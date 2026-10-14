@@ -38,11 +38,22 @@
 // ============================================================================
 // NIVEL 1: CONTROLADOR RAÍZ EN CONFIGURACIÓN DE IOS
 // ============================================================================
-@interface IGFarmRootListController : UIViewController <UITableViewDelegate, UITableViewDataSource> {
+@interface PSViewController : UIViewController {
     id _specifier;
     id _rootController;
     id _parentController;
 }
+- (void)setSpecifier:(id)specifier;
+- (id)specifier;
+- (void)setRootController:(id)rc;
+- (id)rootController;
+- (void)setParentController:(id)pc;
+- (id)parentController;
+- (void)handleURL:(NSDictionary *)url;
+- (BOOL)canBeShownFromSuspendedState;
+@end
+
+@interface IGFarmRootListController : PSViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableDictionary *state;
 @property (nonatomic, strong) NSMutableArray *igContainers;
