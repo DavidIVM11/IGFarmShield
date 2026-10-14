@@ -10,6 +10,8 @@
 		<string>PSLinkCell</string>
 		<key>detail</key>
 		<string>IGFarmRootListController</string>
+		<key>icon</key>
+		<string>IGFarmShieldIcon.png</string>
 		<key>isController</key>
 		<true/>
 		<key>label</key>
