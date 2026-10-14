@@ -1,0 +1,9 @@
+Package: com.ivm.igfarmshield
+Name: IGFarmShield
+Version: 2.0.0
+Architecture: iphoneos-arm64
+Description: Anti-fingerprinting por contenedor (IG & Reddit) + Proxy Auto-Interpreter (Mobile & Residencial)
+Maintainer: IVM
+Author: IVM
+Section: Tweaks
+Depends: mobilesubstrate, preferenceloader
