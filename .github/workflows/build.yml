@@ -1,0 +1,30 @@
+name: Build IGFarmShield Rootless DEB
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies & Theos
+        run: |
+          brew install ldid xz dpkg
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar -xzf - -C $HOME/theos/sdks --strip-components=1
+
+      - name: Build Package (.deb)
+        run: |
+          export THEOS=$HOME/theos
+          make package FINALPACKAGE=1
+
+      - name: Upload Compiled .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: IGFarmShield-Rootless-DEB
+          path: packages/*.deb
