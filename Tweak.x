@@ -9,14 +9,14 @@
 #import <ifaddrs.h>
 #import <arpa/inet.h>
 #import <sys/sysctl.h>
+#import <mach-o/dyld.h>
 #import <string.h>
 #import <substrate.h>
 
-#define STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
+#define GLOBAL_STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
 
 static NSDictionary *getGlobalState() {
-    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:STATE_PLIST];
-    return dict ?: @{};
+    return [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST] ?: @{};
 }
 
 static BOOL isTweakEnabled() {
@@ -31,25 +31,26 @@ static BOOL isTweakEnabled() {
     return YES;
 }
 
+// Lee o crea la huella única DENTRO del propio contenedor de Crane (Sin romper el Sandbox)
 static NSDictionary *getContainerProfile() {
     static NSDictionary *cachedProfile = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         NSString *homePath = NSHomeDirectory();
-        NSString *profilePath = [homePath stringByAppendingPathComponent:@"Documents/.igshield_profile.plist"];
+        NSString *profilePath = [homePath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
         NSMutableDictionary *profile = [NSMutableDictionary dictionaryWithContentsOfFile:profilePath];
 
-        NSDictionary *globalState = getGlobalState();
-        NSString *resetToken = globalState[@"resetToken"] ?: @"default";
+        if (!profile || !profile[@"idfv"]) {
+            NSUInteger seed = [homePath hash] ^ (NSUInteger)[[NSDate date] timeIntervalSince1970];
 
-        if (!profile || ![profile[@"resetToken"] isEqualToString:resetToken]) {
-            NSUInteger seed = [[NSString stringWithFormat:@"%@-%@", homePath, resetToken] hash];
-
+            // Prefijos OUI reales de routers domésticos en EE.UU. (Arris, Netgear, Cisco)
+            NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59"];
+            NSString *oui = ouis[seed % ouis.count];
             uint8_t b3 = (seed >> 8) & 0xFF;
             uint8_t b4 = (seed >> 16) & 0xFF;
             uint8_t b5 = (seed >> 24) & 0xFF;
-            NSString *bssid = [NSString stringWithFormat:@"a4:83:e7:%02x:%02x:%02x", b3, b4, b5];
-            NSString *ssid = [NSString stringWithFormat:@"HOME-%04X", (unsigned int)(seed & 0xFFFF)];
+            NSString *bssid = [NSString stringWithFormat:@"%@:%02x:%02x:%02x", oui, b3, b4, b5];
+            NSString *ssid = [NSString stringWithFormat:@"MySpectrumWiFi%02X-5G", (unsigned int)(seed & 0xFF)];
 
             int lastOctet = 20 + (seed % 210);
             NSString *localIP = [NSString stringWithFormat:@"192.168.1.%d", lastOctet];
@@ -57,12 +58,12 @@ static NSDictionary *getContainerProfile() {
             unsigned long long baseFreeGB = 16500ULL + (seed % 28300ULL);
             unsigned long long freeBytes = baseFreeGB * 1024ULL * 1024ULL + (seed % 1048576ULL);
 
-            NSUInteger uptimeOffset = 600 + (seed % 64800);
-            float batteryLvl = 0.38f + ((seed % 56) / 100.0f);
-            float brightnessLvl = 0.42f + (((seed >> 4) % 46) / 100.0f);
+            NSUInteger uptimeOffset = 900 + (seed % 54000);
+            float batteryLvl = 0.35f + ((seed % 58) / 100.0f);
+            float brightnessLvl = 0.40f + (((seed >> 4) % 48) / 100.0f);
 
             profile = [@{
-                @"resetToken": resetToken,
+                @"idfv": [[NSUUID UUID] UUIDString],
                 @"cloudUUID": [[NSUUID UUID] UUIDString],
                 @"bssid": bssid,
                 @"ssid": ssid,
@@ -70,7 +71,13 @@ static NSDictionary *getContainerProfile() {
                 @"freeBytes": @(freeBytes),
                 @"uptimeOffset": @(uptimeOffset),
                 @"batteryLevel": @(batteryLvl),
-                @"brightness": @(brightnessLvl)
+                @"brightness": @(brightnessLvl),
+                @"CarrierMode": @"CELLULAR",
+                @"CarrierName": @"T-Mobile",
+                @"CarrierMCC": @"310",
+                @"CarrierMNC": @"260",
+                @"CarrierISO": @"us",
+                @"createdAt": [[NSDate date] description]
             } mutableCopy];
 
             [profile writeToFile:profilePath atomically:YES];
@@ -80,6 +87,26 @@ static NSDictionary *getContainerProfile() {
     return cachedProfile;
 }
 
+// ============================================================================
+// 1. OCULTAR TWEAK Y ELLEKIT EN MEMORIA RAM (ANTI-DETECCIÓN DYLD)
+// ============================================================================
+static const char *(*orig_dyld_get_image_name)(uint32_t image_index);
+static const char *custom_dyld_get_image_name(uint32_t image_index) {
+    const char *name = orig_dyld_get_image_name(image_index);
+    if (name && isTweakEnabled()) {
+        if (strstr(name, "IGFarmShield") != NULL ||
+            strstr(name, "ellekit") != NULL ||
+            strstr(name, "Substrate") != NULL ||
+            strstr(name, "Choicy") != NULL) {
+            return "/System/Library/Frameworks/Foundation.framework/Foundation";
+        }
+    }
+    return name;
+}
+
+// ============================================================================
+// 2. BYPASS PASSCODE (A11 PALERA1N) Y BLOQUEO DE DEVICECHECK / APP ATTEST
+// ============================================================================
 %hook LAContext
 - (BOOL)canEvaluatePolicy:(LAPolicy)policy error:(NSError * __autoreleasing *)error {
     if (!isTweakEnabled()) return %orig;
@@ -102,30 +129,41 @@ static NSDictionary *getContainerProfile() {
 }
 %end
 
+// ============================================================================
+// 3. OPERADORA POR CONTENEDOR / PROXY (CTCARRIER)
+// ============================================================================
 %hook CTCarrier
 - (NSString *)carrierName {
     if (!isTweakEnabled()) return %orig;
+    NSDictionary *prof = getContainerProfile();
     NSDictionary *st = getGlobalState();
-    if ([st[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"]) return nil;
-    return st[@"CarrierName"] ?: @"T-Mobile";
+    NSString *mode = st[@"CarrierMode"] ?: prof[@"CarrierMode"];
+    if ([mode isEqualToString:@"WIFI_ONLY"]) return nil;
+    return st[@"CarrierName"] ?: (prof[@"CarrierName"] ?: @"T-Mobile");
 }
 - (NSString *)mobileCountryCode {
     if (!isTweakEnabled()) return %orig;
+    NSDictionary *prof = getContainerProfile();
     NSDictionary *st = getGlobalState();
-    if ([st[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"]) return nil;
-    return st[@"CarrierMCC"] ?: @"310";
+    NSString *mode = st[@"CarrierMode"] ?: prof[@"CarrierMode"];
+    if ([mode isEqualToString:@"WIFI_ONLY"]) return nil;
+    return st[@"CarrierMCC"] ?: (prof[@"CarrierMCC"] ?: @"310");
 }
 - (NSString *)mobileNetworkCode {
     if (!isTweakEnabled()) return %orig;
+    NSDictionary *prof = getContainerProfile();
     NSDictionary *st = getGlobalState();
-    if ([st[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"]) return nil;
-    return st[@"CarrierMNC"] ?: @"260";
+    NSString *mode = st[@"CarrierMode"] ?: prof[@"CarrierMode"];
+    if ([mode isEqualToString:@"WIFI_ONLY"]) return nil;
+    return st[@"CarrierMNC"] ?: (prof[@"CarrierMNC"] ?: @"260");
 }
 - (NSString *)isoCountryCode {
     if (!isTweakEnabled()) return %orig;
+    NSDictionary *prof = getContainerProfile();
     NSDictionary *st = getGlobalState();
-    if ([st[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"]) return nil;
-    return st[@"CarrierISO"] ?: @"us";
+    NSString *mode = st[@"CarrierMode"] ?: prof[@"CarrierMode"];
+    if ([mode isEqualToString:@"WIFI_ONLY"]) return nil;
+    return st[@"CarrierISO"] ?: (prof[@"CarrierISO"] ?: @"us");
 }
 - (BOOL)allowsVOIP {
     return YES;
@@ -147,6 +185,9 @@ static NSDictionary *getContainerProfile() {
 }
 %end
 
+// ============================================================================
+// 4. OCULTAR VPN (UTUN) + ROUTER WIFI Y DIRECCIÓN IP LOCAL POR CONTENEDOR
+// ============================================================================
 %hookf(CFDictionaryRef, CFNetworkCopySystemProxySettings, void) {
     if (!isTweakEnabled()) return %orig();
     return (__bridge_retained CFDictionaryRef)@{};
@@ -156,9 +197,9 @@ static NSDictionary *getContainerProfile() {
     if (!isTweakEnabled()) return %orig(interfaceName);
     NSDictionary *prof = getContainerProfile();
     NSDictionary *fakeWifi = @{
-        @"SSID": prof[@"ssid"] ?: @"HOME-WIFI",
+        @"SSID": prof[@"ssid"] ?: @"MySpectrumWiFi-5G",
         @"BSSID": prof[@"bssid"] ?: @"a4:83:e7:21:9a:10",
-        @"SSIDDATA": [(prof[@"ssid"] ?: @"HOME-WIFI") dataUsingEncoding:NSUTF8StringEncoding]
+        @"SSIDDATA": [(prof[@"ssid"] ?: @"MySpectrumWiFi-5G") dataUsingEncoding:NSUTF8StringEncoding]
     };
     return (__bridge_retained CFDictionaryRef)fakeWifi;
 }
@@ -189,6 +230,27 @@ static NSDictionary *getContainerProfile() {
     return res;
 }
 
+// ============================================================================
+// 5. IDFV, BATERÍA, BRILLO, ESPACIO LIBRE (64GB) Y OCULTACIÓN DE ARCHIVOS JB
+// ============================================================================
+%hook UIDevice
+- (NSUUID *)identifierForVendor {
+    if (!isTweakEnabled()) return %orig;
+    NSDictionary *prof = getContainerProfile();
+    NSUUID *customUUID = [[NSUUID alloc] initWithUUIDString:prof[@"idfv"]];
+    return customUUID ?: %orig;
+}
+- (float)batteryLevel {
+    if (!isTweakEnabled()) return %orig;
+    NSDictionary *prof = getContainerProfile();
+    return [prof[@"batteryLevel"] floatValue];
+}
+- (UIDeviceBatteryState)batteryState {
+    if (!isTweakEnabled()) return %orig;
+    return UIDeviceBatteryStateUnplugged;
+}
+%end
+
 %hook NSFileManager
 - (id)ubiquityIdentityToken {
     if (!isTweakEnabled()) return %orig;
@@ -199,7 +261,6 @@ static NSDictionary *getContainerProfile() {
 - (NSDictionary<NSFileAttributeKey, id> *)attributesOfFileSystemForPath:(NSString *)path error:(NSError * _Nullable *)error {
     NSDictionary *orig = %orig;
     if (!isTweakEnabled() || !orig) return orig;
-
     NSMutableDictionary *modified = [orig mutableCopy];
     NSDictionary *prof = getContainerProfile();
     if (prof[@"freeBytes"]) {
@@ -225,18 +286,6 @@ static NSDictionary *getContainerProfile() {
 }
 %end
 
-%hook NSString
-- (BOOL)containsString:(NSString *)str {
-    if (isTweakEnabled() && str) {
-        NSString *low = [str lowercaseString];
-        if ([low containsString:@"crane"] || [low containsString:@"jailbreak"] || [low containsString:@"/var/jb"]) {
-            return NO;
-        }
-    }
-    return %orig;
-}
-%end
-
 %hook NSProcessInfo
 - (NSTimeInterval)systemUptime {
     NSTimeInterval orig = %orig;
@@ -256,18 +305,6 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     }
     return ret;
 }
-
-%hook UIDevice
-- (float)batteryLevel {
-    if (!isTweakEnabled()) return %orig;
-    NSDictionary *prof = getContainerProfile();
-    return [prof[@"batteryLevel"] floatValue];
-}
-- (UIDeviceBatteryState)batteryState {
-    if (!isTweakEnabled()) return %orig;
-    return UIDeviceBatteryStateUnplugged;
-}
-%end
 
 %hook UIScreen
 - (CGFloat)brightness {
@@ -296,4 +333,5 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 %ctor {
     %init;
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
+    MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
 }
