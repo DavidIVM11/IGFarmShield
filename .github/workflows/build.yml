@@ -16,11 +16,45 @@ jobs:
         run: |
           brew install ldid xz dpkg
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          rm -rf $HOME/theos/sdks/*
           curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar -xzf - -C $HOME/theos/sdks --strip-components=1
 
-      - name: Build Package (.deb)
+      - name: Generate Settings Icon & Build Package (.deb)
         run: |
           export THEOS=$HOME/theos
+          python3 - << 'EOF'
+          import struct, zlib
+          def make_shield_png(w, h, filename):
+              raw = bytearray()
+              cx, cy = w / 2.0, h / 2.0
+              for y in range(h):
+                  raw.append(0)
+                  for x in range(w):
+                      # Fondo redondeado azul estilo iOS Settings + escudo blanco central
+                      dx, dy = abs(x - cx), abs(y - cy)
+                      in_shield = (dy < h*0.32 and dx < w*0.28 * (1.0 - (y - h*0.2)/(h*0.9)))
+                      if in_shield:
+                          raw.extend((255, 255, 255, 255))
+                      else:
+                          raw.extend((0, 122, 255, 255))
+              def chunk(tag, data):
+                  return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", zlib.crc32(tag + data) & 0xffffffff)
+              png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+              with open(filename, "wb") as f:
+                  f.write(png)
+          make_shield_png(29, 29, "igfarmshieldprefs/IGFarmShieldIcon.png")
+          make_shield_png(58, 58, "igfarmshieldprefs/IGFarmShieldIcon@2x.png")
+          make_shield_png(87, 87, "igfarmshieldprefs/IGFarmShieldIcon@3x.png")
+          EOF
+          mkdir -p layout/DEBIAN
+          cat << 'EOF' > layout/DEBIAN/postrm
+          #!/bin/sh
+          rm -f /var/jb/Library/PreferenceLoader/Preferences/IGFarmShieldPrefs.plist
+          rm -f /var/jb/Library/PreferenceLoader/Preferences/IGFarmShieldIcon*.png
+          rm -rf /var/jb/Library/PreferenceBundles/IGFarmShieldPrefs.bundle
+          exit 0
+          EOF
+          chmod 0755 layout/DEBIAN/postrm
           make package FINALPACKAGE=1
 
       - name: Upload Compiled .deb
