@@ -8,7 +8,6 @@ BUNDLE_NAME = IGFarmShieldPrefs
 
 IGFarmShieldPrefs_FILES = IGFarmRootListController.m
 IGFarmShieldPrefs_FRAMEWORKS = UIKit Foundation CoreGraphics
-IGFarmShieldPrefs_PRIVATE_FRAMEWORKS = Preferences
 IGFarmShieldPrefs_INSTALL_PATH = /Library/PreferenceBundles
 IGFarmShieldPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-error
 IGFarmShieldPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup
