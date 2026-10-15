@@ -14,13 +14,9 @@
 @class IGFarmRootListController;
 
 // ============================================================================
-// DECLARACIÓN BASE DE PREFERENCES (SIN DEPENDER DE HEADERS PRIVADOS EXTERNOS)
+// DECLARACIÓN LIMPIA DE PSVIEWCONTROLLER (SIN PISAR IVARS DE IOS 16)
 // ============================================================================
-@interface PSViewController : UIViewController {
-    id _specifier;
-    id _rootController;
-    id _parentController;
-}
+@interface PSViewController : UIViewController
 - (void)setSpecifier:(id)specifier;
 - (id)specifier;
 - (void)setRootController:(id)rc;
@@ -32,21 +28,27 @@
 @end
 
 // ============================================================================
-// NIVEL 3: PANTALLA EXCLUSIVA DE CONFIGURACIÓN POR CONTENEDOR (ESTILO GHOST)
+// NIVEL 3: PANTALLA EXCLUSIVA DE CONFIGURACIÓN POR CONTENEDOR
 // ============================================================================
-@interface IGFarmContainerDetailController : UIViewController <UITableViewDelegate, UITableViewDataSource>
+@interface IGFarmContainerDetailController : PSViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) NSDictionary *containerItem;
 @property (nonatomic, strong) NSMutableDictionary *profile;
 @property (nonatomic, assign) BOOL isIG;
 @property (nonatomic, weak) IGFarmRootListController *parentRoot;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSTimer *detailAuditTimer;
+- (void)saveContainerProfile;
+- (BOOL)isModOn:(NSString *)key;
+- (void)toggleSwitch:(UISwitch *)sender;
+- (void)auditAndSyncWithProxyCenterVPSSilently:(BOOL)silent;
+- (void)showCarrierSelector;
+- (void)showTimeZoneSelector;
 @end
 
 // ============================================================================
-// NIVEL 2: SUB-CONTROLADOR POR APLICACIÓN (INSTAGRAM / REDDIT ESTILO CRANE)
+// NIVEL 2: SUB-CONTROLADOR POR APLICACIÓN (INSTAGRAM / REDDIT)
 // ============================================================================
-@interface IGFarmAppContainersController : UIViewController <UITableViewDelegate, UITableViewDataSource>
+@interface IGFarmAppContainersController : PSViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) NSString *appTitle;
 @property (nonatomic, strong) NSString *stateKey;
 @property (nonatomic, assign) BOOL isIG;
@@ -54,6 +56,7 @@
 @property (nonatomic, strong) NSMutableArray *appContainers;
 @property (nonatomic, weak) IGFarmRootListController *parentRoot;
 @property (nonatomic, strong) UITableView *tableView;
+- (void)toggleAppSwitch:(UISwitch *)sender;
 @end
 
 // ============================================================================
@@ -76,13 +79,17 @@
 @property (nonatomic, strong) NSString *realTimeZone;
 @property (nonatomic, assign) int realBatteryPct;
 - (void)saveState;
+- (void)ensureSettingsShieldIconExists;
+- (void)refreshRealPhoneTelemetry;
 - (void)scanAllRealContainersOnDisk;
 - (BOOL)auditChoicyConfiguration;
 - (void)auditProxyAndSyncCarrierSilently:(BOOL)silent;
+- (void)purgeContainersCache;
+- (void)showAlert:(NSString *)title msg:(NSString *)msg;
+- (void)toggleMasterSwitch:(UISwitch *)sender;
 - (NSMutableDictionary *)ensureProfileForContainerPath:(NSString *)containerPath forceRotate:(BOOL)rotate;
 @end
 
-// Hash FNV-1a de 64 bits para garantizar que ningún contenedor coincida jamás
 static uint64_t fnv1aHashPrefs(NSString *input) {
     uint64_t hash = 14695981039346656037ULL;
     const char *bytes = [input UTF8String];
@@ -101,8 +108,8 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = self.containerItem[@"title"];
-    self.profile = self.containerItem[@"profile"];
+    self.title = self.containerItem[@"title"] ?: @"Contenedor";
+    self.profile = self.containerItem[@"profile"] ?: [NSMutableDictionary dictionary];
 
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
@@ -127,6 +134,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 }
 
 - (void)saveContainerProfile {
+    if (!self.containerItem[@"path"]) return;
     NSString *profilePath = [self.containerItem[@"path"] stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
     [self.profile writeToFile:profilePath atomically:YES];
 }
@@ -218,7 +226,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         } else if (indexPath.row == 2) {
             cell.textLabel.text = @"🌎 Zona Horaria y Región";
             if (![self isModOn:@"spoofLocation"] || [self.profile[@"timeZone"] isEqualToString:@"REAL"]) {
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ Real (%@)", self.parentRoot.realTimeZone];
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ Real (%@)", self.parentRoot.realTimeZone ?: @"Local"];
             } else {
                 cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ (%@)",
                                              self.profile[@"timeZone"] ?: @"America/New_York",
@@ -230,9 +238,11 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         int batPct = (int)([self.profile[@"batteryLevel"] floatValue] * 100.0f);
         int volPct = (int)([self.profile[@"audioVolume"] floatValue] * 100.0f);
         NSUInteger upMin = [self.profile[@"uptimeOffset"] unsignedIntegerValue] / 60;
-        NSString *craneID = self.profile[@"craneContainerID"] ?: self.containerItem[@"uuid"];
+        NSString *craneID = self.profile[@"craneContainerID"] ?: (self.containerItem[@"uuid"] ?: @"Default");
         NSString *craneOrigIDFV = self.profile[@"craneOriginalIDFV"] ?: @"Aislado por Crane";
-        NSString *shieldDevID = self.profile[@"shieldDeviceID"] ?: self.profile[@"cloudUUID"];
+        NSString *shieldDevID = self.profile[@"shieldDeviceID"] ?: (self.profile[@"cloudUUID"] ?: @"N/A");
+        NSString *idfvStr = self.profile[@"idfv"] ?: @"N/A";
+        NSString *bootStr = self.profile[@"bootSessionUUID"] ?: @"N/A";
 
         if (indexPath.row == 0) {
             cell.textLabel.text = @"🆔 ID Contenedor (Crane)";
@@ -245,19 +255,19 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
             cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", [shieldDevID substringToIndex:MIN(14, shieldDevID.length)]] : @"⚪ Desactivado";
         } else if (indexPath.row == 3) {
             cell.textLabel.text = @"🔑 Nuevo Vendor ID (Shield IDFV)";
-            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", [self.profile[@"idfv"] substringToIndex:14]] : @"⚪ Usando IDFV de Crane";
+            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", [idfvStr substringToIndex:MIN(14, idfvStr.length)]] : @"⚪ Usando IDFV de Crane";
         } else if (indexPath.row == 4) {
             cell.textLabel.text = @"🔄 BootSession UUID (Kernel)";
-            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", [self.profile[@"bootSessionUUID"] substringToIndex:14]] : @"⚪ Real";
+            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", [bootStr substringToIndex:MIN(14, bootStr.length)]] : @"⚪ Real";
         } else if (indexPath.row == 5) {
             cell.textLabel.text = @"📡 Router Wi-Fi (BSSID / SSID)";
-            cell.detailTextLabel.text = [self isModOn:@"spoofNetwork"] ? [NSString stringWithFormat:@"🟢 %@ (%@)", self.profile[@"bssid"], self.profile[@"ssid"]] : @"⚪ Router Real";
+            cell.detailTextLabel.text = [self isModOn:@"spoofNetwork"] ? [NSString stringWithFormat:@"🟢 %@ (%@)", self.profile[@"bssid"] ?: @"", self.profile[@"ssid"] ?: @""] : @"⚪ Router Real";
         } else if (indexPath.row == 6) {
             cell.textLabel.text = @"💻 Subred e IP Local (en0)";
-            cell.detailTextLabel.text = [self isModOn:@"spoofNetwork"] ? [NSString stringWithFormat:@"🟢 %@", self.profile[@"localIP"]] : [NSString stringWithFormat:@"⚪ Real (%@)", self.parentRoot.realLocalIP];
+            cell.detailTextLabel.text = [self isModOn:@"spoofNetwork"] ? [NSString stringWithFormat:@"🟢 %@", self.profile[@"localIP"] ?: @""] : [NSString stringWithFormat:@"⚪ Real (%@)", self.parentRoot.realLocalIP ?: @""];
         } else if (indexPath.row == 7) {
             cell.textLabel.text = @"💾 Espacio Libre (Deriva Viva)";
-            cell.detailTextLabel.text = [self isModOn:@"spoofHardware"] ? [NSString stringWithFormat:@"🟢 %.2f GB libres", freeGB] : [NSString stringWithFormat:@"⚪ Real (%@)", self.parentRoot.realFreeDisk];
+            cell.detailTextLabel.text = [self isModOn:@"spoofHardware"] ? [NSString stringWithFormat:@"🟢 %.2f GB libres", freeGB] : [NSString stringWithFormat:@"⚪ Real (%@)", self.parentRoot.realFreeDisk ?: @""];
         } else if (indexPath.row == 8) {
             cell.textLabel.text = @"🔋 Batería / Audio";
             cell.detailTextLabel.text = [self isModOn:@"spoofHardware"] ? [NSString stringWithFormat:@"🟢 Bat: %d%% | Vol: %d%%", batPct, volPct] : [NSString stringWithFormat:@"⚪ Bat Real: %d%%", self.parentRoot.realBatteryPct];
@@ -301,7 +311,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         [self.parentRoot scanAllRealContainersOnDisk];
         [self.tableView reloadData];
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Huella Regenerada"
-                                                                    message:@"Se generaron nuevos identificadores (Shield Device ID, IDFV, BootUUID, Subred LAN, Router BSSID y almacenamiento) exclusivos para este contenedor."
+                                                                    message:@"Se generaron nuevos identificadores exclusivos para este contenedor."
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:ac animated:YES completion:nil];
@@ -327,6 +337,8 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         }
 
         NSDictionary *ipJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![ipJson isKindOfClass:[NSDictionary class]]) return;
+
         NSString *ip = ipJson[@"query"] ?: @"";
         NSString *ispRaw = ipJson[@"isp"] ?: @"ISP";
         NSString *ispUp = [ispRaw uppercaseString];
@@ -337,7 +349,6 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         self.profile[@"timeZone"] = tz;
         self.profile[@"localeID"] = [NSString stringWithFormat:@"en_%@", [cc uppercaseString]];
 
-        // Auto-interpretación local inmediata por si el VPS tarda en responder
         if ([ispUp containsString:@"T-MOBILE"] || [ispUp containsString:@"METRO"] || [ispUp containsString:@"MINT"]) {
             self.profile[@"CarrierMode"] = @"CELLULAR"; self.profile[@"CarrierName"] = @"T-Mobile";
             self.profile[@"CarrierMCC"] = @"310"; self.profile[@"CarrierMNC"] = @"260"; self.profile[@"CarrierISO"] = @"us";
@@ -370,9 +381,10 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 
         [[session dataTaskWithURL:vpsUrl completionHandler:^(NSData *vData, NSURLResponse *vResp, NSError *vErr) {
             NSDictionary *vpsJson = vData ? [NSJSONSerialization JSONObjectWithData:vData options:0 error:nil] : nil;
+            if (![vpsJson isKindOfClass:[NSDictionary class]]) vpsJson = nil;
             NSDictionary *carrierProf = vpsJson[@"carrier_profile"];
 
-            if (carrierProf) {
+            if ([carrierProf isKindOfClass:[NSDictionary class]]) {
                 self.profile[@"CarrierMode"] = carrierProf[@"modo"] ?: self.profile[@"CarrierMode"];
                 self.profile[@"CarrierName"] = carrierProf[@"name"] ?: self.profile[@"CarrierName"];
                 self.profile[@"CarrierMCC"] = carrierProf[@"mcc"] ?: self.profile[@"CarrierMCC"];
@@ -391,7 +403,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
                 [self.tableView reloadData];
                 if (!silent || [status isEqualToString:@"BANEADA"] || [status isEqualToString:@"COOLDOWN"]) {
                     UIAlertController *ac = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"%@ Auditoría: %@", icono, status]
-                                                                                message:[NSString stringWithFormat:@"%@\n\nISP: %@\nModo Inyectado: %@ (%@)\nZona Horaria: %@\n\n(Reporte enviado a Telegram Topic 157)",
+                                                                                message:[NSString stringWithFormat:@"%@\n\nISP: %@\nModo Inyectado: %@ (%@)\nZona Horaria: %@",
                                                                                          msjIphone, ispRaw, self.profile[@"CarrierMode"], self.profile[@"CarrierName"], tz]
                                                                          preferredStyle:UIAlertControllerStyleAlert];
                     [ac addAction:[UIAlertAction actionWithTitle:@"Aceptar" style:UIAlertActionStyleDefault handler:nil]];
@@ -465,7 +477,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = self.appTitle;
+    self.title = self.appTitle ?: @"Contenedores";
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
@@ -502,7 +514,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
     BOOL appOn = [self.state[self.stateKey] boolValue];
 
     if (indexPath.section == 0) {
-        cell.textLabel.text = [NSString stringWithFormat:@"Habilitar en %@", self.appTitle];
+        cell.textLabel.text = [NSString stringWithFormat:@"Habilitar en %@", self.appTitle ?: @"App"];
         cell.detailTextLabel.text = (masterOn && appOn) ? @"🟢 Activo" : @"⚪ Apagado (Datos Reales del Sistema)";
         UISwitch *sw = [[UISwitch alloc] init];
         sw.on = appOn;
@@ -525,18 +537,19 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
     BOOL containerOn = prof[@"enabled"] ? [prof[@"enabled"] boolValue] : YES;
     BOOL effectivelyActive = masterOn && appOn && containerOn;
 
-    cell.textLabel.text = item[@"title"];
+    cell.textLabel.text = item[@"title"] ?: @"Contenedor";
     if (effectivelyActive) {
         cell.detailTextLabel.textColor = [UIColor systemGreenColor];
-        NSString *sID = prof[@"shieldDeviceID"] ?: prof[@"cloudUUID"];
+        NSString *sID = prof[@"shieldDeviceID"] ?: (prof[@"cloudUUID"] ?: @"N/A");
+        NSString *idfv = prof[@"idfv"] ?: @"N/A";
         cell.detailTextLabel.text = [NSString stringWithFormat:@"🛡️ %@ | %@ | IDFV: %@... | Shield: %@...",
                                      prof[@"CarrierName"] ?: @"T-Mobile",
-                                     prof[@"localIP"],
-                                     [prof[@"idfv"] substringToIndex:6],
+                                     prof[@"localIP"] ?: @"",
+                                     [idfv substringToIndex:MIN(6, idfv.length)],
                                      [sID substringToIndex:MIN(6, sID.length)]];
     } else {
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ Usando Sistema Real (%@)", self.parentRoot.realLocalIP];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ Usando Sistema Real (%@)", self.parentRoot.realLocalIP ?: @""];
     }
 
     return cell;
@@ -562,18 +575,9 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 @end
 
 // ============================================================================
-// IMPLEMENTACIÓN NIVEL 1: MENÚ RAÍZ + AUDITOR DE CHOICY + TIMER 15 MINUTOS
+// IMPLEMENTACIÓN NIVEL 1: MENÚ RAÍZ + AUDITOR DE CHOICY
 // ============================================================================
 @implementation IGFarmRootListController
-
-- (void)setSpecifier:(id)specifier { _specifier = specifier; }
-- (id)specifier { return _specifier; }
-- (void)setRootController:(id)rc { _rootController = rc; }
-- (id)rootController { return _rootController; }
-- (void)setParentController:(id)pc { _parentController = pc; }
-- (id)parentController { return _parentController; }
-- (void)handleURL:(NSDictionary *)url {}
-- (BOOL)canBeShownFromSuspendedState { return YES; }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -584,7 +588,10 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
     if (!self.state[@"enableIG"]) self.state[@"enableIG"] = @YES;
     if (!self.state[@"enableReddit"]) self.state[@"enableReddit"] = @YES;
     [self saveState];
-    [self ensureSettingsShieldIconExists];
+
+    [self auditChoicyConfiguration];
+    [self refreshRealPhoneTelemetry];
+    [self scanAllRealContainersOnDisk];
 
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
@@ -592,9 +599,6 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.tableView];
 
-    [self auditChoicyConfiguration];
-    [self refreshRealPhoneTelemetry];
-    [self scanAllRealContainersOnDisk];
     [self auditProxyAndSyncCarrierSilently:YES];
 }
 
@@ -605,7 +609,6 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
     [self scanAllRealContainersOnDisk];
     [self.tableView reloadData];
 
-    // Auto-auditoría automática cada 15 minutos (900 segundos)
     [self.autoAuditTimer invalidate];
     __weak typeof(self) weakSelf = self;
     self.autoAuditTimer = [NSTimer scheduledTimerWithTimeInterval:900.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
@@ -620,29 +623,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 }
 
 - (void)ensureSettingsShieldIconExists {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:PREFS_ICON2X_PATH]) return;
-
-    CGSize size = CGSizeMake(58, 58);
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size];
-    UIImage *iconImg = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
-        UIBezierPath *bg = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, 58, 58) cornerRadius:13];
-        [[UIColor systemBlueColor] setFill];
-        [bg fill];
-
-        UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:34 weight:UIImageSymbolWeightBold];
-        UIImage *shield = [[UIImage systemImageNamed:@"checkmark.shield.fill" withConfiguration:symCfg] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
-        if (shield) {
-            CGRect r = CGRectMake((58 - shield.size.width)/2.0, (58 - shield.size.height)/2.0, shield.size.width, shield.size.height);
-            [shield drawInRect:r];
-        }
-    }];
-
-    NSData *pngData = UIImagePNGRepresentation(iconImg);
-    if (pngData) {
-        [pngData writeToFile:PREFS_ICON_PATH atomically:YES];
-        [pngData writeToFile:PREFS_ICON2X_PATH atomically:YES];
-    }
+    // Opcional: El ícono se maneja desde el paquete si tiene permisos de escritura
 }
 
 - (void)saveState {
@@ -676,21 +657,10 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
     if (size > 0) {
         char *machine = malloc(size);
         sysctlbyname("hw.machine", machine, &size, NULL, 0);
-        self.realHardwareModel = [NSString stringWithUTF8String:machine];
+        self.realHardwareModel = [NSString stringWithUTF8String:machine] ?: @"iPhone10,4";
         free(machine);
     } else {
         self.realHardwareModel = @"iPhone10,4";
-    }
-
-    size_t uuidSize = 0;
-    sysctlbyname("kern.bootsessionuuid", NULL, &uuidSize, NULL, 0);
-    if (uuidSize > 0) {
-        char *bUuid = malloc(uuidSize);
-        sysctlbyname("kern.bootsessionuuid", bUuid, &uuidSize, NULL, 0);
-        self.realBootUUID = [NSString stringWithUTF8String:bUuid];
-        free(bUuid);
-    } else {
-        self.realBootUUID = @"Nativo";
     }
 
     self.realTimeZone = [[NSTimeZone localTimeZone] name] ?: @"Local";
@@ -720,10 +690,10 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
                 inet_ntop(AF_INET, &((struct sockaddr_in *)temp->ifa_addr)->sin_addr, addrBuf, INET_ADDRSTRLEN);
                 NSString *ipStr = [NSString stringWithUTF8String:addrBuf];
 
-                if ([ifName isEqualToString:@"en0"]) {
+                if ([ifName isEqualToString:@"en0"] && ipStr) {
                     self.realLocalIP = ipStr;
                 } else if ([ifName hasPrefix:@"utun"] || [ifName hasPrefix:@"ppp"] || [ifName hasPrefix:@"ipsec"]) {
-                    if (![ipStr hasPrefix:@"127."] && ![ipStr hasPrefix:@"169.254."]) {
+                    if (ipStr && ![ipStr hasPrefix:@"127."] && ![ipStr hasPrefix:@"169.254."]) {
                         self.vpnActive = YES;
                         self.vpnInterfaceName = [NSString stringWithFormat:@"%@ (%@)", ifName, ipStr];
                     }
@@ -741,7 +711,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 
     if (!profile || !profile[@"idfv"] || rotate) {
         BOOL wasEnabled = profile[@"enabled"] ? [profile[@"enabled"] boolValue] : YES;
-        NSString *existingCraneID = profile[@"craneContainerID"] ?: [containerPath lastPathComponent];
+        NSString *existingCraneID = profile[@"craneContainerID"] ?: ([containerPath lastPathComponent] ?: @"Default");
         NSString *existingCraneIDFV = profile[@"craneOriginalIDFV"] ?: @"Aislado por Crane";
 
         uint64_t seed = fnv1aHashPrefs([NSString stringWithFormat:@"%@_%@", containerPath, [[NSUUID UUID] UUIDString]]);
@@ -812,30 +782,31 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
     NSMutableSet *seenPaths = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // 1. Leer contenedores auto-registrados por Tweak.x en STATE_PLIST
     NSDictionary *freshState = [NSDictionary dictionaryWithContentsOfFile:STATE_PLIST];
     NSDictionary *known = freshState[@"knownContainers"];
-    for (NSString *cPath in known) {
-        if (![fm fileExistsAtPath:cPath]) continue;
-        NSDictionary *info = known[cPath];
-        NSString *bID = info[@"bundleID"] ?: @"";
-        NSString *cName = info[@"craneName"] ?: [cPath lastPathComponent];
-        BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
-        BOOL isReddit = [bID isEqualToString:@"com.reddit.Reddit"];
-        if (!isIG && !isReddit) continue;
+    if ([known isKindOfClass:[NSDictionary class]]) {
+        for (NSString *cPath in known) {
+            if (![fm fileExistsAtPath:cPath]) continue;
+            NSDictionary *info = known[cPath];
+            if (![info isKindOfClass:[NSDictionary class]]) continue;
+            NSString *bID = info[@"bundleID"] ?: @"";
+            NSString *cName = info[@"craneName"] ?: ([cPath lastPathComponent] ?: @"Default");
+            BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
+            BOOL isReddit = [bID isEqualToString:@"com.reddit.Reddit"];
+            if (!isIG && !isReddit) continue;
 
-        NSMutableDictionary *prof = [self ensureProfileForContainerPath:cPath forceRotate:NO];
-        NSMutableArray *targetList = isIG ? self.igContainers : self.redditContainers;
-        [targetList addObject:@{
-            @"title": [NSString stringWithFormat:@"[%@]", cName],
-            @"path": cPath,
-            @"uuid": cName,
-            @"profile": prof
-        }];
-        [seenPaths addObject:cPath];
+            NSMutableDictionary *prof = [self ensureProfileForContainerPath:cPath forceRotate:NO];
+            NSMutableArray *targetList = isIG ? self.igContainers : self.redditContainers;
+            [targetList addObject:@{
+                @"title": [NSString stringWithFormat:@"[%@]", cName],
+                @"path": cPath,
+                @"uuid": cName,
+                @"profile": prof
+            }];
+            [seenPaths addObject:cPath];
+        }
     }
 
-    // 2. Escanear rutas directas en disco y subcarpetas de Crane
     NSString *appsDir = @"/var/mobile/Containers/Data/Application";
     NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
 
@@ -930,7 +901,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         } else if (indexPath.row == 2) {
             cell.textLabel.text = @"🛡️ Estado de Choicy";
             cell.detailTextLabel.textColor = self.choicySafe ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-            cell.detailTextLabel.text = self.choicyStatusText;
+            cell.detailTextLabel.text = self.choicyStatusText ?: @"Verificando...";
         }
     } else if (indexPath.section == 1) {
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -950,7 +921,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         if (indexPath.row == 0) {
             cell.textLabel.text = @"Túnel VPN (Shadowrocket)";
             cell.detailTextLabel.textColor = self.vpnActive ? [UIColor systemGreenColor] : [UIColor systemRedColor];
-            cell.detailTextLabel.text = self.vpnActive ? [NSString stringWithFormat:@"🟢 ACTIVO (%@)", self.vpnInterfaceName] : @"⚠️ APAGADO (Wi-Fi Directo)";
+            cell.detailTextLabel.text = self.vpnActive ? [NSString stringWithFormat:@"🟢 ACTIVO (%@)", self.vpnInterfaceName ?: @"utun"] : @"⚠️ APAGADO (Wi-Fi Directo)";
         } else if (indexPath.row == 1) {
             cell.textLabel.text = @"IP / ISP Saliente Actual";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ (%@)",
@@ -958,13 +929,13 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
                                          self.state[@"last_isp"] ?: @"..."];
         } else if (indexPath.row == 2) {
             cell.textLabel.text = @"Zona Horaria Detectada";
-            cell.detailTextLabel.text = self.state[@"defaultTimeZone"] ?: self.realTimeZone;
+            cell.detailTextLabel.text = self.state[@"defaultTimeZone"] ?: (self.realTimeZone ?: @"Local");
         } else if (indexPath.row == 3) {
             cell.textLabel.text = @"Placa / Batería / IP Real";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ | %d%% | %@", self.realHardwareModel, self.realBatteryPct, self.realLocalIP];
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ | %d%% | %@", self.realHardwareModel ?: @"iPhone", self.realBatteryPct, self.realLocalIP ?: @""];
         } else if (indexPath.row == 4) {
             cell.textLabel.text = @"Disco Real (64GB)";
-            cell.detailTextLabel.text = self.realFreeDisk;
+            cell.detailTextLabel.text = self.realFreeDisk ?: @"64 GB";
         }
     } else if (indexPath.section == 3) {
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -1039,6 +1010,8 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
             return;
         }
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![json isKindOfClass:[NSDictionary class]]) return;
+
         NSString *ip = json[@"query"] ?: @"Desconocida";
         NSString *ispRaw = json[@"isp"] ?: @"ISP";
         NSString *cc = [json[@"countryCode"] lowercaseString] ?: @"us";
@@ -1065,7 +1038,8 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 
         [[session dataTaskWithURL:[NSURL URLWithString:vpsUrlStr] completionHandler:^(NSData *vData, NSURLResponse *vResp, NSError *vErr) {
             NSDictionary *vpsJson = vData ? [NSJSONSerialization JSONObjectWithData:vData options:0 error:nil] : nil;
-            NSString *veredictoVPS = vpsJson[@"mensaje_iphone"] ?: @"VPS sin respuesta en puerto 5001 (Verifica el Firewall de Windows en tu VPS).";
+            if (![vpsJson isKindOfClass:[NSDictionary class]]) vpsJson = nil;
+            NSString *veredictoVPS = vpsJson[@"mensaje_iphone"] ?: @"VPS sin respuesta en puerto 5001 (Verifica el Firewall en tu VPS).";
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self refreshRealPhoneTelemetry];
@@ -1073,7 +1047,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
                 NSString *vpnState = self.vpnActive ? @"🟢 VPN Shadowrocket Activo" : @"⚠️ VPN APAGADO (Wi-Fi Directo)";
                 [self showAlert:@"Auditoría Proxy Center + Telegram"
                             msg:[NSString stringWithFormat:@"%@\n🛡️ Choicy: %@\n\n📍 IP Saliente: %@\n📡 ISP: %@ (%@)\n🌎 Zona Horaria: %@\n\n📊 Veredicto Proxy Center:\n%@",
-                                 vpnState, self.choicyStatusText, ip, ispRaw, [cc uppercaseString], tz, veredictoVPS]];
+                                 vpnState, self.choicyStatusText ?: @"", ip, ispRaw, [cc uppercaseString], tz, veredictoVPS]];
             });
         }] resume];
     }] resume];
@@ -1098,7 +1072,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
     [self refreshRealPhoneTelemetry];
     [self.tableView reloadData];
     [self showAlert:@"Caché y Temporales Purgados (64GB Safe)"
-                msg:[NSString stringWithFormat:@"Se eliminaron %lu archivos basura de Library/Caches y tmp/ sin tocar las sesiones iniciadas.\nEspacio libre real: %@", (unsigned long)cleaned, self.realFreeDisk]];
+                msg:[NSString stringWithFormat:@"Se eliminaron %lu archivos basura de Library/Caches y tmp/ sin tocar las sesiones iniciadas.\nEspacio libre real: %@", (unsigned long)cleaned, self.realFreeDisk ?: @""]];
 }
 
 - (void)showAlert:(NSString *)title msg:(NSString *)msg {
