@@ -39,7 +39,6 @@ static NSString *detectCraneContainerName(NSString *homePath) {
     return [homePath lastPathComponent] ?: @"Default";
 }
 
-// Hash FNV-1a de 64 bits para garantizar distribución sin colisiones entre 40 contenedores
 static uint64_t fnv1aHash(NSString *input) {
     uint64_t hash = 14695981039346656037ULL;
     const char *bytes = [input UTF8String];
@@ -57,13 +56,13 @@ static NSMutableDictionary *getContainerProfile() {
         sessionStartTimestamp = [[NSDate date] timeIntervalSince1970];
         NSString *homePath = NSHomeDirectory();
         NSString *profilePath = [homePath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
-        NSMutableDictionary *profile = [NSMutableDictionary dictionaryWithContentsOfFile:profilePath];
+        NSDictionary *loaded = [NSDictionary dictionaryWithContentsOfFile:profilePath];
+        NSMutableDictionary *profile = loaded ? [loaded mutableCopy] : nil;
         NSString *craneName = detectCraneContainerName(homePath);
 
         if (!profile || !profile[@"idfv"]) {
             uint64_t seed = fnv1aHash([NSString stringWithFormat:@"%@_%@", homePath, [[NSUUID UUID] UUIDString]]);
             
-            // Diversidad real de fabricantes Wi-Fi (Apple, Netgear, Cisco, TP-Link, Asus, Ubiquiti)
             NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
             NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
             NSString *oui = ouis[seed % ouis.count];
@@ -75,7 +74,6 @@ static NSMutableDictionary *getContainerProfile() {
             NSString *bssid = [NSString stringWithFormat:@"%@:%02x:%02x:%02x", oui, b3, b4, b5];
             NSString *ssid = [NSString stringWithFormat:@"%@-%02X-5G", ssidPref, (unsigned int)(seed & 0xFF)];
 
-            // Subredes domésticas variadas para no coincidir jamás en la estructura LAN
             NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0"];
             NSString *subnet = subnets[(seed >> 5) % subnets.count];
             int lastOctet = 15 + (int)(seed % 225);
@@ -126,9 +124,10 @@ static NSMutableDictionary *getContainerProfile() {
 
         [profile writeToFile:profilePath atomically:YES];
 
-        // Registrar contenedor en el estado global
-        NSMutableDictionary *globalSt = [NSMutableDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST] ?: [NSMutableDictionary dictionary];
-        NSMutableDictionary *known = [globalSt[@"knownContainers"] mutableCopy] ?: [NSMutableDictionary dictionary];
+        NSDictionary *loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST];
+        NSMutableDictionary *globalSt = loadedGlobal ? [loadedGlobal mutableCopy] : [NSMutableDictionary dictionary];
+        NSDictionary *loadedKnown = globalSt[@"knownContainers"];
+        NSMutableDictionary *known = [loadedKnown isKindOfClass:[NSDictionary class]] ? [loadedKnown mutableCopy] : [NSMutableDictionary dictionary];
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
         known[homePath] = @{
             @"bundleID": bundleID,
@@ -160,9 +159,6 @@ static BOOL isModuleActive(NSString *moduleKey) {
     return YES;
 }
 
-// ============================================================================
-// AUDITORÍA AUTOMÁTICA DE RED CADA 15 MINUTOS + AUTO-ADAPTACIÓN A LA IP REAL
-// ============================================================================
 static void runPeriodicContainerNetworkAudit() {
     if (!isModuleActive(@"spoofNetwork")) return;
 
@@ -174,7 +170,7 @@ static void runPeriodicContainerNetworkAudit() {
     [[session dataTaskWithURL:ipUrl completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         if (!data || err) return;
         NSDictionary *ipJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (![ipJson[@"status"] isEqualToString:@"success"]) return;
+        if (![ipJson isKindOfClass:[NSDictionary class]] || ![ipJson[@"status"] isEqualToString:@"success"]) return;
 
         NSString *ip = ipJson[@"query"] ?: @"";
         NSString *ispRaw = ipJson[@"isp"] ?: @"";
@@ -187,7 +183,6 @@ static void runPeriodicContainerNetworkAudit() {
         prof[@"timeZone"] = tz;
         prof[@"localeID"] = [NSString stringWithFormat:@"en_%@", [cc uppercaseString]];
 
-        // Adaptación automática transparente según el ISP real del proxy
         if ([ispUp containsString:@"T-MOBILE"] || [ispUp containsString:@"METRO"] || [ispUp containsString:@"MINT"]) {
             prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"T-Mobile";
             prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"260"; prof[@"CarrierISO"] = @"us";
@@ -211,12 +206,11 @@ static void runPeriodicContainerNetworkAudit() {
         NSString *profilePath = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
         [prof writeToFile:profilePath atomically:YES];
 
-        // Consultar a tu VPS (Proxy Center) cada 15 min para chequear que la IP no esté quemada
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
         NSString *plat = [bundleID isEqualToString:@"com.burbn.instagram"] ? @"INSTAGRAM" : @"REDDIT";
-        NSString *contName = [prof[@"craneContainerID"] stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"Default";
+        NSString *contName = [(prof[@"craneContainerID"] ?: @"Default") stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"Default";
         NSString *ispEnc = [ispRaw stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
-        NSString *bssidEnc = [prof[@"bssid"] stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
+        NSString *bssidEnc = [(prof[@"bssid"] ?: @"") stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
         BOOL choicyOK = ([[NSFileManager defaultManager] fileExistsAtPath:CHOICY_PLIST]);
 
         NSString *vpsUrlStr = [NSString stringWithFormat:@"%@?ip=%@&contenedor=%@&plataforma=%@&choicy=%d&bssid=%@&isp=%@&cc=%@",
@@ -225,11 +219,11 @@ static void runPeriodicContainerNetworkAudit() {
         [[session dataTaskWithURL:[NSURL URLWithString:vpsUrlStr] completionHandler:^(NSData *vData, NSURLResponse *vResp, NSError *vErr) {
             if (!vData || vErr) return;
             NSDictionary *vpsJson = [NSJSONSerialization JSONObjectWithData:vData options:0 error:nil];
+            if (![vpsJson isKindOfClass:[NSDictionary class]]) return;
             NSString *status = vpsJson[@"status"] ?: @"LIMPIA";
             prof[@"lastAuditVerdict"] = [NSString stringWithFormat:@"%@ %@", vpsJson[@"icono"] ?: @"🟢", status];
             [prof writeToFile:profilePath atomically:YES];
 
-            // Si en el chequeo de 15 min se detecta IP BANEADA o COOLDOWN, avisar en pantalla de inmediato
             if ([status isEqualToString:@"BANEADA"] || [status isEqualToString:@"COOLDOWN"]) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
@@ -237,7 +231,7 @@ static void runPeriodicContainerNetworkAudit() {
                     while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
                     if (rootVC) {
                         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⚠️ Alerta de Red (Auto-Audit 15m)"
-                                                                                       message:vpsJson[@"mensaje_iphone"]
+                                                                                       message:vpsJson[@"mensaje_iphone"] ?: @"IP con conflicto detectado."
                                                                                 preferredStyle:UIAlertControllerStyleAlert];
                         [alert addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDestructive handler:nil]];
                         [rootVC presentViewController:alert animated:YES completion:nil];
@@ -248,9 +242,6 @@ static void runPeriodicContainerNetworkAudit() {
     }] resume];
 }
 
-// ============================================================================
-// MÓDULO 1: ESCUDOS DE SEGURIDAD (HIDE CRANE, PASSCODE, DEVICECHECK, NO-PUSH)
-// ============================================================================
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index);
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
     const char *name = orig_dyld_get_image_name(image_index);
@@ -314,9 +305,6 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
 }
 %end
 
-// ============================================================================
-// MÓDULO 2: ZONA HORARIA E IDIOMA/REGIÓN POR CONTENEDOR
-// ============================================================================
 %hook NSTimeZone
 + (NSTimeZone *)systemTimeZone {
     if (!isModuleActive(@"spoofLocation")) return %orig;
@@ -345,9 +333,6 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
 }
 %end
 
-// ============================================================================
-// MÓDULO 3: RED, PROXY, OPERADORA (CTCARRIER) Y OCULTACIÓN DE VPN POR CUENTA
-// ============================================================================
 %hook CTCarrier
 - (NSString *)carrierName {
     if (!isModuleActive(@"spoofNetwork")) return %orig;
@@ -438,9 +423,6 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     return res;
 }
 
-// ============================================================================
-// MÓDULO 4: HARDWARE REALISTA CON DERIVA VIVA (DISCO, BATERÍA, UPTIME, IDFV)
-// ============================================================================
 %hook UIDevice
 - (NSString *)name {
     if (!isModuleActive(@"spoofHardware")) return %orig;
@@ -465,7 +447,6 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     if (!isModuleActive(@"spoofHardware")) return %orig;
     NSDictionary *prof = getContainerProfile();
     float baseBat = [prof[@"batteryLevel"] floatValue];
-    // Baja 1% cada 15 minutos de sesión activa para simular consumo real de batería
     NSTimeInterval elapsedMinutes = ([[NSDate date] timeIntervalSince1970] - sessionStartTimestamp) / 60.0;
     float drop = (float)((int)(elapsedMinutes / 15.0)) * 0.01f;
     return MAX(0.15f, baseBat - drop);
@@ -498,7 +479,6 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     NSDictionary *prof = getContainerProfile();
     if (prof[@"freeBytes"]) {
         unsigned long long baseFree = [prof[@"freeBytes"] unsignedLongLongValue];
-        // Fluctuación realista de caché en tiempo de uso (varía unos KB por minuto)
         unsigned long long driftBytes = (unsigned long long)(([[NSDate date] timeIntervalSince1970] - sessionStartTimestamp) * 4096.0);
         modified[NSFileSystemFreeSize] = @(baseFree - (driftBytes % (20 * 1024 * 1024)));
     }
@@ -588,7 +568,6 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
-    // Iniciar auto-auditoría al abrir la app y repetir automáticamente cada 15 minutos (900 segundos)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         runPeriodicContainerNetworkAudit();
         [NSTimer scheduledTimerWithTimeInterval:900.0 repeats:YES block:^(NSTimer * _Nonnull timer) {

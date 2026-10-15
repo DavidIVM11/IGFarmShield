@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = IGFarmShield
 
 IGFarmShield_FILES = Tweak.x
-IGFarmShield_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable
+IGFarmShield_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-error
 IGFarmShield_FRAMEWORKS = UIKit Foundation CFNetwork LocalAuthentication CoreTelephony DeviceCheck SystemConfiguration AVFoundation
 
 SUBPROJECTS += igfarmshieldprefs
