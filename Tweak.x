@@ -1,6 +1,5 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <QuartzCore/QuartzCore.h>
 #import <CFNetwork/CFNetwork.h>
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <CoreTelephony/CTCarrier.h>
