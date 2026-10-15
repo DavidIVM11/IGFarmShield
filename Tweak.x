@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <CFNetwork/CFNetwork.h>
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <CoreTelephony/CTCarrier.h>
@@ -26,7 +27,7 @@
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CHOICY_PLIST @"/var/jb/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 8
+#define CURRENT_SCHEMA_VERSION 9
 
 static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
@@ -49,12 +50,12 @@ static uint64_t fnv1aHash(NSString *input) {
 }
 
 static void applyLowLevelCTimeZone(NSString *tzName) {
-    if (!tzName || tzName.length == 0) return;
+    if (!tzName || [tzName hasPrefix:@"Sincronizando"] || tzName.length == 0) return;
     setenv("TZ", [tzName UTF8String], 1);
     tzset();
 }
 
-static NSString *recursiveFindCraneName(id node, NSString *targetID) {
+static NSString *findCraneNameByID(id node, NSString *targetID) {
     if (!node || !targetID || targetID.length == 0) return nil;
     if ([node isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)node;
@@ -77,20 +78,20 @@ static NSString *recursiveFindCraneName(id node, NSString *targetID) {
                 }
             }
             if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
-                NSString *found = recursiveFindCraneName(val, targetID);
+                NSString *found = findCraneNameByID(val, targetID);
                 if (found) return found;
             }
         }
     } else if ([node isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)node) {
-            NSString *found = recursiveFindCraneName(item, targetID);
+            NSString *found = findCraneNameByID(item, targetID);
             if (found) return found;
         }
     }
     return nil;
 }
 
-static void resolveCraneIdentity(NSString *homePath, NSString **outCraneID, NSString **outCraneName) {
+static void resolveCraneIdentity(NSString *homePath, NSString **outKeyUUID, NSString **outCraneID, NSString **outCraneName) {
     NSString *folderUUID = [homePath lastPathComponent] ?: @"Default";
     NSString *metaPath = [homePath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
     NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
@@ -99,8 +100,11 @@ static void resolveCraneIdentity(NSString *homePath, NSString **outCraneID, NSSt
     NSString *craneName = nil;
 
     if ([meta isKindOfClass:[NSDictionary class]]) {
-        if ([meta[@"MCMMetadataUUID"] isKindOfClass:[NSString class]]) {
-            folderUUID = meta[@"MCMMetadataUUID"];
+        for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
+            if ([meta[rk] isKindOfClass:[NSString class]] && [meta[rk] length] > 0) craneName = meta[rk];
+        }
+        for (NSString *ik in @[@"com.opa334.crane.container.identifier", @"com.opa334.crane.container.id", @"craneContainerIdentifier"]) {
+            if ([meta[ik] isKindOfClass:[NSString class]] && [meta[ik] length] > 0) craneID = meta[ik];
         }
         NSDictionary *userInfo = meta[@"MCMMetadataUserInfo"];
         if ([userInfo isKindOfClass:[NSDictionary class]]) {
@@ -109,7 +113,9 @@ static void resolveCraneIdentity(NSString *homePath, NSString **outCraneID, NSSt
                 id val = userInfo[k];
                 if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
                     if ([kl containsString:@"name"]) craneName = val;
-                    else if ([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"]) craneID = val;
+                    else if ([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"]) {
+                        if (![val hasPrefix:@"com."]) craneID = val;
+                    }
                 }
             }
         }
@@ -118,24 +124,39 @@ static void resolveCraneIdentity(NSString *homePath, NSString **outCraneID, NSSt
     if (!craneID && origCraneIDFV && origCraneIDFV.length > 0) {
         craneID = origCraneIDFV;
     }
-    if (!craneID) craneID = folderUUID;
+    if (!craneID) {
+        craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
+    }
 
+    NSMutableArray *sources = [NSMutableArray array];
+    for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
+        CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, (__bridge CFStringRef)domain, CFSTR("mobile"), kCFPreferencesAnyHost);
+        if (cfDict) {
+            NSDictionary *d = CFBridgingRelease(cfDict);
+            if ([d count] > 0) [sources addObject:d];
+        }
+    }
     for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_PREFS_VAR]) {
         NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
-        if (cPrefs) {
-            if (!craneName) craneName = recursiveFindCraneName(cPrefs, craneID);
-            if (!craneName) craneName = recursiveFindCraneName(cPrefs, folderUUID);
-        }
+        if (cPrefs) [sources addObject:cPrefs];
+    }
+
+    for (NSDictionary *src in sources) {
+        if (!craneName && craneID) craneName = findCraneNameByID(src, craneID);
+        if (!craneName && origCraneIDFV) craneName = findCraneNameByID(src, origCraneIDFV);
+        if (!craneName) craneName = findCraneNameByID(src, folderUUID);
     }
 
     if (!craneName || craneName.length == 0) {
-        if (!meta[@"MCMMetadataUserInfo"] || [meta[@"MCMMetadataUserInfo"] count] == 0 || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
+        if ((!meta[@"MCMMetadataUserInfo"] || [meta[@"MCMMetadataUserInfo"] count] == 0) ||
+            [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
             craneName = @"Default";
         } else {
-            craneName = [NSString stringWithFormat:@"Crane (%@)", [craneID substringToIndex:MIN(8, craneID.length)]];
+            craneName = craneID;
         }
     }
 
+    *outKeyUUID = craneID;
     *outCraneID = craneID;
     *outCraneName = craneName;
 }
@@ -146,10 +167,11 @@ static NSMutableDictionary *getContainerProfile() {
         sessionStartTimestamp = [[NSDate date] timeIntervalSince1970];
         NSString *homePath = NSHomeDirectory();
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.burbn.instagram";
-        NSString *folderUUID = [homePath lastPathComponent] ?: @"Default";
+
+        NSString *keyUUID = nil;
         NSString *craneID = nil;
         NSString *craneName = nil;
-        resolveCraneIdentity(homePath, &craneID, &craneName);
+        resolveCraneIdentity(homePath, &keyUUID, &craneID, &craneName);
 
         NSString *localPlist = [homePath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
         NSDictionary *loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST];
@@ -165,23 +187,20 @@ static NSMutableDictionary *getContainerProfile() {
             [diskLoaded[@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION &&
             diskLoaded[@"idfv"]) {
             profile = [diskLoaded mutableCopy];
-        } else if ([byUUID[folderUUID] isKindOfClass:[NSDictionary class]] &&
-                   [byUUID[folderUUID][@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION) {
-            profile = [byUUID[folderUUID] mutableCopy];
-        } else if ([byUUID[craneID] isKindOfClass:[NSDictionary class]] &&
-                   [byUUID[craneID][@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION) {
-            profile = [byUUID[craneID] mutableCopy];
+        } else if ([byUUID[keyUUID] isKindOfClass:[NSDictionary class]] &&
+                   [byUUID[keyUUID][@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION) {
+            profile = [byUUID[keyUUID] mutableCopy];
         }
 
-        if (profile && [byUUID[folderUUID] isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *stCopy = byUUID[folderUUID];
+        if (profile && [byUUID[keyUUID] isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *stCopy = byUUID[keyUUID];
             for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP"]) {
                 if (stCopy[k] != nil) profile[k] = stCopy[k];
             }
         }
 
         if (!profile || !profile[@"idfv"]) {
-            uint64_t seed = fnv1aHash(folderUUID) ^ (((uint64_t)arc4random() << 32) | arc4random());
+            uint64_t seed = fnv1aHash(keyUUID) ^ (((uint64_t)arc4random() << 32) | arc4random());
             NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
             NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
             NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0"];
@@ -198,10 +217,12 @@ static NSMutableDictionary *getContainerProfile() {
             NSString *localIP = [NSString stringWithFormat:@"%@.%d", subnet, 15 + (int)(seed % 220)];
             unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
 
+            NSString *baseIDFV = (origCraneIDFV && origCraneIDFV.length >= 32) ? origCraneIDFV : [[NSUUID UUID] UUIDString];
+
             profile = [@{
                 @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
-                @"containerUUID": folderUUID,
-                @"craneIdentifier": craneID,
+                @"containerUUID": keyUUID,
+                @"craneIdentifier": origCraneIDFV ?: craneID,
                 @"containerName": craneName,
                 @"bundleID": bundleID,
                 @"path": homePath,
@@ -216,7 +237,7 @@ static NSMutableDictionary *getContainerProfile() {
                 @"osBuild": osBuild,
                 @"deviceName": [NSString stringWithFormat:@"iPhone-%02X", (unsigned int)(seed & 0xFF)],
                 @"craneOriginalIDFV": origCraneIDFV ?: craneID,
-                @"idfv": [[NSUUID UUID] UUIDString],
+                @"idfv": baseIDFV,
                 @"shieldDeviceID": [[NSUUID UUID] UUIDString],
                 @"bootSessionUUID": [[NSUUID UUID] UUIDString],
                 @"cloudUUID": [[NSUUID UUID] UUIDString],
@@ -229,37 +250,40 @@ static NSMutableDictionary *getContainerProfile() {
                 @"brightness": @(0.30f + (((seed >> 4) % 60) / 100.0f)),
                 @"audioVolume": @(0.20f + (((seed >> 6) % 70) / 100.0f)),
                 @"pasteboardCount": @(5 + (seed % 90)),
-                @"timeZone": @"Sincronizando con IP...",
+                @"lastSyncedIP": @"Sincronizando...",
+                @"ispName": @"ISP",
+                @"cityCountry": @"Sincronizando con IP...",
+                @"timeZone": @"America/New_York",
                 @"localeID": @"en_US",
                 @"CarrierMode": @"WIFI_ONLY",
-                @"CarrierName": @"Sincronizando...",
+                @"CarrierName": @"ISP",
                 @"CarrierMCC": @"310",
                 @"CarrierMNC": @"260",
                 @"CarrierISO": @"us"
             } mutableCopy];
         } else {
             profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
-            profile[@"containerUUID"] = folderUUID;
-            profile[@"craneIdentifier"] = craneID;
+            profile[@"containerUUID"] = keyUUID;
+            profile[@"craneIdentifier"] = origCraneIDFV ?: craneID;
             profile[@"bundleID"] = bundleID;
             profile[@"path"] = homePath;
-            if (![craneName hasPrefix:@"Crane ("]) {
+            if (craneName && ![craneName isEqualToString:keyUUID]) {
                 profile[@"containerName"] = craneName;
             }
         }
 
-        if ([profile[@"spoofLocation"] boolValue] && profile[@"timeZone"] && ![profile[@"timeZone"] hasPrefix:@"Sincronizando"]) {
+        if ([profile[@"spoofLocation"] boolValue] && profile[@"timeZone"]) {
             applyLowLevelCTimeZone(profile[@"timeZone"]);
         }
 
         [profile writeToFile:localPlist atomically:YES];
-        byUUID[folderUUID] = profile;
+        byUUID[keyUUID] = profile;
         globalSt[@"containersByUUID"] = byUUID;
 
         NSMutableDictionary *activeMap = [globalSt[@"activeInCrane"] isKindOfClass:[NSDictionary class]]
             ? [globalSt[@"activeInCrane"] mutableCopy]
             : [NSMutableDictionary dictionary];
-        activeMap[bundleID] = folderUUID;
+        activeMap[bundleID] = keyUUID;
         globalSt[@"activeInCrane"] = activeMap;
         [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
 
@@ -283,9 +307,9 @@ static BOOL isModuleActive(NSString *moduleKey) {
 }
 
 // ============================================================================
-// SINCRONIZACIÓN AUTOMÁTICA DE RED E IP (ANCLA DE UBICACIÓN EN 1RA CONEXIÓN)
+// SINCRONIZACIÓN TRANSPARENTE CON LA IP EN VIVO (CADA 15 MINUTOS)
 // ============================================================================
-static void syncContainerWithLiveIP(BOOL forceReanchor) {
+static void syncContainerWithLiveIP() {
     if (!isModuleActive(@"spoofNetwork")) return;
 
     NSURL *ipUrl = [NSURL URLWithString:@"http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,timezone,isp,mobile,query"];
@@ -310,13 +334,11 @@ static void syncContainerWithLiveIP(BOOL forceReanchor) {
         NSMutableDictionary *prof = getContainerProfile();
         NSString *localPlist = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
 
-        // Siempre actualiza la IP actual y el ISP de forma transparente
         prof[@"lastSyncedIP"] = ip;
         prof[@"ispName"] = ispRaw;
 
-        // Si es la primera conexión del contenedor (o se forzó re-sincronizar), anclar la ubicación estática y operadora
-        BOOL alreadyAnchored = [prof[@"locationAnchored"] boolValue];
-        if (!alreadyAnchored || forceReanchor) {
+        // Si es la primera conexión del contenedor, fija la ubicación estática de esa IP
+        if (![prof[@"locationAnchored"] boolValue]) {
             prof[@"locationAnchored"] = @YES;
             prof[@"timeZone"] = tz;
             prof[@"localeID"] = [NSString stringWithFormat:@"en_%@", [cc uppercaseString]];
@@ -362,13 +384,6 @@ static void showStartupBanner() {
     bannerShownThisSession = YES;
 
     NSMutableDictionary *prof = getContainerProfile();
-    NSString *localPlist = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
-    if (origCraneIDFV && origCraneIDFV.length > 0) {
-        prof[@"craneOriginalIDFV"] = origCraneIDFV;
-        prof[@"craneIdentifier"] = origCraneIDFV;
-        [prof writeToFile:localPlist atomically:YES];
-    }
-
     UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
     if (!keyWin) {
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
@@ -379,8 +394,8 @@ static void showStartupBanner() {
 
     BOOL active = isModuleActive(nil);
     NSString *cName = prof[@"containerName"] ?: @"Default";
-    NSString *idfvStr = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"";
-    NSString *shortIDFV = (idfvStr.length > 8) ? [idfvStr substringToIndex:8] : idfvStr;
+    NSString *craneID = prof[@"craneIdentifier"] ?: @"";
+    NSString *shortID = (craneID.length > 8) ? [craneID substringToIndex:8] : craneID;
 
     UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(16, 44, keyWin.bounds.size.width - 32, 40)];
     toast.layer.cornerRadius = 10;
@@ -392,8 +407,8 @@ static void showStartupBanner() {
 
     if (active) {
         toast.backgroundColor = [UIColor colorWithRed:0.06 green:0.48 blue:0.24 alpha:0.92];
-        toast.text = [NSString stringWithFormat:@"🛡️ %@ • Escudo Activo\nIDFV: %@... • IP: %@",
-                      cName, shortIDFV, prof[@"lastSyncedIP"] ?: @"Sincronizando..."];
+        toast.text = [NSString stringWithFormat:@"🛡️ %@ • Crane ID: %@...\n%@ • %@",
+                      cName, shortID, prof[@"lastSyncedIP"] ?: @"Sincronizando IP...", prof[@"timeZone"] ?: @""];
     } else {
         toast.backgroundColor = [UIColor colorWithRed:0.75 green:0.15 blue:0.15 alpha:0.92];
         toast.text = [NSString stringWithFormat:@"⚪ %@ • Escudo en Pausa", cName];
@@ -406,7 +421,7 @@ static void showStartupBanner() {
 }
 
 // ============================================================================
-// ESCUDO ANTI-DETECCIÓN (COMPLEMENTO DE CHOICY)
+// OCULTACIÓN DE JAILBREAK Y LIBRERÍAS (COMPLEMENTO CHOICY)
 // ============================================================================
 static BOOL isSuspiciousPathC(const char *path) {
     if (!path) return NO;
@@ -829,10 +844,10 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        syncContainerWithLiveIP(NO);
+        syncContainerWithLiveIP();
         showStartupBanner();
         [NSTimer scheduledTimerWithTimeInterval:900.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-            syncContainerWithLiveIP(NO);
+            syncContainerWithLiveIP();
         }];
     });
 }
