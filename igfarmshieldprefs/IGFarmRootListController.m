@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 #import <ifaddrs.h>
 #import <arpa/inet.h>
 #import <net/if.h>
@@ -13,14 +14,81 @@
 
 @class IGFarmRootListController;
 
-// Declaración limpia de PSViewController (se resuelve en tiempo de ejecución dentro de Settings.app)
-@interface PSViewController : UIViewController
+static id dynamicSafeFallbackIMP(id self, SEL _cmd) {
+    return nil;
+}
+
+static NSString *safeSub(NSString *str, NSUInteger maxLen) {
+    if (!str || ![str isKindOfClass:[NSString class]]) return @"N/A";
+    if (str.length <= maxLen) return str;
+    return [str substringToIndex:maxLen];
+}
+
+// ============================================================================
+// CLASE BASE COMPATIBLE CON SETTINGS.APP EN iOS 16 (NO REQUIERE PRIVATE SDK)
+// ============================================================================
+@interface IGFarmPSBaseController : UIViewController {
+    id _specifier;
+    id _rootController;
+    id _parentController;
+}
+- (instancetype)initForContentSize:(CGSize)contentSize;
+- (void)setSpecifier:(id)specifier;
+- (id)specifier;
+- (void)setRootController:(id)rc;
+- (id)rootController;
+- (void)setParentController:(id)pc;
+- (id)parentController;
+- (void)handleURL:(NSDictionary *)url;
+- (void)handleURL:(NSDictionary *)url withCompletion:(void (^)(void))completion;
+- (BOOL)canBeShownFromSuspendedState;
+- (void)viewWillBecomeVisible:(void *)source;
+- (id)readPreferenceValue:(id)specifier;
+- (void)setPreferenceValue:(id)value specifier:(id)specifier;
+- (void)suspend;
+- (void)didLock;
+- (void)willUnlock;
+- (void)didUnlock;
+- (void)didWake;
+- (void)willBecomeActive;
+- (void)willResignActive;
+- (void)statusBarWillAnimateByHeight:(double)height;
+@end
+
+@implementation IGFarmPSBaseController
+- (instancetype)initForContentSize:(CGSize)contentSize { return [self init]; }
+- (void)setSpecifier:(id)specifier { _specifier = specifier; }
+- (id)specifier { return _specifier; }
+- (void)setRootController:(id)rc { _rootController = rc; }
+- (id)rootController { return _rootController; }
+- (void)setParentController:(id)pc { _parentController = pc; }
+- (id)parentController { return _parentController; }
+- (void)handleURL:(NSDictionary *)url {}
+- (void)handleURL:(NSDictionary *)url withCompletion:(void (^)(void))completion { if (completion) completion(); }
+- (BOOL)canBeShownFromSuspendedState { return YES; }
+- (void)viewWillBecomeVisible:(void *)source {}
+- (id)readPreferenceValue:(id)specifier { return nil; }
+- (void)setPreferenceValue:(id)value specifier:(id)specifier {}
+- (void)suspend {}
+- (void)didLock {}
+- (void)willUnlock {}
+- (void)didUnlock {}
+- (void)didWake {}
+- (void)willBecomeActive {}
+- (void)willResignActive {}
+- (void)statusBarWillAnimateByHeight:(double)height {}
+
++ (BOOL)resolveInstanceMethod:(SEL)sel {
+    if ([super resolveInstanceMethod:sel]) return YES;
+    class_addMethod(self, sel, (IMP)dynamicSafeFallbackIMP, "@@:");
+    return YES;
+}
 @end
 
 // ============================================================================
 // NIVEL 3: PANTALLA EXCLUSIVA DE CONFIGURACIÓN POR CONTENEDOR
 // ============================================================================
-@interface IGFarmContainerDetailController : PSViewController <UITableViewDelegate, UITableViewDataSource>
+@interface IGFarmContainerDetailController : IGFarmPSBaseController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) NSDictionary *containerItem;
 @property (nonatomic, strong) NSMutableDictionary *profile;
 @property (nonatomic, assign) BOOL isIG;
@@ -38,7 +106,7 @@
 // ============================================================================
 // NIVEL 2: SUB-CONTROLADOR POR APLICACIÓN (INSTAGRAM / REDDIT)
 // ============================================================================
-@interface IGFarmAppContainersController : PSViewController <UITableViewDelegate, UITableViewDataSource>
+@interface IGFarmAppContainersController : IGFarmPSBaseController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) NSString *appTitle;
 @property (nonatomic, strong) NSString *stateKey;
 @property (nonatomic, assign) BOOL isIG;
@@ -52,7 +120,7 @@
 // ============================================================================
 // NIVEL 1: CONTROLADOR RAÍZ EN CONFIGURACIÓN DE IOS
 // ============================================================================
-@interface IGFarmRootListController : PSViewController <UITableViewDelegate, UITableViewDataSource>
+@interface IGFarmRootListController : IGFarmPSBaseController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableDictionary *state;
 @property (nonatomic, strong) NSMutableArray *igContainers;
@@ -231,24 +299,22 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         NSString *craneID = self.profile[@"craneContainerID"] ?: (self.containerItem[@"uuid"] ?: @"Default");
         NSString *craneOrigIDFV = self.profile[@"craneOriginalIDFV"] ?: @"Aislado por Crane";
         NSString *shieldDevID = self.profile[@"shieldDeviceID"] ?: (self.profile[@"cloudUUID"] ?: @"N/A");
-        NSString *idfvStr = self.profile[@"idfv"] ?: @"N/A";
-        NSString *bootStr = self.profile[@"bootSessionUUID"] ?: @"N/A";
 
         if (indexPath.row == 0) {
             cell.textLabel.text = @"🆔 ID Contenedor (Crane)";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"📦 %@", [craneID substringToIndex:MIN(16, craneID.length)]];
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"📦 %@", safeSub(craneID, 16)];
         } else if (indexPath.row == 1) {
             cell.textLabel.text = @"🧬 IDFV Base (Que da Crane)";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"📦 %@", [craneOrigIDFV substringToIndex:MIN(16, craneOrigIDFV.length)]];
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"📦 %@", safeSub(craneOrigIDFV, 16)];
         } else if (indexPath.row == 2) {
             cell.textLabel.text = @"🛡️ Nuevo Device ID (Shield)";
-            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", [shieldDevID substringToIndex:MIN(14, shieldDevID.length)]] : @"⚪ Desactivado";
+            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", safeSub(shieldDevID, 14)] : @"⚪ Desactivado";
         } else if (indexPath.row == 3) {
             cell.textLabel.text = @"🔑 Nuevo Vendor ID (Shield IDFV)";
-            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", [idfvStr substringToIndex:MIN(14, idfvStr.length)]] : @"⚪ Usando IDFV de Crane";
+            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", safeSub(self.profile[@"idfv"], 14)] : @"⚪ Usando IDFV de Crane";
         } else if (indexPath.row == 4) {
             cell.textLabel.text = @"🔄 BootSession UUID (Kernel)";
-            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", [bootStr substringToIndex:MIN(14, bootStr.length)]] : @"⚪ Real";
+            cell.detailTextLabel.text = [self isModOn:@"spoofIDs"] ? [NSString stringWithFormat:@"🟢 %@", safeSub(self.profile[@"bootSessionUUID"], 14)] : @"⚪ Real";
         } else if (indexPath.row == 5) {
             cell.textLabel.text = @"📡 Router Wi-Fi (BSSID / SSID)";
             cell.detailTextLabel.text = [self isModOn:@"spoofNetwork"] ? [NSString stringWithFormat:@"🟢 %@ (%@)", self.profile[@"bssid"] ?: @"", self.profile[@"ssid"] ?: @""] : @"⚪ Router Real";
@@ -363,7 +429,7 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         NSString *plat = self.isIG ? @"INSTAGRAM" : @"REDDIT";
         NSString *contName = [self.containerItem[@"title"] stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"Container";
         NSString *ispEnc = [ispRaw stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
-        NSString *bssidEnc = [self.profile[@"bssid"] stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
+        NSString *bssidEnc = [(self.profile[@"bssid"] ?: @"") stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
 
         NSString *vpsUrlStr = [NSString stringWithFormat:@"%@?ip=%@&contenedor=%@&plataforma=%@&choicy=%d&bssid=%@&isp=%@&cc=%@",
                                VPS_AUDIT_URL, ip, contName, plat, choicyOK ? 1 : 0, bssidEnc, ispEnc, cc];
@@ -535,8 +601,8 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
         cell.detailTextLabel.text = [NSString stringWithFormat:@"🛡️ %@ | %@ | IDFV: %@... | Shield: %@...",
                                      prof[@"CarrierName"] ?: @"T-Mobile",
                                      prof[@"localIP"] ?: @"",
-                                     [idfv substringToIndex:MIN(6, idfv.length)],
-                                     [sID substringToIndex:MIN(6, sID.length)]];
+                                     safeSub(idfv, 6),
+                                     safeSub(sID, 6)];
     } else {
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
         cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ Usando Sistema Real (%@)", self.parentRoot.realLocalIP ?: @""];
@@ -572,7 +638,9 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"IGFarmShield";
-    self.state = [NSMutableDictionary dictionaryWithContentsOfFile:STATE_PLIST] ?: [NSMutableDictionary dictionary];
+
+    NSDictionary *loaded = [NSDictionary dictionaryWithContentsOfFile:STATE_PLIST];
+    self.state = loaded ? [loaded mutableCopy] : [NSMutableDictionary dictionary];
 
     if (!self.state[@"masterEnabled"]) self.state[@"masterEnabled"] = @YES;
     if (!self.state[@"enableIG"]) self.state[@"enableIG"] = @YES;
@@ -641,62 +709,68 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 }
 
 - (void)refreshRealPhoneTelemetry {
-    size_t size = 0;
-    sysctlbyname("hw.machine", NULL, &size, NULL, 0);
-    if (size > 0) {
-        char *machine = malloc(size);
-        sysctlbyname("hw.machine", machine, &size, NULL, 0);
-        self.realHardwareModel = [NSString stringWithUTF8String:machine] ?: @"iPhone10,4";
-        free(machine);
-    } else {
-        self.realHardwareModel = @"iPhone10,4";
-    }
+    @try {
+        size_t size = 0;
+        sysctlbyname("hw.machine", NULL, &size, NULL, 0);
+        if (size > 0) {
+            char *machine = malloc(size);
+            sysctlbyname("hw.machine", machine, &size, NULL, 0);
+            self.realHardwareModel = [NSString stringWithUTF8String:machine] ?: @"iPhone10,4";
+            free(machine);
+        } else {
+            self.realHardwareModel = @"iPhone10,4";
+        }
 
-    self.realTimeZone = [[NSTimeZone localTimeZone] name] ?: @"Local";
+        self.realTimeZone = [[NSTimeZone localTimeZone] name] ?: @"Local";
 
-    [UIDevice currentDevice].batteryMonitoringEnabled = YES;
-    float rawBat = [UIDevice currentDevice].batteryLevel;
-    self.realBatteryPct = (rawBat > 0) ? (int)(rawBat * 100.0f) : 50;
+        [UIDevice currentDevice].batteryMonitoringEnabled = YES;
+        float rawBat = [UIDevice currentDevice].batteryLevel;
+        self.realBatteryPct = (rawBat > 0) ? (int)(rawBat * 100.0f) : 50;
 
-    NSDictionary *fsAttr = [[NSFileManager defaultManager] attributesOfFileSystemForPath:@"/var/mobile" error:nil];
-    unsigned long long freeBytes = [fsAttr[NSFileSystemFreeSize] unsignedLongLongValue];
-    unsigned long long totalBytes = [fsAttr[NSFileSystemSize] unsignedLongLongValue];
-    self.realFreeDisk = [NSString stringWithFormat:@"%.2f GB de %.0f GB",
-                         (double)freeBytes / (1024.0*1024.0*1024.0),
-                         (double)totalBytes / (1024.0*1024.0*1024.0)];
+        NSDictionary *fsAttr = [[NSFileManager defaultManager] attributesOfFileSystemForPath:@"/var/mobile" error:nil];
+        unsigned long long freeBytes = [fsAttr[NSFileSystemFreeSize] unsignedLongLongValue];
+        unsigned long long totalBytes = [fsAttr[NSFileSystemSize] unsignedLongLongValue];
+        self.realFreeDisk = [NSString stringWithFormat:@"%.2f GB de %.0f GB",
+                             (double)freeBytes / (1024.0*1024.0*1024.0),
+                             (double)totalBytes / (1024.0*1024.0*1024.0)];
 
-    self.vpnActive = NO;
-    self.vpnInterfaceName = @"Ninguno";
-    self.realLocalIP = @"Sin Wi-Fi";
+        self.vpnActive = NO;
+        self.vpnInterfaceName = @"Ninguno";
+        self.realLocalIP = @"Sin Wi-Fi";
 
-    struct ifaddrs *interfaces = NULL;
-    if (getifaddrs(&interfaces) == 0) {
-        struct ifaddrs *temp = interfaces;
-        while (temp != NULL) {
-            if (temp->ifa_addr && temp->ifa_addr->sa_family == AF_INET && (temp->ifa_flags & IFF_UP)) {
-                NSString *ifName = [NSString stringWithUTF8String:temp->ifa_name];
-                char addrBuf[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &((struct sockaddr_in *)temp->ifa_addr)->sin_addr, addrBuf, INET_ADDRSTRLEN);
-                NSString *ipStr = [NSString stringWithUTF8String:addrBuf];
+        struct ifaddrs *interfaces = NULL;
+        if (getifaddrs(&interfaces) == 0) {
+            struct ifaddrs *temp = interfaces;
+            while (temp != NULL) {
+                if (temp->ifa_addr && temp->ifa_addr->sa_family == AF_INET && (temp->ifa_flags & IFF_UP)) {
+                    NSString *ifName = [NSString stringWithUTF8String:temp->ifa_name];
+                    char addrBuf[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)temp->ifa_addr)->sin_addr, addrBuf, INET_ADDRSTRLEN);
+                    NSString *ipStr = [NSString stringWithUTF8String:addrBuf];
 
-                if ([ifName isEqualToString:@"en0"] && ipStr) {
-                    self.realLocalIP = ipStr;
-                } else if ([ifName hasPrefix:@"utun"] || [ifName hasPrefix:@"ppp"] || [ifName hasPrefix:@"ipsec"]) {
-                    if (ipStr && ![ipStr hasPrefix:@"127."] && ![ipStr hasPrefix:@"169.254."]) {
-                        self.vpnActive = YES;
-                        self.vpnInterfaceName = [NSString stringWithFormat:@"%@ (%@)", ifName, ipStr];
+                    if ([ifName isEqualToString:@"en0"] && ipStr) {
+                        self.realLocalIP = ipStr;
+                    } else if ([ifName hasPrefix:@"utun"] || [ifName hasPrefix:@"ppp"] || [ifName hasPrefix:@"ipsec"]) {
+                        if (ipStr && ![ipStr hasPrefix:@"127."] && ![ipStr hasPrefix:@"169.254."]) {
+                            self.vpnActive = YES;
+                            self.vpnInterfaceName = [NSString stringWithFormat:@"%@ (%@)", ifName, ipStr];
+                        }
                     }
                 }
+                temp = temp->ifa_next;
             }
-            temp = temp->ifa_next;
+            freeifaddrs(interfaces);
         }
-        freeifaddrs(interfaces);
+    } @catch (NSException *exception) {
+        self.realHardwareModel = @"iPhone10,4";
+        self.realLocalIP = @"192.168.1.x";
     }
 }
 
 - (NSMutableDictionary *)ensureProfileForContainerPath:(NSString *)containerPath forceRotate:(BOOL)rotate {
     NSString *profilePath = [containerPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
-    NSMutableDictionary *profile = [NSMutableDictionary dictionaryWithContentsOfFile:profilePath];
+    NSDictionary *loaded = [NSDictionary dictionaryWithContentsOfFile:profilePath];
+    NSMutableDictionary *profile = loaded ? [loaded mutableCopy] : nil;
 
     if (!profile || !profile[@"idfv"] || rotate) {
         BOOL wasEnabled = profile[@"enabled"] ? [profile[@"enabled"] boolValue] : YES;
@@ -768,78 +842,80 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 - (void)scanAllRealContainersOnDisk {
     self.igContainers = [NSMutableArray array];
     self.redditContainers = [NSMutableArray array];
-    NSMutableSet *seenPaths = [NSMutableSet set];
-    NSFileManager *fm = [NSFileManager defaultManager];
+    @try {
+        NSMutableSet *seenPaths = [NSMutableSet set];
+        NSFileManager *fm = [NSFileManager defaultManager];
 
-    NSDictionary *freshState = [NSDictionary dictionaryWithContentsOfFile:STATE_PLIST];
-    NSDictionary *known = freshState[@"knownContainers"];
-    if ([known isKindOfClass:[NSDictionary class]]) {
-        for (NSString *cPath in known) {
-            if (![fm fileExistsAtPath:cPath]) continue;
-            NSDictionary *info = known[cPath];
-            if (![info isKindOfClass:[NSDictionary class]]) continue;
-            NSString *bID = info[@"bundleID"] ?: @"";
-            NSString *cName = info[@"craneName"] ?: ([cPath lastPathComponent] ?: @"Default");
-            BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
-            BOOL isReddit = [bID isEqualToString:@"com.reddit.Reddit"];
-            if (!isIG && !isReddit) continue;
+        NSDictionary *freshState = [NSDictionary dictionaryWithContentsOfFile:STATE_PLIST];
+        NSDictionary *known = freshState[@"knownContainers"];
+        if ([known isKindOfClass:[NSDictionary class]]) {
+            for (NSString *cPath in known) {
+                if (![fm fileExistsAtPath:cPath]) continue;
+                NSDictionary *info = known[cPath];
+                if (![info isKindOfClass:[NSDictionary class]]) continue;
+                NSString *bID = info[@"bundleID"] ?: @"";
+                NSString *cName = info[@"craneName"] ?: ([cPath lastPathComponent] ?: @"Default");
+                BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
+                BOOL isReddit = [bID isEqualToString:@"com.reddit.Reddit"];
+                if (!isIG && !isReddit) continue;
 
-            NSMutableDictionary *prof = [self ensureProfileForContainerPath:cPath forceRotate:NO];
-            NSMutableArray *targetList = isIG ? self.igContainers : self.redditContainers;
-            [targetList addObject:@{
-                @"title": [NSString stringWithFormat:@"[%@]", cName],
-                @"path": cPath,
-                @"uuid": cName,
-                @"profile": prof
-            }];
-            [seenPaths addObject:cPath];
-        }
-    }
-
-    NSString *appsDir = @"/var/mobile/Containers/Data/Application";
-    NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
-
-    for (NSString *uuid in uuids) {
-        NSString *fullPath = [appsDir stringByAppendingPathComponent:uuid];
-        NSString *metaPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-        NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
-        NSString *bundleID = meta[@"MCMMetadataIdentifier"] ?: @"";
-
-        BOOL isIG = [bundleID isEqualToString:@"com.burbn.instagram"];
-        BOOL isReddit = [bundleID isEqualToString:@"com.reddit.Reddit"];
-        if (!isIG && !isReddit) continue;
-
-        NSMutableArray *targetList = isIG ? self.igContainers : self.redditContainers;
-        if (![seenPaths containsObject:fullPath]) {
-            NSString *craneName = meta[@"com.opa334.crane.container.name"] ?: @"Default";
-            NSString *shortUUID = [uuid substringToIndex:MIN(6, uuid.length)];
-            NSMutableDictionary *prof = [self ensureProfileForContainerPath:fullPath forceRotate:NO];
-            [targetList addObject:@{
-                @"title": [NSString stringWithFormat:@"[%@] (%@)", craneName, shortUUID],
-                @"path": fullPath,
-                @"uuid": uuid,
-                @"profile": prof
-            }];
-            [seenPaths addObject:fullPath];
-        }
-
-        NSString *subCraneDir = [fullPath stringByAppendingPathComponent:@"___Crane_Containers"];
-        if ([fm fileExistsAtPath:subCraneDir]) {
-            NSArray *subUUIDs = [fm contentsOfDirectoryAtPath:subCraneDir error:nil];
-            for (NSString *sub in subUUIDs) {
-                NSString *subPath = [subCraneDir stringByAppendingPathComponent:sub];
-                if ([seenPaths containsObject:subPath]) continue;
-                NSMutableDictionary *subProf = [self ensureProfileForContainerPath:subPath forceRotate:NO];
+                NSMutableDictionary *prof = [self ensureProfileForContainerPath:cPath forceRotate:NO];
+                NSMutableArray *targetList = isIG ? self.igContainers : self.redditContainers;
                 [targetList addObject:@{
-                    @"title": [NSString stringWithFormat:@"[Crane: %@]", [sub substringToIndex:MIN(8, sub.length)]],
-                    @"path": subPath,
-                    @"uuid": sub,
-                    @"profile": subProf
+                    @"title": [NSString stringWithFormat:@"[%@]", cName],
+                    @"path": cPath,
+                    @"uuid": cName,
+                    @"profile": prof
                 }];
-                [seenPaths addObject:subPath];
+                [seenPaths addObject:cPath];
             }
         }
-    }
+
+        NSString *appsDir = @"/var/mobile/Containers/Data/Application";
+        NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
+
+        for (NSString *uuid in uuids) {
+            NSString *fullPath = [appsDir stringByAppendingPathComponent:uuid];
+            NSString *metaPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+            NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
+            NSString *bundleID = meta[@"MCMMetadataIdentifier"] ?: @"";
+
+            BOOL isIG = [bundleID isEqualToString:@"com.burbn.instagram"];
+            BOOL isReddit = [bundleID isEqualToString:@"com.reddit.Reddit"];
+            if (!isIG && !isReddit) continue;
+
+            NSMutableArray *targetList = isIG ? self.igContainers : self.redditContainers;
+            if (![seenPaths containsObject:fullPath]) {
+                NSString *craneName = meta[@"com.opa334.crane.container.name"] ?: @"Default";
+                NSString *shortUUID = safeSub(uuid, 6);
+                NSMutableDictionary *prof = [self ensureProfileForContainerPath:fullPath forceRotate:NO];
+                [targetList addObject:@{
+                    @"title": [NSString stringWithFormat:@"[%@] (%@)", craneName, shortUUID],
+                    @"path": fullPath,
+                    @"uuid": uuid,
+                    @"profile": prof
+                }];
+                [seenPaths addObject:fullPath];
+            }
+
+            NSString *subCraneDir = [fullPath stringByAppendingPathComponent:@"___Crane_Containers"];
+            if ([fm fileExistsAtPath:subCraneDir]) {
+                NSArray *subUUIDs = [fm contentsOfDirectoryAtPath:subCraneDir error:nil];
+                for (NSString *sub in subUUIDs) {
+                    NSString *subPath = [subCraneDir stringByAppendingPathComponent:sub];
+                    if ([seenPaths containsObject:subPath]) continue;
+                    NSMutableDictionary *subProf = [self ensureProfileForContainerPath:subPath forceRotate:NO];
+                    [targetList addObject:@{
+                        @"title": [NSString stringWithFormat:@"[Crane: %@]", safeSub(sub, 8)],
+                        @"path": subPath,
+                        @"uuid": sub,
+                        @"profile": subProf
+                    }];
+                    [seenPaths addObject:subPath];
+                }
+            }
+        }
+    } @catch (NSException *exception) {}
 }
 
 #pragma mark - TableView DataSource
