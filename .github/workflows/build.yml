@@ -12,67 +12,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies & Theos with iOS 16.5 SDK
+      - name: Install Theos
+        uses: theos/actions/install-theos@v1
+        with:
+          sdks: '15.2'
+
+      - name: Build Package (.deb)
         run: |
-          brew install ldid xz dpkg
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
-          rm -rf $HOME/theos/sdks/*
-          curl -sL https://github.com/theos/sdks/releases/download/master-1464700/iPhoneOS16.5.sdk.tar.xz | tar -xJf - -C $HOME/theos/sdks
-
-      - name: Generate Icon, Postrm Script & Build Package (.deb)
-        run: |
-          export THEOS=$HOME/theos
-          python3 - << 'EOF'
-          import struct, zlib, os
-
-          def make_shield_png(w, h, filename):
-              raw = bytearray()
-              for y in range(h):
-                  raw.append(0)
-                  for x in range(w):
-                      # Escudo azul estilo iOS Settings con borde redondeado
-                      cx, cy = w / 2.0, h / 2.0
-                      dx, dy = abs(x - cx) / (w * 0.32), (y - h * 0.18) / (h * 0.65)
-                      in_shield = (0 <= dy <= 1.0) and (dx <= (1.0 - 0.5 * (dy ** 1.6)))
-                      if in_shield:
-                          raw.extend((255, 255, 255, 255))
-                      else:
-                          raw.extend((0, 122, 255, 255))
-              def chunk(tag, data):
-                  return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
-              ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
-              png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
-              with open(filename, "wb") as f:
-                  f.write(png)
-
-          os.makedirs("igfarmshieldprefs", exist_ok=True)
-          make_shield_png(29, 29, "igfarmshieldprefs/IGFarmShieldIcon.png")
-          make_shield_png(58, 58, "igfarmshieldprefs/IGFarmShieldIcon@2x.png")
-          make_shield_png(87, 87, "igfarmshieldprefs/IGFarmShieldIcon@3x.png")
-
-          # Crear script DEBIAN/postrm para borrar TODO rastro al desinstalar el tweak
-          os.makedirs("layout/DEBIAN", exist_ok=True)
-          postrm_code = """#!/bin/sh
-          if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
-              rm -f /var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist
-              rm -f /var/jb/Library/PreferenceLoader/Preferences/IGFarmShieldPrefs.plist
-              rm -f /var/jb/Library/PreferenceLoader/Preferences/IGFarmShieldIcon*.png
-              rm -rf /var/jb/Library/PreferenceBundles/IGFarmShieldPrefs.bundle
-              find /var/mobile/Containers/Data/Application -name ".igshield_container.plist" -delete 2>/dev/null || true
-          fi
-          exit 0
-          """
-          with open("layout/DEBIAN/postrm", "w", newline="\n") as f:
-              f.write(postrm_code.strip() + "\n")
-          os.chmod("layout/DEBIAN/postrm", 0o755)
-          EOF
-
+          source $GITHUB_WORKSPACE/.theosrc || true
+          export THEOS=~/theos
           make package FINALPACKAGE=1
 
-      - name: Upload Compiled Rootless DEB
+      - name: Upload Compiled .deb
         uses: actions/upload-artifact@v4
         with:
-          name: IGFarmShield-Rootless-DEB
-          path: packages/*.deb
           name: IGFarmShield-Rootless-DEB
           path: packages/*.deb
