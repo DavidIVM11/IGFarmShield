@@ -11,12 +11,14 @@
 #import <arpa/inet.h>
 #import <net/if.h>
 #import <sys/sysctl.h>
+#import <sys/mount.h>
 #import <mach-o/dyld.h>
 #import <string.h>
+#import <stdlib.h>
+#import <time.h>
 #import <substrate.h>
 
 #define GLOBAL_STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
-#define CRANE_PREFS_PLIST @"/var/jb/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CHOICY_PLIST @"/var/jb/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
 
@@ -39,7 +41,12 @@ static uint64_t fnv1aHash(NSString *input) {
     return hash ^ ((uint64_t)arc4random() << 32) ^ arc4random();
 }
 
-// Extrae el ID único de carpeta del contenedor y su nombre real en Crane
+static void applyLowLevelCTimeZone(NSString *tzName) {
+    if (!tzName || [tzName isEqualToString:@"REAL"] || tzName.length == 0) return;
+    setenv("TZ", [tzName UTF8String], 1);
+    tzset();
+}
+
 static NSString *extractContainerUUID(NSString *homePath) {
     NSRange r = [homePath rangeOfString:@"___Crane_Containers/"];
     if (r.location != NSNotFound) {
@@ -73,7 +80,7 @@ static NSString *detectCraneHumanName(NSString *homePath, NSString *containerUUI
         return env[@"CRANE_CONTAINER_ID"];
     }
     NSString *shortID = (containerUUID.length > 6) ? [containerUUID substringToIndex:6] : containerUUID;
-    return [NSString stringWithFormat:@"Contenedor-%@", shortID];
+    return [NSString stringWithFormat:@"Crane-%@", shortID];
 }
 
 static NSMutableDictionary *getContainerProfile() {
@@ -100,7 +107,6 @@ static NSMutableDictionary *getContainerProfile() {
             profile = [appContainers[containerUUID] mutableCopy];
         }
 
-        // Si el usuario editó switches o red desde Settings, sincronizar con el perfil local
         if (profile && [appContainers[containerUUID] isKindOfClass:[NSDictionary class]]) {
             NSDictionary *settingsCopy = appContainers[containerUUID];
             for (NSString *k in @[@"enabled", @"customAlias", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"timeZone", @"localeID"]) {
@@ -113,12 +119,10 @@ static NSMutableDictionary *getContainerProfile() {
             NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
             NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
             NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0"];
-            NSArray *phoneNames = @[@"iPhone", @"iPhone 8", @"My iPhone", @"iPhone"];
 
             NSString *oui = ouis[seed % ouis.count];
             NSString *ssidPref = ssidPrefixes[(seed >> 3) % ssidPrefixes.count];
             NSString *subnet = subnets[(seed >> 5) % subnets.count];
-            NSString *devName = phoneNames[(seed >> 7) % phoneNames.count];
 
             NSString *bssid = [NSString stringWithFormat:@"%@:%02x:%02x:%02x",
                                oui, (unsigned int)((seed >> 8) & 0xFF), (unsigned int)((seed >> 16) & 0xFF), (unsigned int)((seed >> 24) & 0xFF)];
@@ -140,8 +144,8 @@ static NSMutableDictionary *getContainerProfile() {
                 @"spoofLocation": @YES,
                 @"spoofHardware": @YES,
                 @"spoofSecurity": @YES,
-                @"deviceModel": @"iPhone10,4", // Siempre iPhone 8 Real Coherente
-                @"deviceName": devName,
+                @"deviceModel": @"iPhone10,4",
+                @"deviceName": @"iPhone",
                 @"craneOriginalIDFV": origCraneIDFV ?: @"Aislado por Crane",
                 @"idfv": [[NSUUID UUID] UUIDString],
                 @"shieldDeviceID": [[NSUUID UUID] UUIDString],
@@ -165,7 +169,7 @@ static NSMutableDictionary *getContainerProfile() {
                 @"CarrierISO": @"us"
             } mutableCopy];
         } else {
-            profile[@"deviceModel"] = @"iPhone10,4"; // Forzar coherencia con iPhone 8
+            profile[@"deviceModel"] = @"iPhone10,4";
             profile[@"containerUUID"] = containerUUID;
             profile[@"path"] = homePath;
             profile[@"bundleID"] = bundleID;
@@ -174,10 +178,13 @@ static NSMutableDictionary *getContainerProfile() {
             }
         }
 
+        if ([profile[@"spoofLocation"] boolValue]) {
+            applyLowLevelCTimeZone(profile[@"timeZone"]);
+        }
+
         profile[@"lastOpened"] = @(sessionStartTimestamp);
         [profile writeToFile:localPlist atomically:YES];
 
-        // Registrar este contenedor como el ACTIVO ACTUAL de Crane para esta app
         appContainers[containerUUID] = profile;
         globalSt[bundleID] = appContainers;
 
@@ -193,8 +200,6 @@ static NSMutableDictionary *getContainerProfile() {
     return liveContainerProfile;
 }
 
-// PROTOCOLO ANTI-FUGA: Incluso si un contenedor está marcado como OFF, jamás expone el hardware real;
-// mantiene la huella aislada si el escudo maestro está activo y avisa en pantalla.
 static BOOL isModuleActive(NSString *moduleKey) {
     NSDictionary *state = getGlobalState();
     if (state[@"masterEnabled"] != nil && ![state[@"masterEnabled"] boolValue]) return NO;
@@ -213,9 +218,6 @@ static BOOL isModuleActive(NSString *moduleKey) {
     return YES;
 }
 
-// ============================================================================
-// AUDITORÍA AUTOMÁTICA CADA 15 MINUTOS + VERIFICACIÓN DE CONTENEDOR ACTIVO
-// ============================================================================
 static void checkInactiveContainerWarning() {
     NSDictionary *state = getGlobalState();
     if (state[@"masterEnabled"] != nil && ![state[@"masterEnabled"] boolValue]) return;
@@ -228,8 +230,8 @@ static void checkInactiveContainerWarning() {
         while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
         if (rootVC) {
             NSString *alias = prof[@"customAlias"] ?: prof[@"containerName"];
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⛔ Contenedor Desactivado"
-                                                                           message:[NSString stringWithFormat:@"Abres el contenedor '%@', pero lo tienes DESACTIVADO en IGFarmShield.\n\nPor seguridad Anti-Fuga tu hardware real sigue oculto, pero debes ir a Configuración > IGFarmShield y activar este contenedor antes de operar.", alias]
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⛔ Contenedor en Pausa"
+                                                                           message:[NSString stringWithFormat:@"Has abierto '%@' en Crane, pero su interruptor está apagado en IGFarmShield.\n\nEl escudo Anti-Fuga mantiene oculto tu hardware real, pero activa este contenedor en Configuración antes de operar.", alias]
                                                                     preferredStyle:UIAlertControllerStyleAlert];
             [alert addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDestructive handler:nil]];
             [rootVC presentViewController:alert animated:YES completion:nil];
@@ -260,6 +262,9 @@ static void runPeriodicContainerNetworkAudit() {
         prof[@"lastSyncedIP"] = ip;
         prof[@"timeZone"] = tz;
         prof[@"localeID"] = [NSString stringWithFormat:@"en_%@", [cc uppercaseString]];
+        if (isModuleActive(@"spoofLocation")) {
+            applyLowLevelCTimeZone(tz);
+        }
 
         if ([ispUp containsString:@"T-MOBILE"] || [ispUp containsString:@"METRO"] || [ispUp containsString:@"MINT"]) {
             prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"T-Mobile";
@@ -321,7 +326,7 @@ static void runPeriodicContainerNetworkAudit() {
 }
 
 // ============================================================================
-// HOOKS DE SEGURIDAD, RED Y HARDWARE (COHERENTE CON IPHONE 8 REAL iPhone10,4)
+// HOOKS PROFUNDOS (DYLD, PASSCODE, DEVICECHECK, C-TIMEZONE, STATFS, SYSCTL)
 // ============================================================================
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index);
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
@@ -404,6 +409,24 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
 }
 %end
 
+static CFTimeZoneRef (*orig_CFTimeZoneCopySystem)(void);
+static CFTimeZoneRef custom_CFTimeZoneCopySystem(void) {
+    if (!isModuleActive(@"spoofLocation")) return orig_CFTimeZoneCopySystem();
+    NSDictionary *prof = getContainerProfile();
+    NSString *tzName = prof[@"timeZone"];
+    if (tzName && ![tzName isEqualToString:@"REAL"]) {
+        CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
+        if (tz) return tz;
+    }
+    return orig_CFTimeZoneCopySystem();
+}
+
+static CFTimeZoneRef (*orig_CFTimeZoneCopyDefault)(void);
+static CFTimeZoneRef custom_CFTimeZoneCopyDefault(void) {
+    if (!isModuleActive(@"spoofLocation")) return orig_CFTimeZoneCopyDefault();
+    return custom_CFTimeZoneCopySystem();
+}
+
 %hook NSLocale
 + (NSLocale *)currentLocale {
     if (!isModuleActive(@"spoofLocation")) return %orig;
@@ -411,6 +434,17 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
     NSString *locID = prof[@"localeID"];
     if (!locID || [locID isEqualToString:@"REAL"]) return %orig;
     return [NSLocale localeWithLocaleIdentifier:locID] ?: %orig;
+}
++ (NSLocale *)autoupdatingCurrentLocale {
+    if (!isModuleActive(@"spoofLocation")) return %orig;
+    return [self currentLocale];
+}
++ (NSArray<NSString *> *)preferredLanguages {
+    if (!isModuleActive(@"spoofLocation")) return %orig;
+    NSDictionary *prof = getContainerProfile();
+    NSString *locID = prof[@"localeID"] ?: @"en_US";
+    NSString *lang = [locID stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
+    return @[lang, @"en-US"];
 }
 %end
 
@@ -549,6 +583,24 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
 }
 %end
 
+// Hook C de bajo nivel statfs() para que el espacio libre coincida tanto en C/Kernel como en NSFileManager
+static int (*orig_statfs)(const char *, struct statfs *);
+static int custom_statfs(const char *path, struct statfs *buf) {
+    int ret = orig_statfs(path, buf);
+    if (ret == 0 && buf && isModuleActive(@"spoofHardware")) {
+        NSDictionary *prof = getContainerProfile();
+        if (prof[@"freeBytes"] && buf->f_bsize > 0) {
+            unsigned long long baseFree = [prof[@"freeBytes"] unsignedLongLongValue];
+            unsigned long long driftBytes = (unsigned long long)(([[NSDate date] timeIntervalSince1970] - sessionStartTimestamp) * 4096.0);
+            unsigned long long finalFree = baseFree - (driftBytes % (20 * 1024 * 1024));
+            uint64_t blocks = finalFree / buf->f_bsize;
+            buf->f_bavail = blocks;
+            buf->f_bfree = blocks;
+        }
+    }
+    return ret;
+}
+
 %hook NSFileManager
 - (id)ubiquityIdentityToken {
     if (!isModuleActive(@"spoofIDs")) return %orig;
@@ -646,6 +698,9 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     %init;
     getContainerProfile();
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
+    MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
+    MSHookFunction((void *)CFTimeZoneCopySystem, (void *)custom_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
+    MSHookFunction((void *)CFTimeZoneCopyDefault, (void *)custom_CFTimeZoneCopyDefault, (void **)&orig_CFTimeZoneCopyDefault);
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
     MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)custom_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
