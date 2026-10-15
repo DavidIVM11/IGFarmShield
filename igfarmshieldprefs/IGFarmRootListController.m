@@ -13,18 +13,8 @@
 
 @class IGFarmRootListController;
 
-// ============================================================================
-// DECLARACIÓN LIMPIA DE PSVIEWCONTROLLER (SIN PISAR IVARS DE IOS 16)
-// ============================================================================
+// Declaración limpia de PSViewController (se resuelve en tiempo de ejecución dentro de Settings.app)
 @interface PSViewController : UIViewController
-- (void)setSpecifier:(id)specifier;
-- (id)specifier;
-- (void)setRootController:(id)rc;
-- (id)rootController;
-- (void)setParentController:(id)pc;
-- (id)parentController;
-- (void)handleURL:(NSDictionary *)url;
-- (BOOL)canBeShownFromSuspendedState;
 @end
 
 // ============================================================================
@@ -623,7 +613,6 @@ static uint64_t fnv1aHashPrefs(NSString *input) {
 }
 
 - (void)ensureSettingsShieldIconExists {
-    // Opcional: El ícono se maneja desde el paquete si tiene permisos de escritura
 }
 
 - (void)saveState {
