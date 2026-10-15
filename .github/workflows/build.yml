@@ -12,16 +12,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies & Theos
-        run: |
-          brew install ldid xz dpkg
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
-          rm -rf $HOME/theos/sdks/*
-          curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar -xzf - -C $HOME/theos/sdks --strip-components=1
+      - name: Install Theos
+        uses: theos/actions/install-theos@v1
+        with:
+          sdks: '15.2'
 
-      - name: Fix Makefile Tabs & Build Package (.deb)
+      - name: Build Package (.deb)
         run: |
-          export THEOS=$HOME/theos
+          source $GITHUB_WORKSPACE/.theosrc || true
+          export THEOS=~/theos
           perl -i -pe 's/^[ ]+/\t/g' Makefile igfarmshieldprefs/Makefile
           make package FINALPACKAGE=1
 
