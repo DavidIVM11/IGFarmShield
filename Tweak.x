@@ -1,6 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <CoreFoundation/CoreFoundation.h>
+#import <QuartzCore/QuartzCore.h>
 #import <CFNetwork/CFNetwork.h>
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <CoreTelephony/CTCarrier.h>
@@ -13,22 +13,19 @@
 #import <net/if.h>
 #import <sys/sysctl.h>
 #import <sys/mount.h>
-#import <sys/stat.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
-#import <unistd.h>
 #import <string.h>
 #import <stdlib.h>
 #import <time.h>
-#import <errno.h>
 #import <substrate.h>
 
 #define GLOBAL_STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
 #define CRANE_PREFS_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
-#define CHOICY_PLIST @"/var/jb/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
-#define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 9
+#define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
+#define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
+#define CURRENT_SCHEMA_VERSION 10
 
 static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
@@ -56,7 +53,7 @@ static void applyLowLevelCTimeZone(NSString *tzName) {
     tzset();
 }
 
-static NSString *findCraneNameByID(id node, NSString *targetID) {
+static NSString *findCraneNameInNode(id node, NSString *targetID) {
     if (!node || !targetID || targetID.length == 0) return nil;
     if ([node isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)node;
@@ -79,20 +76,20 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
                 }
             }
             if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
-                NSString *found = findCraneNameByID(val, targetID);
+                NSString *found = findCraneNameInNode(val, targetID);
                 if (found) return found;
             }
         }
     } else if ([node isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)node) {
-            NSString *found = findCraneNameByID(item, targetID);
+            NSString *found = findCraneNameInNode(item, targetID);
             if (found) return found;
         }
     }
     return nil;
 }
 
-static void resolveCraneIdentity(NSString *homePath, NSString **outKeyUUID, NSString **outCraneID, NSString **outCraneName) {
+static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
     NSString *folderUUID = [homePath lastPathComponent] ?: @"Default";
     NSString *metaPath = [homePath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
     NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
@@ -130,22 +127,19 @@ static void resolveCraneIdentity(NSString *homePath, NSString **outKeyUUID, NSSt
     }
 
     NSMutableArray *sources = [NSMutableArray array];
-    for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
-        CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, (__bridge CFStringRef)domain, CFSTR("mobile"), kCFPreferencesAnyHost);
-        if (cfDict) {
-            NSDictionary *d = CFBridgingRelease(cfDict);
-            if ([d count] > 0) [sources addObject:d];
-        }
+    for (NSString *suite in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
+        NSDictionary *ud = [[[NSUserDefaults alloc] initWithSuiteName:suite] dictionaryRepresentation];
+        if ([ud count] > 0) [sources addObject:ud];
     }
-    for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_PREFS_VAR]) {
+    for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_PREFS_VAR, CRANE_MAIN_JB, CRANE_MAIN_VAR]) {
         NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
-        if (cPrefs) [sources addObject:cPrefs];
+        if ([cPrefs count] > 0) [sources addObject:cPrefs];
     }
 
     for (NSDictionary *src in sources) {
-        if (!craneName && craneID) craneName = findCraneNameByID(src, craneID);
-        if (!craneName && origCraneIDFV) craneName = findCraneNameByID(src, origCraneIDFV);
-        if (!craneName) craneName = findCraneNameByID(src, folderUUID);
+        if (!craneName && craneID) craneName = findCraneNameInNode(src, craneID);
+        if (!craneName && origCraneIDFV) craneName = findCraneNameInNode(src, origCraneIDFV);
+        if (!craneName) craneName = findCraneNameInNode(src, folderUUID);
     }
 
     if (!craneName || craneName.length == 0) {
@@ -157,9 +151,11 @@ static void resolveCraneIdentity(NSString *homePath, NSString **outKeyUUID, NSSt
         }
     }
 
-    *outKeyUUID = craneID;
-    *outCraneID = craneID;
-    *outCraneName = craneName;
+    return @{
+        @"keyUUID": folderUUID ?: @"Default",
+        @"craneID": (origCraneIDFV ?: craneID) ?: @"Default",
+        @"craneName": craneName ?: @"Default"
+    };
 }
 
 static NSMutableDictionary *getContainerProfile() {
@@ -169,10 +165,10 @@ static NSMutableDictionary *getContainerProfile() {
         NSString *homePath = NSHomeDirectory();
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.burbn.instagram";
 
-        NSString *keyUUID = nil;
-        NSString *craneID = nil;
-        NSString *craneName = nil;
-        resolveCraneIdentity(homePath, &keyUUID, &craneID, &craneName);
+        NSDictionary *ident = resolveCraneIdentityDict(homePath);
+        NSString *keyUUID = ident[@"keyUUID"];
+        NSString *craneID = ident[@"craneID"];
+        NSString *craneName = ident[@"craneName"];
 
         NSString *localPlist = [homePath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
         NSDictionary *loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST];
@@ -223,7 +219,7 @@ static NSMutableDictionary *getContainerProfile() {
             profile = [@{
                 @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
                 @"containerUUID": keyUUID,
-                @"craneIdentifier": origCraneIDFV ?: craneID,
+                @"craneIdentifier": craneID,
                 @"containerName": craneName,
                 @"bundleID": bundleID,
                 @"path": homePath,
@@ -237,7 +233,7 @@ static NSMutableDictionary *getContainerProfile() {
                 @"deviceModel": @"iPhone10,4",
                 @"osBuild": osBuild,
                 @"deviceName": [NSString stringWithFormat:@"iPhone-%02X", (unsigned int)(seed & 0xFF)],
-                @"craneOriginalIDFV": origCraneIDFV ?: craneID,
+                @"craneOriginalIDFV": craneID,
                 @"idfv": baseIDFV,
                 @"shieldDeviceID": [[NSUUID UUID] UUIDString],
                 @"bootSessionUUID": [[NSUUID UUID] UUIDString],
@@ -265,7 +261,7 @@ static NSMutableDictionary *getContainerProfile() {
         } else {
             profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
             profile[@"containerUUID"] = keyUUID;
-            profile[@"craneIdentifier"] = origCraneIDFV ?: craneID;
+            profile[@"craneIdentifier"] = craneID;
             profile[@"bundleID"] = bundleID;
             profile[@"path"] = homePath;
             if (craneName && ![craneName isEqualToString:keyUUID]) {
@@ -395,8 +391,8 @@ static void showStartupBanner() {
     NSString *shortID = (craneID.length > 8) ? [craneID substringToIndex:8] : craneID;
 
     UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(16, 44, keyWin.bounds.size.width - 32, 40)];
-    toast.layer.cornerRadius = 10;
-    toast.layer.masksToBounds = YES;
+    toast.layer.cornerRadius = 10.0;
+    toast.clipsToBounds = YES;
     toast.textAlignment = NSTextAlignmentCenter;
     toast.font = [UIFont boldSystemFontOfSize:12.0];
     toast.numberOfLines = 2;
@@ -458,33 +454,6 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
         }
     }
     return ret;
-}
-
-static int (*orig_access)(const char *, int);
-static int custom_access(const char *path, int amode) {
-    if (path && isModuleActive(@"spoofSecurity") && isSuspiciousPathC(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return orig_access(path, amode);
-}
-
-static int (*orig_stat)(const char *, struct stat *);
-static int custom_stat(const char *path, struct stat *buf) {
-    if (path && isModuleActive(@"spoofSecurity") && isSuspiciousPathC(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return orig_stat(path, buf);
-}
-
-static int (*orig_lstat)(const char *, struct stat *);
-static int custom_lstat(const char *path, struct stat *buf) {
-    if (path && isModuleActive(@"spoofSecurity") && isSuspiciousPathC(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return orig_lstat(path, buf);
 }
 
 %hook LAContext
@@ -551,24 +520,6 @@ static int custom_lstat(const char *path, struct stat *buf) {
     return [self systemTimeZone];
 }
 %end
-
-static CFTimeZoneRef (*orig_CFTimeZoneCopySystem)(void);
-static CFTimeZoneRef custom_CFTimeZoneCopySystem(void) {
-    if (!isModuleActive(@"spoofLocation")) return orig_CFTimeZoneCopySystem();
-    NSDictionary *prof = getContainerProfile();
-    NSString *tzName = prof[@"timeZone"];
-    if (tzName && ![tzName hasPrefix:@"Sincronizando"]) {
-        CFTimeZoneRef tz = CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
-        if (tz) return tz;
-    }
-    return orig_CFTimeZoneCopySystem();
-}
-
-static CFTimeZoneRef (*orig_CFTimeZoneCopyDefault)(void);
-static CFTimeZoneRef custom_CFTimeZoneCopyDefault(void) {
-    if (!isModuleActive(@"spoofLocation")) return orig_CFTimeZoneCopyDefault();
-    return custom_CFTimeZoneCopySystem();
-}
 
 %hook NSLocale
 + (NSLocale *)currentLocale {
@@ -817,17 +768,11 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 
 %ctor {
     %init;
-    origCraneIDFV = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
     getContainerProfile();
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
-    MSHookFunction((void *)CFTimeZoneCopySystem, (void *)custom_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
-    MSHookFunction((void *)CFTimeZoneCopyDefault, (void *)custom_CFTimeZoneCopyDefault, (void **)&orig_CFTimeZoneCopyDefault);
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
     MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
-    MSHookFunction((void *)access, (void *)custom_access, (void **)&orig_access);
-    MSHookFunction((void *)stat, (void *)custom_stat, (void **)&orig_stat);
-    MSHookFunction((void *)lstat, (void *)custom_lstat, (void **)&orig_lstat);
     MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)custom_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
