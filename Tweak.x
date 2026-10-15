@@ -20,6 +20,7 @@
 #import <string.h>
 #import <stdlib.h>
 #import <time.h>
+#import <errno.h>
 #import <substrate.h>
 
 #define GLOBAL_STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
@@ -306,9 +307,6 @@ static BOOL isModuleActive(NSString *moduleKey) {
     return YES;
 }
 
-// ============================================================================
-// SINCRONIZACIÓN TRANSPARENTE CON LA IP EN VIVO (CADA 15 MINUTOS)
-// ============================================================================
 static void syncContainerWithLiveIP() {
     if (!isModuleActive(@"spoofNetwork")) return;
 
@@ -337,7 +335,6 @@ static void syncContainerWithLiveIP() {
         prof[@"lastSyncedIP"] = ip;
         prof[@"ispName"] = ispRaw;
 
-        // Si es la primera conexión del contenedor, fija la ubicación estática de esa IP
         if (![prof[@"locationAnchored"] boolValue]) {
             prof[@"locationAnchored"] = @YES;
             prof[@"timeZone"] = tz;
@@ -420,9 +417,6 @@ static void showStartupBanner() {
     });
 }
 
-// ============================================================================
-// OCULTACIÓN DE JAILBREAK Y LIBRERÍAS (COMPLEMENTO CHOICY)
-// ============================================================================
 static BOOL isSuspiciousPathC(const char *path) {
     if (!path) return NO;
     if (strstr(path, "igfarmshield") != NULL || strstr(path, ".igshield_container") != NULL) return NO;
@@ -434,6 +428,7 @@ static BOOL isSuspiciousPathC(const char *path) {
         strstr(path, "Choicy") != NULL ||
         strstr(path, "choicy") != NULL ||
         strstr(path, "Sileo") != NULL ||
+        strstr(path, "sileo") != NULL ||
         strstr(path, "Filza") != NULL ||
         strstr(path, "palera1n") != NULL ||
         strstr(path, "MobileSubstrate") != NULL ||
@@ -539,9 +534,6 @@ static int custom_lstat(const char *path, struct stat *buf) {
 }
 %end
 
-// ============================================================================
-// ZONA HORARIA, REGIÓN Y RED (GUIADOS POR LA IP EN VIVO)
-// ============================================================================
 %hook NSTimeZone
 + (NSTimeZone *)systemTimeZone {
     if (!isModuleActive(@"spoofLocation")) return %orig;
@@ -682,9 +674,6 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     return res;
 }
 
-// ============================================================================
-// HARDWARE IPHONE 8 INDEPENDIENTE POR CONTENEDOR (IDFV, STATFS, KERNEL)
-// ============================================================================
 %hook UIDevice
 - (NSString *)name {
     if (!isModuleActive(@"spoofHardware")) return %orig;
