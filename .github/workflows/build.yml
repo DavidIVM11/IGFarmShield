@@ -12,51 +12,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Dependencies & Theos
+      - name: Install Theos and SDK
         run: |
-          brew install ldid xz dpkg
+          brew install ldid xz dpkg || brew install xz dpkg || true
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          if ! command -v ldid >/dev/null 2>&1; then curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macos_arm64 -o $HOME/theos/bin/ldid && chmod +x $HOME/theos/bin/ldid; fi
           rm -rf $HOME/theos/sdks/*
-          curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar -xzf - -C $HOME/theos/sdks --strip-components=1
+          curl -sL https://github.com/theos/sdks/archive/refs/heads/master.tar.gz | tar -xzf - -C $HOME/theos/sdks --strip-components=1
 
-      - name: Generate Icon, Fix Tabs & Build Package (.deb)
+      - name: Generate Icon, Fix Tabs & Build DEB
         run: |
           export THEOS=$HOME/theos
-          python3 - << 'EOF'
-          import zlib, struct, math
-
-          def make_shield_png(path, size):
-              raw = bytearray()
-              cx, cy = size / 2.0, size / 2.0
-              r_corner = size * 0.22
-              for y in range(size):
-                  raw.append(0)
-                  for x in range(size):
-                      # Fondo azul redondeado estilo iOS Settings + escudo blanco central
-                      dx = max(abs(x - cx) - (size / 2.0 - r_corner), 0.0)
-                      dy = max(abs(y - cy) - (size / 2.0 - r_corner), 0.0)
-                      if math.hypot(dx, dy) > r_corner:
-                          raw.extend((0, 0, 0, 0))
-                      else:
-                          nx = (x - cx) / (size * 0.30)
-                          ny = (y - cy) / (size * 0.34)
-                          in_shield = (-0.85 <= ny <= 0.90) and (abs(nx) <= (0.85 * (1.0 - max(0.0, (ny + 0.1) * 0.65))))
-                          if in_shield:
-                              raw.extend((255, 255, 255, 255))
-                          else:
-                              raw.extend((0, 122, 255, 255))
-              def chunk(tag, data):
-                  return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
-              ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
-              png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
-              with open(path, "wb") as f:
-                  f.write(png)
-
-          make_shield_png("igfarmshieldprefs/IGFarmShieldIcon.png", 29)
-          make_shield_png("igfarmshieldprefs/IGFarmShieldIcon@2x.png", 58)
-          make_shield_png("igfarmshieldprefs/IGFarmShieldIcon@3x.png", 87)
-          EOF
+          python3 -c 'import zlib,struct; s=58; raw=b"".join(b"\x00"+b"".join(b"\xff\xff\xff\xff" if (14<=y<=44 and abs(x-29)<=(16-(y-14)*0.45 if y>26 else 16)) else b"\x00\x7a\xff\xff" for x in range(s)) for y in range(s)); c=lambda t,d: struct.pack(">I",len(d))+t+d+struct.pack(">I",zlib.crc32(t+d)&0xffffffff); p=b"\x89PNG\r\n\x1a\n"+c(b"IHDR",struct.pack(">IIBBBBB",s,s,8,6,0,0,0))+c(b"IDAT",zlib.compress(raw,9))+c(b"IEND",b""); [open(f,"wb").write(p) for f in ("igfarmshieldprefs/IGFarmShieldIcon.png","igfarmshieldprefs/IGFarmShieldIcon@2x.png","igfarmshieldprefs/IGFarmShieldIcon@3x.png")]'
           perl -i -pe 's/^[ ]+/\t/g' Makefile igfarmshieldprefs/Makefile
+          make clean
           make package FINALPACKAGE=1
           dpkg-deb -c packages/*.deb
 
