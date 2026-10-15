@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <ifaddrs.h>
 #import <arpa/inet.h>
 #import <net/if.h>
@@ -9,12 +10,10 @@
 extern char **environ;
 
 #define STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
-#define CRANE_PREFS_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
-#define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CHOICY_PLIST_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define CHOICY_PLIST_VAR @"/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 8
+#define CURRENT_SCHEMA_VERSION 9
 
 @interface PSViewController : UIViewController
 @end
@@ -38,7 +37,7 @@ static void killAppProcess(NSString *procName) {
     posix_spawn(&pid, args[0], NULL, NULL, (char *const *)args, environ);
 }
 
-static BOOL dictionaryMentionsString(id node, NSString *needle) {
+static BOOL nodeMentionsString(id node, NSString *needle) {
     if (!node || !needle) return NO;
     if ([node isKindOfClass:[NSString class]]) {
         return [(NSString *)node rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
@@ -46,73 +45,39 @@ static BOOL dictionaryMentionsString(id node, NSString *needle) {
     if ([node isKindOfClass:[NSDictionary class]]) {
         NSDictionary *d = (NSDictionary *)node;
         for (id k in d) {
-            if (dictionaryMentionsString(k, needle) || dictionaryMentionsString(d[k], needle)) return YES;
+            if (nodeMentionsString(k, needle) || nodeMentionsString(d[k], needle)) return YES;
         }
     } else if ([node isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)node) {
-            if (dictionaryMentionsString(item, needle)) return YES;
+            if (nodeMentionsString(item, needle)) return YES;
         }
     }
     return NO;
 }
 
-static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
-    if (!node || !targetKey || targetKey.length == 0) return nil;
-    if ([node isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *dict = (NSDictionary *)node;
-        for (id k in dict) {
-            NSString *kStr = [k description];
-            id val = dict[k];
-            if ([kStr caseInsensitiveCompare:targetKey] == NSOrderedSame) {
-                if ([val isKindOfClass:[NSString class]] && [val length] > 0) return val;
-                if ([val isKindOfClass:[NSDictionary class]]) {
-                    for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
-                        if ([val[nk] isKindOfClass:[NSString class]] && [val[nk] length] > 0) return val[nk];
-                    }
-                }
-            }
-            if ([val isKindOfClass:[NSString class]] && [val caseInsensitiveCompare:targetKey] == NSOrderedSame) {
-                for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
-                    if ([dict[nk] isKindOfClass:[NSString class]] && [dict[nk] length] > 0 && ![dict[nk] isEqualToString:targetKey]) {
-                        return dict[nk];
-                    }
-                }
-            }
-            if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
-                NSString *found = recursiveSearchCraneNamePrefs(val, targetKey);
-                if (found) return found;
-            }
-        }
-    } else if ([node isKindOfClass:[NSArray class]]) {
-        for (id item in (NSArray *)node) {
-            NSString *found = recursiveSearchCraneNamePrefs(item, targetKey);
-            if (found) return found;
-        }
-    }
-    return nil;
-}
-
-// Extrae todos los contenedores configurados en Crane para un bundleID dado
-static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *outMap, NSString **outActiveID) {
+static void parseCraneNodeForApp(id node, NSMutableDictionary *outContainers, NSString **outActiveID) {
     if (!node) return;
     if ([node isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)node;
-        for (NSString *ak in @[@"activeContainer", @"selectedContainer", @"currentContainer", @"activeContainerIdentifier", @"active"]) {
-            if ([dict[ak] isKindOfClass:[NSString class]] && [dict[ak] length] > 0 && outActiveID) {
+
+        for (NSString *ak in @[@"activeContainer", @"selectedContainer", @"currentContainer", @"activeContainerIdentifier", @"active", @"defaultContainer"]) {
+            if ([dict[ak] isKindOfClass:[NSString class]] && [dict[ak] length] > 0 && outActiveID && !(*outActiveID)) {
                 *outActiveID = dict[ak];
             }
         }
+
         NSString *cID = nil;
         NSString *cName = nil;
-        for (NSString *ik in @[@"identifier", @"id", @"UUID", @"uuid", @"containerIdentifier"]) {
+        for (NSString *ik in @[@"identifier", @"id", @"UUID", @"uuid", @"containerIdentifier", @"craneIdentifier"]) {
             if ([dict[ik] isKindOfClass:[NSString class]] && [dict[ik] length] > 0) { cID = dict[ik]; break; }
         }
         for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
             if ([dict[nk] isKindOfClass:[NSString class]] && [dict[nk] length] > 0) { cName = dict[nk]; break; }
         }
         if (cID && cName) {
-            outMap[cID] = cName;
+            outContainers[cID] = cName;
         }
+
         for (id k in dict) {
             NSString *kStr = [k description];
             id val = dict[k];
@@ -120,21 +85,65 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
                 NSDictionary *sub = (NSDictionary *)val;
                 for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
                     if ([sub[nk] isKindOfClass:[NSString class]] && [sub[nk] length] > 0) {
-                        outMap[kStr] = sub[nk];
+                        outContainers[kStr] = sub[nk];
                     }
+                }
+            } else if ([val isKindOfClass:[NSString class]]) {
+                NSString *vStr = (NSString *)val;
+                if (kStr.length >= 8 && [kStr containsString:@"-"] && vStr.length > 0 && vStr.length < 40 && ![vStr containsString:@"/"]) {
+                    outContainers[kStr] = vStr;
                 }
             }
             if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
-                extractCraneContainersFromPrefsNode(val, outMap, outActiveID);
+                parseCraneNodeForApp(val, outContainers, outActiveID);
             }
         }
     } else if ([node isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)node) {
-            extractCraneContainersFromPrefsNode(item, outMap, outActiveID);
+            parseCraneNodeForApp(item, outContainers, outActiveID);
         }
     }
 }
 
+static NSString *findCraneNameByID(id node, NSString *targetID) {
+    if (!node || !targetID || targetID.length == 0) return nil;
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)node;
+        for (id k in dict) {
+            NSString *kStr = [k description];
+            id val = dict[k];
+            if ([kStr caseInsensitiveCompare:targetID] == NSOrderedSame) {
+                if ([val isKindOfClass:[NSString class]] && [val length] > 0) return val;
+                if ([val isKindOfClass:[NSDictionary class]]) {
+                    for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+                        if ([val[nk] isKindOfClass:[NSString class]] && [val[nk] length] > 0) return val[nk];
+                    }
+                }
+            }
+            if ([val isKindOfClass:[NSString class]] && [val caseInsensitiveCompare:targetID] == NSOrderedSame) {
+                for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+                    if ([dict[nk] isKindOfClass:[NSString class]] && [dict[nk] length] > 0 && ![dict[nk] isEqualToString:targetID]) {
+                        return dict[nk];
+                    }
+                }
+            }
+            if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
+                NSString *found = findCraneNameByID(val, targetID);
+                if (found) return found;
+            }
+        }
+    } else if ([node isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)node) {
+            NSString *found = findCraneNameByID(item, targetID);
+            if (found) return found;
+        }
+    }
+    return nil;
+}
+
+// ============================================================================
+// INTERFACES DE NAVEGACIÓN (ESTILO GHOST / CRANE)
+// ============================================================================
 @interface IGFarmRootListController : PSViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableDictionary *state;
@@ -176,13 +185,13 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 @end
 
 // ============================================================================
-// NIVEL 1: CENTRO DE CONTROL PRINCIPAL (COMPLEMENTO PURO DE CRANE)
+// NIVEL 1: MENÚ PRINCIPAL (IGFarmShield v9.0)
 // ============================================================================
 @implementation IGFarmRootListController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"IGFarmShield";
+    self.title = @"IGFarmShield v9.0";
 
     NSDictionary *loaded = [NSDictionary dictionaryWithContentsOfFile:STATE_PLIST];
     self.state = loaded ? [loaded mutableCopy] : [NSMutableDictionary dictionary];
@@ -203,7 +212,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 60.0;
+    self.tableView.estimatedRowHeight = 64.0;
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.tableView];
 
@@ -227,7 +236,10 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 - (void)auditChoicyStatus {
     NSDictionary *choicy = [NSDictionary dictionaryWithContentsOfFile:CHOICY_PLIST_JB];
     if (!choicy) choicy = [NSDictionary dictionaryWithContentsOfFile:CHOICY_PLIST_VAR];
-    if (!choicy) choicy = [[[NSUserDefaults alloc] initWithSuiteName:@"com.opa334.choicyprefs"] dictionaryRepresentation];
+    if (!choicy) {
+        CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, CFSTR("com.opa334.choicyprefs"), CFSTR("mobile"), kCFPreferencesAnyHost);
+        if (cfDict) choicy = CFBridgingRelease(cfDict);
+    }
 
     NSDictionary *appSettings = [choicy[@"appSettings"] isKindOfClass:[NSDictionary class]] ? choicy[@"appSettings"] : @{};
     BOOL igOK = ([appSettings[@"com.burbn.instagram"] isKindOfClass:[NSDictionary class]] && [appSettings[@"com.burbn.instagram"] count] > 0);
@@ -235,21 +247,20 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 
     self.choicyAllSafe = (igOK && rdOK);
     if (igOK && rdOK) {
-        self.choicySummary = @"🟢 Óptimo • Inyección filtrada y rutas ocultas";
+        self.choicySummary = @"🟢 Seguro • Instagram y Reddit protegidos";
     } else if (igOK || rdOK) {
-        self.choicySummary = [NSString stringWithFormat:@"🟡 Parcial • IG: %@ | Reddit: %@", igOK ? @"Protegido" : @"Sin filtro", rdOK ? @"Protegido" : @"Sin filtro"];
+        self.choicySummary = [NSString stringWithFormat:@"🟡 Parcial • IG: %@ | Reddit: %@", igOK ? @"OK" : @"Pendiente", rdOK ? @"OK" : @"Pendiente"];
     } else {
-        self.choicySummary = @"🟠 Protección interna activa • Configura Choicy";
+        self.choicySummary = @"🟠 Escudo interno activo • Toca para ver resumen";
     }
 
     self.choicyDetailReport = [NSString stringWithFormat:
-        @"• Choicy en Instagram: %@\n"
-        @"• Choicy en Reddit: %@\n"
-        @"• Rutas de Jailbreak (/var/jb): Ocultas\n"
-        @"• Librerías de Crane y Tweak: Ocultas\n"
-        @"• Interfaz VPN (utun): Camuflada como Wi-Fi Local",
-        igOK ? @"🟢 Lista Blanca Activa" : @"⚠️ Sin configurar en Choicy",
-        rdOK ? @"🟢 Lista Blanca Activa" : @"⚠️ Sin configurar en Choicy"];
+        @"1. Filtro Choicy en Instagram: %@\n"
+        @"2. Filtro Choicy en Reddit: %@\n"
+        @"3. Ocultación de Jailbreak (/var/jb): Activa\n"
+        @"4. Ocultación de librerías en memoria: Activa",
+        igOK ? @"✅ Activo" : @"⚠️ No configurado",
+        rdOK ? @"✅ Activo" : @"⚠️ No configurado"];
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -345,6 +356,11 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         NSString *localIP = [NSString stringWithFormat:@"%@.%d", subnet, 15 + (int)(seed % 220)];
         unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
 
+        // Si Crane tiene "Use Container Identifier" activo, respetamos el UUID de Crane como base y generamos los complementarios
+        NSString *shieldIDFV = ([craneID containsString:@"-"] && craneID.length >= 32 && !rotate)
+            ? [craneID uppercaseString]
+            : [[NSUUID UUID] UUIDString];
+
         profile = [@{
             @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
             @"containerUUID": uuid,
@@ -363,7 +379,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
             @"osBuild": osBuild,
             @"deviceName": [NSString stringWithFormat:@"iPhone-%02X", (unsigned int)(seed & 0xFF)],
             @"craneOriginalIDFV": craneID,
-            @"idfv": [[NSUUID UUID] UUIDString],
+            @"idfv": shieldIDFV,
             @"shieldDeviceID": [[NSUUID UUID] UUIDString],
             @"bootSessionUUID": [[NSUUID UUID] UUIDString],
             @"cloudUUID": [[NSUUID UUID] UUIDString],
@@ -378,7 +394,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
             @"pasteboardCount": @(5 + (seed % 90)),
             @"lastSyncedIP": self.state[@"last_ip"] ?: @"Pendiente de sincronizar",
             @"ispName": self.state[@"last_isp"] ?: @"ISP",
-            @"cityCountry": self.state[@"last_city_country"] ?: @"Sin sincronizar",
+            @"cityCountry": self.state[@"last_city_country"] ?: @"Toca Sincronizar con IP",
             @"timeZone": self.state[@"defaultTimeZone"] ?: @"America/New_York",
             @"localeID": self.state[@"defaultLocale"] ?: @"en_US",
             @"CarrierMode": self.state[@"defaultCarrierMode"] ?: @"WIFI_ONLY",
@@ -405,25 +421,34 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
     self.igContainersList = [NSMutableArray array];
     self.redditContainersList = [NSMutableArray array];
     NSMutableSet *seenUUIDs = [NSMutableSet set];
-    NSMutableSet *seenIDFVs = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // 1. Cargar todas las fuentes de preferencias y soporte de Crane
+    // 1. Leer la base de datos de Crane desde CFPreferences (com.opa334.crane) y todos los plists de Crane en disco
     NSMutableArray *craneSources = [NSMutableArray array];
-    NSDictionary *ud1 = [[[NSUserDefaults alloc] initWithSuiteName:@"com.opa334.craneprefs"] dictionaryRepresentation];
-    if (ud1) [craneSources addObject:ud1];
-    NSDictionary *ud2 = [[[NSUserDefaults alloc] initWithSuiteName:@"com.opa334.crane"] dictionaryRepresentation];
-    if (ud2) [craneSources addObject:ud2];
-    for (NSString *cp in @[CRANE_PREFS_JB, CRANE_PREFS_VAR]) {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:cp];
-        if (d) [craneSources addObject:d];
+    for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
+        CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, (__bridge CFStringRef)domain, CFSTR("mobile"), kCFPreferencesAnyHost);
+        if (cfDict) {
+            NSDictionary *d = CFBridgingRelease(cfDict);
+            if ([d count] > 0) [craneSources addObject:d];
+        }
+        NSDictionary *ud = [[[NSUserDefaults alloc] initWithSuiteName:domain] dictionaryRepresentation];
+        if ([ud count] > 0) [craneSources addObject:ud];
     }
-    for (NSString *suppDir in @[@"/var/mobile/Library/Application Support/Crane", @"/var/jb/var/mobile/Library/Application Support/Crane"]) {
-        NSArray *subFiles = [fm subpathsOfDirectoryAtPath:suppDir error:nil];
-        for (NSString *sf in subFiles) {
-            if ([sf hasSuffix:@".plist"]) {
-                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:[suppDir stringByAppendingPathComponent:sf]];
-                if (d) [craneSources addObject:d];
+
+    NSArray *prefDirs = @[
+        @"/var/mobile/Library/Preferences",
+        @"/var/jb/var/mobile/Library/Preferences",
+        @"/var/mobile/Library/Application Support/Crane",
+        @"/var/jb/var/mobile/Library/Application Support/Crane"
+    ];
+    for (NSString *pDir in prefDirs) {
+        NSArray *files = [fm subpathsOfDirectoryAtPath:pDir error:nil];
+        for (NSString *f in files) {
+            if ([[f lowercaseString] containsString:@"crane"] && [f hasSuffix:@".plist"]) {
+                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:[pDir stringByAppendingPathComponent:f]];
+                if ([d isKindOfClass:[NSDictionary class]] && [d count] > 0) {
+                    [craneSources addObject:d];
+                }
             }
         }
     }
@@ -436,15 +461,19 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
     for (NSDictionary *src in craneSources) {
         for (id k in src) {
             NSString *kStr = [k description];
-            if ([kStr rangeOfString:@"com.burbn.instagram" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                extractCraneContainersFromPrefsNode(src[k], igCraneMap, &igActiveCraneID);
-            } else if ([kStr rangeOfString:@"com.reddit.Reddit" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                extractCraneContainersFromPrefsNode(src[k], rdCraneMap, &rdActiveCraneID);
+            id val = src[k];
+            if ([kStr rangeOfString:@"com.burbn.instagram" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                nodeMentionsString(val, @"com.burbn.instagram")) {
+                parseCraneNodeForApp(val, igCraneMap, &igActiveCraneID);
+            }
+            if ([kStr rangeOfString:@"com.reddit.Reddit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                nodeMentionsString(val, @"com.reddit.Reddit")) {
+                parseCraneNodeForApp(val, rdCraneMap, &rdActiveCraneID);
             }
         }
     }
 
-    // 2. Escanear TODAS las carpetas en /var/mobile/Containers/Data/Application (incluyendo contenedores secundarios de Crane)
+    // 2. Escanear todas las carpetas en /var/mobile/Containers/Data/Application
     NSString *appsDir = @"/var/mobile/Containers/Data/Application";
     NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
 
@@ -454,8 +483,8 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
         if (![meta isKindOfClass:[NSDictionary class]]) continue;
 
-        BOOL isIG = dictionaryMentionsString(meta, @"com.burbn.instagram");
-        BOOL isRD = dictionaryMentionsString(meta, @"com.reddit.Reddit");
+        BOOL isIG = nodeMentionsString(meta, @"com.burbn.instagram");
+        BOOL isRD = nodeMentionsString(meta, @"com.reddit.Reddit");
         if (!isIG && !isRD) continue;
 
         NSString *bundleID = isIG ? @"com.burbn.instagram" : @"com.reddit.Reddit";
@@ -464,6 +493,13 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         NSString *craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
         NSString *detectedName = nil;
 
+        for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
+            if ([meta[rk] isKindOfClass:[NSString class]] && [meta[rk] length] > 0) detectedName = meta[rk];
+        }
+        for (NSString *ik in @[@"com.opa334.crane.container.identifier", @"com.opa334.crane.container.id", @"craneContainerIdentifier"]) {
+            if ([meta[ik] isKindOfClass:[NSString class]] && [meta[ik] length] > 0) craneID = meta[ik];
+        }
+
         NSDictionary *userInfo = meta[@"MCMMetadataUserInfo"];
         if ([userInfo isKindOfClass:[NSDictionary class]] && [userInfo count] > 0) {
             for (NSString *k in userInfo) {
@@ -471,8 +507,8 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
                 id val = userInfo[k];
                 if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
                     if ([kl containsString:@"name"]) detectedName = val;
-                    else if ([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"]) {
-                        if (![val isEqualToString:bundleID]) craneID = val;
+                    else if (([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"]) && ![val isEqualToString:bundleID]) {
+                        craneID = val;
                     }
                 }
             }
@@ -483,9 +519,9 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 
         if (!detectedName) {
             for (NSDictionary *src in craneSources) {
-                detectedName = recursiveSearchCraneNamePrefs(src, craneID);
+                detectedName = findCraneNameByID(src, craneID);
                 if (detectedName) break;
-                detectedName = recursiveSearchCraneNamePrefs(src, folderUUID);
+                detectedName = findCraneNameByID(src, folderUUID);
                 if (detectedName) break;
             }
         }
@@ -498,19 +534,61 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
             }
         }
 
-        NSMutableDictionary *prof = [self ensureProfileForBundle:bundleID uuid:folderUUID craneID:craneID defaultName:detectedName path:fullPath forceRotate:NO];
-        if ([seenIDFVs containsObject:prof[@"idfv"]]) {
-            prof = [self ensureProfileForBundle:bundleID uuid:folderUUID craneID:craneID defaultName:detectedName path:fullPath forceRotate:YES];
-        }
-        [seenIDFVs addObject:prof[@"idfv"]];
-        [seenUUIDs addObject:folderUUID];
+        craneMap[craneID] = detectedName;
+        NSMutableDictionary *prof = [self ensureProfileForBundle:bundleID uuid:craneID craneID:craneID defaultName:detectedName path:fullPath forceRotate:NO];
         [seenUUIDs addObject:craneID];
+        [seenUUIDs addObject:folderUUID];
 
         if (isIG) [self.igContainersList addObject:prof];
         else [self.redditContainersList addObject:prof];
+
+        // Escanear subcarpetas si Crane anida contenedores dentro de la carpeta principal
+        for (NSString *subFolder in @[@"___Crane_Containers", @"Library/Application Support/Crane/Containers", @"Library/Crane/Containers"]) {
+            NSString *subDir = [fullPath stringByAppendingPathComponent:subFolder];
+            if ([fm fileExistsAtPath:subDir]) {
+                NSArray *subItems = [fm contentsOfDirectoryAtPath:subDir error:nil];
+                for (NSString *subID in subItems) {
+                    if ([seenUUIDs containsObject:subID]) continue;
+                    NSString *subPath = [subDir stringByAppendingPathComponent:subID];
+                    NSString *subName = craneMap[subID] ?: subID;
+                    NSMutableDictionary *subProf = [self ensureProfileForBundle:bundleID uuid:subID craneID:subID defaultName:subName path:subPath forceRotate:NO];
+                    [seenUUIDs addObject:subID];
+                    if (isIG) [self.igContainersList addObject:subProf];
+                    else [self.redditContainersList addObject:subProf];
+                }
+            }
+        }
     }
 
-    // 3. Añadir cualquier contenedor de Crane que aún no tenga carpeta abierta o haya sido registrado por Tweak.x
+    // 3. Escanear directorios dedicados de Crane (/var/mobile/Library/Application Support/Crane/Containers/<bundleID>)
+    for (NSString *base in @[@"/var/mobile/Library/Application Support/Crane/Containers", @"/var/jb/var/mobile/Library/Application Support/Crane/Containers"]) {
+        for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
+            NSString *appCraneDir = [base stringByAppendingPathComponent:bID];
+            if (![fm fileExistsAtPath:appCraneDir]) continue;
+            BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
+            NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
+            NSMutableArray *targetList = isIG ? self.igContainersList : self.redditContainersList;
+
+            NSArray *cDirs = [fm contentsOfDirectoryAtPath:appCraneDir error:nil];
+            for (NSString *cID in cDirs) {
+                if ([seenUUIDs containsObject:cID]) continue;
+                NSString *cPath = [appCraneDir stringByAppendingPathComponent:cID];
+                NSString *cName = craneMap[cID];
+                if (!cName) {
+                    for (NSDictionary *src in craneSources) {
+                        cName = findCraneNameByID(src, cID);
+                        if (cName) break;
+                    }
+                }
+                if (!cName) cName = cID;
+                NSMutableDictionary *prof = [self ensureProfileForBundle:bID uuid:cID craneID:cID defaultName:cName path:cPath forceRotate:NO];
+                [targetList addObject:prof];
+                [seenUUIDs addObject:cID];
+            }
+        }
+    }
+
+    // 4. Agregar cualquier contenedor de Crane listado en sus preferencias aunque aún no se haya abierto
     for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
         BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
         NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
@@ -525,6 +603,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         }
     }
 
+    // 5. Incluir contenedores auto-registrados en tiempo de ejecución por Tweak.x
     NSDictionary *savedByUUID = self.state[@"containersByUUID"];
     if ([savedByUUID isKindOfClass:[NSDictionary class]]) {
         for (NSString *uKey in savedByUUID) {
@@ -542,7 +621,6 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         }
     }
 
-    // Actualizar contenedor activo si Crane lo reporta en sus preferencias
     NSMutableDictionary *activeMap = [self.state[@"activeInCrane"] isKindOfClass:[NSDictionary class]]
         ? [self.state[@"activeInCrane"] mutableCopy]
         : [NSMutableDictionary dictionary];
@@ -636,18 +714,20 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 #pragma mark - TableView Nivel 1
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return 3;
+    return 4;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"1. CONTROL MAESTRO, SEGURIDAD Y RED EN VIVO";
-    if (section == 1) return @"2. APLICACIONES VINCULADAS A CRANE";
-    return @"3. MANTENIMIENTO RÁPIDO (64 GB)";
+    if (section == 0) return @"1. CONTROL GENERAL DEL ESCUDO";
+    if (section == 1) return @"2. APLICACIONES Y CONTENEDORES DE CRANE";
+    if (section == 2) return @"3. RED EN VIVO Y ESTADO DE SEGURIDAD";
+    return @"4. MANTENIMIENTO RÁPIDO (64 GB)";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (section == 0) return 4;
+    if (section == 0) return 2;
     if (section == 1) return 2;
+    if (section == 2) return 2;
     return 1;
 }
 
@@ -669,34 +749,16 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
             sw.tag = 10;
             [sw addTarget:self action:@selector(toggleRootSwitch:) forControlEvents:UIControlEventValueChanged];
             cell.accessoryView = sw;
-        } else if (indexPath.row == 1) {
+        } else {
             BOOL excl = [self.state[@"exclusiveMode"] boolValue];
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
             cell.textLabel.text = @"Modo Exclusivo (1 Contenedor a la vez)";
-            cell.detailTextLabel.text = excl ? @"🔒 Al encender un contenedor se apagan los demás y cierra la app" : @"🔓 Múltiples contenedores activos simultáneos";
+            cell.detailTextLabel.text = excl ? @"🔒 Al activar un contenedor se apagan los demás y cierra la app" : @"🔓 Múltiples contenedores activos simultáneos";
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = excl;
             sw.tag = 11;
             [sw addTarget:self action:@selector(toggleRootSwitch:) forControlEvents:UIControlEventValueChanged];
             cell.accessoryView = sw;
-        } else if (indexPath.row == 2) {
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-            cell.textLabel.text = @"🛡️ Estado de Seguridad y Choicy";
-            cell.detailTextLabel.textColor = self.choicyAllSafe ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-            cell.detailTextLabel.text = self.choicySummary;
-        } else {
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-            cell.textLabel.text = @"🌐 Red Saliente Actual (Toca para refrescar)";
-            NSString *vpnTxt = self.vpnActive ? [NSString stringWithFormat:@"🟢 VPN (%@)", self.vpnInterfaceName] : @"⚠️ Red Directa";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ • IP: %@\nISP: %@ • Zona: %@",
-                                         vpnTxt,
-                                         self.state[@"last_ip"] ?: @"Consultando...",
-                                         self.state[@"last_isp"] ?: @"...",
-                                         self.state[@"defaultTimeZone"] ?: @"..."];
         }
         return cell;
     }
@@ -710,30 +772,54 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 
         if (indexPath.row == 0) {
             NSString *actID = activeMap[@"com.burbn.instagram"];
-            NSString *actName = @"Ninguno abierto aún";
+            NSString *actName = @"Toca para ver contenedores";
             for (NSDictionary *p in self.igContainersList) {
-                if ([p[@"containerUUID"] isEqualToString:actID] || [p[@"craneIdentifier"] isEqualToString:actID]) {
-                    actName = p[@"containerName"];
+                if ([p[@"containerUUID"] isEqualToString:actID] || [p[@"craneIdentifier"] isEqualToString:actID] || [p[@"containerName"] isEqualToString:actID]) {
+                    actName = [NSString stringWithFormat:@"🎯 Activo en Crane: %@", p[@"containerName"]];
                     break;
                 }
             }
             cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
             cell.textLabel.text = [NSString stringWithFormat:@"📸 Instagram (%lu Contenedores)", (unsigned long)self.igContainersList.count];
             cell.detailTextLabel.textColor = [UIColor systemGreenColor];
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"🎯 Contenedor Activo: %@", actName];
+            cell.detailTextLabel.text = actName;
         } else {
             NSString *actID = activeMap[@"com.reddit.Reddit"];
-            NSString *actName = @"Ninguno abierto aún";
+            NSString *actName = @"Toca para ver contenedores";
             for (NSDictionary *p in self.redditContainersList) {
-                if ([p[@"containerUUID"] isEqualToString:actID] || [p[@"craneIdentifier"] isEqualToString:actID]) {
-                    actName = p[@"containerName"];
+                if ([p[@"containerUUID"] isEqualToString:actID] || [p[@"craneIdentifier"] isEqualToString:actID] || [p[@"containerName"] isEqualToString:actID]) {
+                    actName = [NSString stringWithFormat:@"🎯 Activo en Crane: %@", p[@"containerName"]];
                     break;
                 }
             }
             cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
             cell.textLabel.text = [NSString stringWithFormat:@"🤖 Reddit (%lu Contenedores)", (unsigned long)self.redditContainersList.count];
             cell.detailTextLabel.textColor = [UIColor systemGreenColor];
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"🎯 Contenedor Activo: %@", actName];
+            cell.detailTextLabel.text = actName;
+        }
+        return cell;
+    }
+
+    if (indexPath.section == 2) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.textLabel.numberOfLines = 0;
+        cell.detailTextLabel.numberOfLines = 0;
+
+        if (indexPath.row == 0) {
+            cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
+            cell.textLabel.text = @"🌐 Red Saliente Actual (Toca para actualizar)";
+            NSString *vpnTxt = self.vpnActive ? [NSString stringWithFormat:@"🟢 VPN (%@)", self.vpnInterfaceName] : @"⚠️ Red Directa";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ • IP: %@\nISP: %@ • Zona: %@",
+                                         vpnTxt,
+                                         self.state[@"last_ip"] ?: @"Consultando...",
+                                         self.state[@"last_isp"] ?: @"...",
+                                         self.state[@"defaultTimeZone"] ?: @"..."];
+        } else {
+            cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
+            cell.textLabel.text = @"🛡️ Estado de Seguridad y Choicy";
+            cell.detailTextLabel.textColor = self.choicyAllSafe ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
+            cell.detailTextLabel.text = self.choicySummary;
         }
         return cell;
     }
@@ -759,19 +845,6 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
-    if (indexPath.section == 0) {
-        if (indexPath.row == 2) {
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Resumen de Seguridad"
-                                                                        message:self.choicyDetailReport
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:ac animated:YES completion:nil];
-        } else if (indexPath.row == 3) {
-            [self detectCurrentNetworkSilently:NO];
-        }
-        return;
-    }
-
     if (indexPath.section == 1) {
         IGFarmAppContainersController *appVC = [[IGFarmAppContainersController alloc] init];
         appVC.parentRoot = self;
@@ -791,6 +864,19 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
     }
 
     if (indexPath.section == 2) {
+        if (indexPath.row == 0) {
+            [self detectCurrentNetworkSilently:NO];
+        } else {
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Estado de Seguridad"
+                                                                        message:self.choicyDetailReport
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:ac animated:YES completion:nil];
+        }
+        return;
+    }
+
+    if (indexPath.section == 3) {
         [self cleanResidualTracesAndKillApps:YES];
     }
 }
@@ -857,7 +943,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 @end
 
 // ============================================================================
-// NIVEL 2: SELECTOR DE CONTENEDORES POR APLICACIÓN (ESTILO GHOST / CRANE)
+// NIVEL 2: LISTA DE CONTENEDORES DE LA APLICACIÓN (ESTILO GHOST / CRANE)
 // ============================================================================
 @implementation IGFarmAppContainersController
 
@@ -868,7 +954,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 64.0;
+    self.tableView.estimatedRowHeight = 66.0;
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.tableView];
 }
@@ -887,8 +973,8 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"ESTADO EN ESTA APLICACIÓN";
-    return [NSString stringWithFormat:@"CONTENEDORES DE CRANE (%lu) — TOCA UNO PARA VER SU FINGERPRINT", (unsigned long)self.containers.count];
+    if (section == 0) return @"INTERRUPTOR DE LA APLICACIÓN";
+    return [NSString stringWithFormat:@"CONTENEDORES EN CRANE (%lu) — TOCA UNO PARA VER SU FINGERPRINT", (unsigned long)self.containers.count];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -905,7 +991,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
         cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
         cell.textLabel.text = [NSString stringWithFormat:@"Habilitar Escudo en %@", self.appTitle];
-        cell.detailTextLabel.text = (masterOn && appOn) ? @"🟢 Activo para los contenedores seleccionados" : @"⚪ Desactivado";
+        cell.detailTextLabel.text = (masterOn && appOn) ? @"🟢 Activo para los contenedores habilitados" : @"⚪ Desactivado";
         UISwitch *sw = [[UISwitch alloc] init];
         sw.on = appOn;
         sw.enabled = masterOn;
@@ -917,7 +1003,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
     if (self.containers.count == 0) {
         UITableViewCell *empty = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         empty.textLabel.text = @"No se encontraron contenedores";
-        empty.detailTextLabel.text = @"Abre la app en tu contenedor de Crane para sincronizarlo";
+        empty.detailTextLabel.text = @"Abre la aplicación en tu contenedor de Crane para sincronizarlo";
         return empty;
     }
 
@@ -933,7 +1019,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 
     NSDictionary *activeMap = self.parentRoot.state[@"activeInCrane"];
     NSString *activeID = activeMap[self.bundleID];
-    BOOL isCurrentInCrane = ([activeID isEqualToString:uuid] || [activeID isEqualToString:craneID]);
+    BOOL isCurrentInCrane = ([activeID isEqualToString:uuid] || [activeID isEqualToString:craneID] || [activeID isEqualToString:cName]);
 
     cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
     cell.textLabel.text = isCurrentInCrane
@@ -946,10 +1032,10 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 
     if (masterOn && appOn && contOn) {
         cell.detailTextLabel.textColor = [UIColor systemGreenColor];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"🟢 Protegido • Crane ID: %@...\nIP: %@ • %@", shortCraneID, ip, tz];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"🟢 ON • Container ID: %@...\nIP: %@ • %@", shortCraneID, ip, tz];
     } else {
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ En pausa • Crane ID: %@...", shortCraneID];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ En pausa • Container ID: %@...", shortCraneID];
     }
 
     UISwitch *sw = [[UISwitch alloc] init];
@@ -991,7 +1077,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 @end
 
 // ============================================================================
-// NIVEL 3: VISTA ESTRUCTURADA DE SPOOFING Y FINGERPRINT DEL CONTENEDOR
+// NIVEL 3: SPOOFING Y FINGERPRINT ESTRUCTURADO DEL CONTENEDOR
 // ============================================================================
 @implementation IGFarmContainerDetailController
 
@@ -1001,7 +1087,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 62.0;
+    self.tableView.estimatedRowHeight = 64.0;
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.tableView];
 }
@@ -1027,7 +1113,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     switch (section) {
         case 0: return @"1. ESTADO Y SINCRONIZACIÓN CON LA IP EN VIVO";
-        case 1: return @"2. MÓDULOS DE SPOOFING (ACTIVA O DESACTIVA)";
+        case 1: return @"2. OPCIONES DE SPOOFING (ACTIVA O DESACTIVA)";
         case 2: return @"3. FINGERPRINT ASIGNADO A ESTE CONTENEDOR";
         case 3: return @"4. ROTACIÓN DE FINGERPRINT";
         default: return nil;
@@ -1038,7 +1124,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
     switch (section) {
         case 0: return 3;
         case 1: return 5;
-        case 2: return 8;
+        case 2: return 6;
         case 3: return 1;
         default: return 0;
     }
@@ -1047,7 +1133,6 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     BOOL contOn = self.profile[@"enabled"] ? [self.profile[@"enabled"] boolValue] : YES;
 
-    // SECCIÓN 1: CONTROL Y SINCRONIZACIÓN DE IP EN VIVO
     if (indexPath.section == 0) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.textLabel.numberOfLines = 0;
@@ -1056,8 +1141,8 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         if (indexPath.row == 0) {
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
-            cell.textLabel.text = @"Protección Activa en este Contenedor";
-            cell.detailTextLabel.text = contOn ? @"🟢 Inyectando Fingerprint aislado en la aplicación" : @"⚪ En pausa";
+            cell.textLabel.text = @"Habilitar Escudo en este Contenedor";
+            cell.detailTextLabel.text = contOn ? @"🟢 Activo • Aplicando Fingerprint en la app" : @"⚪ En pausa";
             cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = contOn;
@@ -1069,7 +1154,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
             cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
             cell.textLabel.textColor = [UIColor systemBlueColor];
             cell.textLabel.text = @"⚡ Sincronizar con la IP Actual en Vivo";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"Toma ISP, Zona Horaria y Región de tu IP actual (%@)",
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"Asigna ISP, País y Zona Horaria de tu IP actual (%@)",
                                          self.profile[@"lastSyncedIP"] ?: @"Sin sincronizar"];
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -1081,7 +1166,6 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         return cell;
     }
 
-    // SECCIÓN 2: MÓDULOS DE SPOOFING (TEXTO COMPLETO Y CLARO)
     if (indexPath.section == 1) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -1089,18 +1173,18 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         cell.detailTextLabel.numberOfLines = 0;
 
         NSArray *titles = @[
-            @"1. Identificadores (IDFV / BootUUID / iCloud)",
-            @"2. Red Local (IP LAN / Router Wi-Fi / Ocultar VPN)",
-            @"3. Ubicación de Red (Zona Horaria / Idioma / ISP)",
-            @"4. Hardware iPhone 8 (Disco / Batería / Audio / Uptime)",
-            @"5. Escudo Anti-Detección (Ocultar Jailbreak y Crane)"
+            @"1. Identificadores del Sistema",
+            @"2. Red Local y Ocultación de VPN",
+            @"3. Ubicación de Red (Hora e Idioma por IP)",
+            @"4. Hardware iPhone 8 (Disco, Batería y Audio)",
+            @"5. Ocultación de Jailbreak y Crane"
         ];
         NSArray *subtitles = @[
-            @"Aísla el Vendor ID, el UUID de arranque del kernel y el token de iCloud",
-            @"Asigna una subred doméstica propia y oculta la interfaz utun del VPN",
-            @"Adapta automáticamente el huso horario y la región a los datos de la IP",
-            @"Varía los gigabytes libres, nivel de batería, volumen y tiempo de encendido",
-            @"Bloquea el escaneo de /var/jb, palera1n y librerías en memoria"
+            @"Complementa el ID de Crane aislando BootUUID y el token de iCloud",
+            @"Asigna una IP doméstica y router propios; oculta el túnel utun del VPN",
+            @"Sincroniza el huso horario y el idioma del contenedor con los datos de la IP",
+            @"Aísla gigabytes libres en disco, porcentaje de batería, volumen y arranque",
+            @"Impide que la app detecte /var/jb, palera1n o librerías inyectadas"
         ];
         NSArray *keys = @[@"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity"];
 
@@ -1120,7 +1204,6 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
         return cell;
     }
 
-    // SECCIÓN 3: FINGERPRINT ESTRUCTURADO Y LEGIBLE
     if (indexPath.section == 2) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -1138,57 +1221,51 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
 
         switch (indexPath.row) {
             case 0:
-                cell.textLabel.text = @"📦 Contenedor y Container ID (Base de Crane)";
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"Nombre en Crane: %@\nContainer ID: %@",
+                cell.textLabel.text = @"📦 Identidad Base de Crane";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"Container Name: %@\nContainer ID:   %@",
                                              self.profile[@"containerName"] ?: @"Default", craneID];
                 break;
             case 1:
-                cell.textLabel.text = @"🔑 Vendor ID Inyectado (Shield IDFV)";
-                cell.detailTextLabel.text = self.profile[@"idfv"] ?: @"N/A";
+                cell.textLabel.text = @"🔑 Identificadores Complementarios (Sistema)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"IDFV:     %@\nBootUUID: %@\niCloud:   %@",
+                                             self.profile[@"idfv"] ?: @"N/A",
+                                             self.profile[@"bootSessionUUID"] ?: @"N/A",
+                                             self.profile[@"cloudUUID"] ?: @"N/A"];
                 break;
             case 2:
-                cell.textLabel.text = @"🔄 Kernel BootSession UUID y Token iCloud";
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"BootUUID: %@\niCloud:   %@",
-                                             self.profile[@"bootSessionUUID"] ?: @"N/A", self.profile[@"cloudUUID"] ?: @"N/A"];
-                break;
-            case 3:
-                cell.textLabel.text = @"📱 Dispositivo y Compilación del Sistema";
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"Modelo: iPhone 8 (iPhone10,4)\nNombre: %@ • Build iOS: %@",
-                                             self.profile[@"deviceName"] ?: @"iPhone", self.profile[@"osBuild"] ?: @"20G81"];
-                break;
-            case 4:
-                cell.textLabel.text = @"🌐 Red Pública e ISP Sincronizado";
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"IP Actual: %@\nISP: %@ (%@)",
+                cell.textLabel.text = @"🌐 Red e ISP Sincronizado con la IP";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"IP Actual: %@\nISP:       %@\nTipo Red:  %@",
                                              self.profile[@"lastSyncedIP"] ?: @"Sin sincronizar",
                                              self.profile[@"ispName"] ?: @"ISP",
-                                             [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"] ? @"Datos Móviles 4G LTE" : @"Red Residencial / Wi-Fi"];
+                                             [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"] ? @"Datos Móviles 4G LTE" : @"ISP Residencial / Fijo"];
                 break;
-            case 5:
-                cell.textLabel.text = @"🌎 Ubicación Estática del Contenedor (Hora e Idioma)";
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"Ubicación: %@\nZona Horaria: %@ • Locale: %@",
-                                             self.profile[@"cityCountry"] ?: @"Sincroniza con tu IP",
+            case 3:
+                cell.textLabel.text = @"🌎 Ubicación Asignada al Contenedor";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"Región:       %@\nZona Horaria: %@\nIdioma/País:  %@",
+                                             self.profile[@"cityCountry"] ?: @"Toca Sincronizar con IP",
                                              self.profile[@"timeZone"] ?: @"America/New_York",
                                              self.profile[@"localeID"] ?: @"en_US"];
                 break;
-            case 6:
-                cell.textLabel.text = @"📡 Red Doméstica Simulada (LAN y Router Wi-Fi)";
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"IP Local (en0): %@\nSSID: %@ • BSSID: %@",
-                                             self.profile[@"localIP"] ?: @"", self.profile[@"ssid"] ?: @"", self.profile[@"bssid"] ?: @""];
+            case 4:
+                cell.textLabel.text = @"📡 Red Doméstica Aislada (LAN y Router)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"IP Local (en0): %@\nWi-Fi SSID:     %@\nRouter BSSID:   %@",
+                                             self.profile[@"localIP"] ?: @"",
+                                             self.profile[@"ssid"] ?: @"",
+                                             self.profile[@"bssid"] ?: @""];
                 break;
-            case 7:
-                cell.textLabel.text = @"🔋 Métricas Físicas (Disco, Batería, Audio y Arranque)";
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"Espacio Libre: %.2f GB de 64 GB\nBatería: %d%% • Volumen: %d%% • Uptime: +%lu min",
-                                             freeGB, batPct, volPct, (unsigned long)upMin];
+            case 5:
+                cell.textLabel.text = @"📱 Hardware iPhone 8 (iPhone10,4)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"Disco Libre: %.2f GB de 64 GB (Build %@)\nBatería:     %d%% • Volumen: %d%% • Uptime: +%lu min",
+                                             freeGB, self.profile[@"osBuild"] ?: @"20G81", batPct, volPct, (unsigned long)upMin];
                 break;
         }
         return cell;
     }
 
-    // SECCIÓN 4: REGENERAR FINGERPRINT
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
     cell.textLabel.textColor = [UIColor systemRedColor];
     cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-    cell.textLabel.text = @"🔄 Generar Nuevo Fingerprint para este Contenedor";
+    cell.textLabel.text = @"🔄 Regenerar Métricas Complementarias";
     return cell;
 }
 
@@ -1222,7 +1299,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
                                                    forceRotate:YES];
         [self.tableView reloadData];
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Fingerprint Renovado"
-                                                                    message:@"Se generaron nuevos identificadores y métricas físicas para este contenedor manteniendo su vínculo con Crane."
+                                                                    message:@"Se generaron nuevas métricas complementarias conservando intacto el Container ID de Crane."
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:ac animated:YES completion:nil];
@@ -1275,7 +1352,7 @@ static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *ou
             self.profile[@"CarrierMCC"] = @"311"; self.profile[@"CarrierMNC"] = @"480"; self.profile[@"CarrierISO"] = cc;
         } else if (isMobileISP) {
             self.profile[@"CarrierMode"] = @"CELLULAR"; self.profile[@"CarrierName"] = ispRaw;
-            self.profile[@"CarrierMCC"] = @"310"; self.profile[@"CarrierMNC"] = @"260"; self.profile[@"CarrierISO"] = cc;
+            self.profile[@"CarrierMCC"] = @"310"; self.state[@"defaultCarrierMNC"] = @"260"; self.profile[@"CarrierISO"] = cc;
         } else {
             self.profile[@"CarrierMode"] = @"WIFI_ONLY"; self.profile[@"CarrierName"] = ispRaw;
             self.profile[@"CarrierMCC"] = @""; self.profile[@"CarrierMNC"] = @""; self.profile[@"CarrierISO"] = cc;
