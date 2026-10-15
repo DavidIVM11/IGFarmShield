@@ -12,19 +12,129 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Theos
-        uses: theos/actions/install-theos@v1
-        with:
-          sdks: '15.2'
-
-      - name: Build Package (.deb)
+      - name: Install Dependencies & Theos with iOS 16.5 SDK
         run: |
-          source $GITHUB_WORKSPACE/.theosrc || true
-          export THEOS=~/theos
-          perl -i -pe 's/^[ ]+/\t/g' Makefile igfarmshieldprefs/Makefile
-          make package FINALPACKAGE=1
+          brew install ldid xz dpkg
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          rm -rf $HOME/theos/sdks/*
+          curl -sL https://github.com/theos/sdks/releases/download/master-1464700/iPhoneOS16.5.sdk.tar.xz | tar -xJf - -C $HOME/theos/sdks
 
-      - name: Upload Compiled .deb
+      - name: Normalize Structure, Makefiles, Icons & Build DEB
+        run: |
+          export THEOS=$HOME/theos
+          python3 - << 'EOF'
+          import struct, zlib, os, shutil
+
+          # 1. Si se subió una subcarpeta IGFarmShield-main por error, limpiar
+          if os.path.exists("IGFarmShield-main"):
+              shutil.rmtree("IGFarmShield-main", ignore_errors=True)
+          for junk in ["extracto.py", "todo_mi_repo_github.txt", "todo_mi_repo_github_2.txt"]:
+              if os.path.exists(junk):
+                  os.remove(junk)
+
+          # 2. Crear carpeta Resources para el bundle y colocar Info.plist adentro
+          os.makedirs("igfarmshieldprefs/Resources", exist_ok=True)
+          if os.path.exists("igfarmshieldprefs/Info.plist"):
+              shutil.copy("igfarmshieldprefs/Info.plist", "igfarmshieldprefs/Resources/Info.plist")
+
+          # 3. Generar íconos PNG en igfarmshieldprefs/ y en Resources/
+          def make_shield_png(w, h, filename):
+              raw = bytearray()
+              for y in range(h):
+                  raw.append(0)
+                  for x in range(w):
+                      cx, cy = w / 2.0, h / 2.0
+                      dx, dy = abs(x - cx) / (w * 0.32), (y - h * 0.18) / (h * 0.65)
+                      in_shield = (0 <= dy <= 1.0) and (dx <= (1.0 - 0.5 * (dy ** 1.6)))
+                      if in_shield:
+                          raw.extend((255, 255, 255, 255))
+                      else:
+                          raw.extend((0, 122, 255, 255))
+              def chunk(tag, data):
+                  return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+              ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
+              png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
+              with open(filename, "wb") as f:
+                  f.write(png)
+
+          for folder in ["igfarmshieldprefs", "igfarmshieldprefs/Resources"]:
+              make_shield_png(29, 29, f"{folder}/IGFarmShieldIcon.png")
+              make_shield_png(58, 58, f"{folder}/IGFarmShieldIcon@2x.png")
+              make_shield_png(87, 87, f"{folder}/IGFarmShieldIcon@3x.png")
+
+          # 4. Escribir Makefile raíz con tabulaciones exactas
+          root_mk = (
+              "TARGET := iphone:clang:latest:14.0\n"
+              "INSTALL_TARGET_PROCESSES = Instagram Reddit Preferences\n"
+              "THEOS_PACKAGE_SCHEME = rootless\n"
+              "ARCHS = arm64\n\n"
+              "include $(THEOS)/makefiles/common.mk\n\n"
+              "TWEAK_NAME = IGFarmShield\n"
+              "IGFarmShield_FILES = Tweak.x\n"
+              "IGFarmShield_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-error\n"
+              "IGFarmShield_FRAMEWORKS = UIKit Foundation CFNetwork LocalAuthentication CoreTelephony DeviceCheck SystemConfiguration AVFoundation\n\n"
+              "SUBPROJECTS += igfarmshieldprefs\n\n"
+              "include $(THEOS_MAKE_PATH)/tweak.mk\n"
+              "include $(THEOS_MAKE_PATH)/aggregate.mk\n"
+          )
+          with open("Makefile", "w", newline="\n") as f:
+              f.write(root_mk)
+
+          # 5. Escribir igfarmshieldprefs/Makefile con rutas Rootless exactas (sin duplicar /var/jb)
+          prefs_mk = (
+              "TARGET := iphone:clang:latest:14.0\n"
+              "THEOS_PACKAGE_SCHEME = rootless\n"
+              "ARCHS = arm64\n\n"
+              "include $(THEOS)/makefiles/common.mk\n\n"
+              "BUNDLE_NAME = IGFarmShieldPrefs\n"
+              "IGFarmShieldPrefs_FILES = IGFarmRootListController.m\n"
+              "IGFarmShieldPrefs_FRAMEWORKS = UIKit Foundation CoreGraphics\n"
+              "IGFarmShieldPrefs_INSTALL_PATH = /Library/PreferenceBundles\n"
+              "IGFarmShieldPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-error\n"
+              "IGFarmShieldPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup\n\n"
+              "include $(THEOS_MAKE_PATH)/bundle.mk\n\n"
+              "internal-stage::\n"
+              "\t$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences$(ECHO_END)\n"
+              "\t$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/Library/PreferenceBundles/IGFarmShieldPrefs.bundle$(ECHO_END)\n"
+              "\t$(ECHO_NOTHING)cp entry.plist $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences/IGFarmShieldPrefs.plist$(ECHO_END)\n"
+              "\t$(ECHO_NOTHING)cp Info.plist $(THEOS_STAGING_DIR)/Library/PreferenceBundles/IGFarmShieldPrefs.bundle/Info.plist$(ECHO_END)\n"
+              "\t$(ECHO_NOTHING)cp IGFarmShieldIcon*.png $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences/ 2>/dev/null || true$(ECHO_END)\n"
+              "\t$(ECHO_NOTHING)cp IGFarmShieldIcon*.png $(THEOS_STAGING_DIR)/Library/PreferenceBundles/IGFarmShieldPrefs.bundle/ 2>/dev/null || true$(ECHO_END)\n"
+          )
+          with open("igfarmshieldprefs/Makefile", "w", newline="\n") as f:
+              f.write(prefs_mk)
+
+          # 6. Asegurar salto de línea final en control
+          with open("control", "r", encoding="utf-8") as f:
+              ctrl = f.read().strip() + "\n"
+          with open("control", "w", encoding="utf-8", newline="\n") as f:
+              f.write(ctrl)
+
+          # 7. Crear script DEBIAN/postrm para desinstalación 100% limpia
+          os.makedirs("layout/DEBIAN", exist_ok=True)
+          postrm_code = (
+              "#!/bin/sh\n"
+              "if [ \"$1\" = \"remove\" ] || [ \"$1\" = \"purge\" ]; then\n"
+              "    rm -f /var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist\n"
+              "    rm -f /var/jb/Library/PreferenceLoader/Preferences/IGFarmShieldPrefs.plist\n"
+              "    rm -f /var/jb/Library/PreferenceLoader/Preferences/IGFarmShieldIcon*.png\n"
+              "    rm -rf /var/jb/Library/PreferenceBundles/IGFarmShieldPrefs.bundle\n"
+              "    rm -rf /var/jb/var/jb\n"
+              "    find /var/mobile/Containers/Data/Application -name \".igshield_container.plist\" -delete 2>/dev/null || true\n"
+              "fi\n"
+              "exit 0\n"
+          )
+          with open("layout/DEBIAN/postrm", "w", newline="\n") as f:
+              f.write(postrm_code)
+          os.chmod("layout/DEBIAN/postrm", 0o755)
+          EOF
+
+          make clean
+          make package FINALPACKAGE=1
+          echo "=== ARCHIVOS EMPACADOS EN EL DEB ==="
+          dpkg-deb -c packages/*.deb
+
+      - name: Upload Compiled Rootless DEB
         uses: actions/upload-artifact@v4
         with:
           name: IGFarmShield-Rootless-DEB
