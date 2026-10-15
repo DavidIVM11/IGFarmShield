@@ -14,7 +14,7 @@ extern char **environ;
 #define CHOICY_PLIST_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define CHOICY_PLIST_VAR @"/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 6
+#define CURRENT_SCHEMA_VERSION 8
 
 @interface PSViewController : UIViewController
 @end
@@ -36,6 +36,24 @@ static void killAppProcess(NSString *procName) {
     pid_t pid;
     const char *args[] = {"/var/jb/usr/bin/killall", "-9", [procName UTF8String], NULL};
     posix_spawn(&pid, args[0], NULL, NULL, (char *const *)args, environ);
+}
+
+static BOOL dictionaryMentionsString(id node, NSString *needle) {
+    if (!node || !needle) return NO;
+    if ([node isKindOfClass:[NSString class]]) {
+        return [(NSString *)node rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
+    }
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)node;
+        for (id k in d) {
+            if (dictionaryMentionsString(k, needle) || dictionaryMentionsString(d[k], needle)) return YES;
+        }
+    } else if ([node isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)node) {
+            if (dictionaryMentionsString(item, needle)) return YES;
+        }
+    }
+    return NO;
 }
 
 static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
@@ -74,6 +92,49 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     return nil;
 }
 
+// Extrae todos los contenedores configurados en Crane para un bundleID dado
+static void extractCraneContainersFromPrefsNode(id node, NSMutableDictionary *outMap, NSString **outActiveID) {
+    if (!node) return;
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)node;
+        for (NSString *ak in @[@"activeContainer", @"selectedContainer", @"currentContainer", @"activeContainerIdentifier", @"active"]) {
+            if ([dict[ak] isKindOfClass:[NSString class]] && [dict[ak] length] > 0 && outActiveID) {
+                *outActiveID = dict[ak];
+            }
+        }
+        NSString *cID = nil;
+        NSString *cName = nil;
+        for (NSString *ik in @[@"identifier", @"id", @"UUID", @"uuid", @"containerIdentifier"]) {
+            if ([dict[ik] isKindOfClass:[NSString class]] && [dict[ik] length] > 0) { cID = dict[ik]; break; }
+        }
+        for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+            if ([dict[nk] isKindOfClass:[NSString class]] && [dict[nk] length] > 0) { cName = dict[nk]; break; }
+        }
+        if (cID && cName) {
+            outMap[cID] = cName;
+        }
+        for (id k in dict) {
+            NSString *kStr = [k description];
+            id val = dict[k];
+            if ([val isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *sub = (NSDictionary *)val;
+                for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+                    if ([sub[nk] isKindOfClass:[NSString class]] && [sub[nk] length] > 0) {
+                        outMap[kStr] = sub[nk];
+                    }
+                }
+            }
+            if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
+                extractCraneContainersFromPrefsNode(val, outMap, outActiveID);
+            }
+        }
+    } else if ([node isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)node) {
+            extractCraneContainersFromPrefsNode(item, outMap, outActiveID);
+        }
+    }
+}
+
 @interface IGFarmRootListController : PSViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableDictionary *state;
@@ -92,7 +153,7 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 - (void)cleanResidualTracesAndKillApps:(BOOL)showPopup;
 - (void)detectCurrentNetworkSilently:(BOOL)silent;
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid;
-- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid defaultName:(NSString *)dName path:(NSString *)path forceRotate:(BOOL)rotate;
+- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path forceRotate:(BOOL)rotate;
 - (void)saveProfile:(NSMutableDictionary *)profile forUUID:(NSString *)uuid;
 - (void)setContainer:(NSString *)targetUUID enabled:(BOOL)enabled inBundle:(NSString *)bundleID;
 @end
@@ -115,7 +176,7 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 @end
 
 // ============================================================================
-// NIVEL 1: MENÚ PRINCIPAL (CHOICY + RED TRANSPARENTE + SELECTORES CRANE)
+// NIVEL 1: CENTRO DE CONTROL PRINCIPAL (COMPLEMENTO PURO DE CRANE)
 // ============================================================================
 @implementation IGFarmRootListController
 
@@ -141,6 +202,8 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 60.0;
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.tableView];
 
@@ -167,29 +230,26 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     if (!choicy) choicy = [[[NSUserDefaults alloc] initWithSuiteName:@"com.opa334.choicyprefs"] dictionaryRepresentation];
 
     NSDictionary *appSettings = [choicy[@"appSettings"] isKindOfClass:[NSDictionary class]] ? choicy[@"appSettings"] : @{};
-    NSDictionary *igCfg = appSettings[@"com.burbn.instagram"];
-    NSDictionary *rdCfg = appSettings[@"com.reddit.Reddit"];
-
-    BOOL igOK = ([igCfg isKindOfClass:[NSDictionary class]] && [igCfg count] > 0);
-    BOOL rdOK = ([rdCfg isKindOfClass:[NSDictionary class]] && [rdCfg count] > 0);
+    BOOL igOK = ([appSettings[@"com.burbn.instagram"] isKindOfClass:[NSDictionary class]] && [appSettings[@"com.burbn.instagram"] count] > 0);
+    BOOL rdOK = ([appSettings[@"com.reddit.Reddit"] isKindOfClass:[NSDictionary class]] && [appSettings[@"com.reddit.Reddit"] count] > 0);
 
     self.choicyAllSafe = (igOK && rdOK);
     if (igOK && rdOK) {
-        self.choicySummary = @"🟢 Blindado (IG y Reddit en Whitelist) + Escudo Choicy+";
+        self.choicySummary = @"🟢 Óptimo • Inyección filtrada y rutas ocultas";
     } else if (igOK || rdOK) {
-        self.choicySummary = [NSString stringWithFormat:@"🟡 Parcial (IG:%@ • Reddit:%@) + Escudo Choicy+", igOK ? @"OK" : @"Falta", rdOK ? @"OK" : @"Falta"];
+        self.choicySummary = [NSString stringWithFormat:@"🟡 Parcial • IG: %@ | Reddit: %@", igOK ? @"Protegido" : @"Sin filtro", rdOK ? @"Protegido" : @"Sin filtro"];
     } else {
-        self.choicySummary = @"🟠 Escudo Choicy+ Activo (Toca para ver estado de Choicy)";
+        self.choicySummary = @"🟠 Protección interna activa • Configura Choicy";
     }
 
     self.choicyDetailReport = [NSString stringWithFormat:
-        @"Estado de Choicy en el Sistema:\n• Instagram: %@\n• Reddit: %@\n\n"
-        @"Funciones de Seguridad Choicy+ (Activas en IGFarmShield):\n"
-        @"• Hook dladdr(): Oculta en RAM los punteros de IGFarmShield y Crane.\n"
-        @"• Hook stat() / lstat() / access(): Bloquea escaneos en C de /var/jb y palera1n.\n"
-        @"• Hook dyld: Camufla las librerías inyectadas como UIKitCore.",
-        igOK ? @"🟢 Whitelist Activa" : @"⚠️ Sin Whitelist en Choicy",
-        rdOK ? @"🟢 Whitelist Activa" : @"⚠️ Sin Whitelist en Choicy"];
+        @"• Choicy en Instagram: %@\n"
+        @"• Choicy en Reddit: %@\n"
+        @"• Rutas de Jailbreak (/var/jb): Ocultas\n"
+        @"• Librerías de Crane y Tweak: Ocultas\n"
+        @"• Interfaz VPN (utun): Camuflada como Wi-Fi Local",
+        igOK ? @"🟢 Lista Blanca Activa" : @"⚠️ Sin configurar en Choicy",
+        rdOK ? @"🟢 Lista Blanca Activa" : @"⚠️ Sin configurar en Choicy"];
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -240,9 +300,10 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     killAppProcess([bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
 }
 
-- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid defaultName:(NSString *)dName path:(NSString *)path forceRotate:(BOOL)rotate {
+- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path forceRotate:(BOOL)rotate {
     if (!bundleID) bundleID = @"com.burbn.instagram";
-    if (!uuid || uuid.length == 0) uuid = [path lastPathComponent] ?: @"Default_UUID";
+    if (!uuid || uuid.length == 0) uuid = craneID ?: @"Default";
+    if (!craneID || craneID.length == 0) craneID = uuid;
 
     NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
         ? [self.state[@"containersByUUID"] mutableCopy]
@@ -258,22 +319,20 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
         }
     }
     if (!profile && [byUUID[uuid] isKindOfClass:[NSDictionary class]] &&
-        [byUUID[uuid][@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION &&
-        [byUUID[uuid][@"containerUUID"] isEqualToString:uuid]) {
+        [byUUID[uuid][@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION) {
         profile = [byUUID[uuid] mutableCopy];
     }
 
+    NSString *cleanCraneName = (dName && dName.length > 0) ? dName : @"Default";
+
     if (!profile || !profile[@"idfv"] || rotate) {
         BOOL wasEnabled = (profile && profile[@"enabled"] != nil) ? [profile[@"enabled"] boolValue] : YES;
-        NSString *cleanName = (dName && dName.length > 0) ? dName : uuid;
-        NSString *savedAlias = (profile[@"customAlias"] && ![profile[@"customAlias"] isEqualToString:@"Default"]) ? profile[@"customAlias"] : cleanName;
 
-        // Semilla única por carpeta UUID + entropía aleatoria para que dos contenedores jamás coincidan
         uint64_t seed = fnv1aHashPrefs(uuid) ^ (((uint64_t)arc4random() << 32) | arc4random());
         NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
-        NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link", @"Verizon-5G"];
-        NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0", @"192.168.86"];
-        NSArray *osBuilds = @[@"20G75", @"20G81", @"20H19", @"20H30", @"20F66", @"20E252"];
+        NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
+        NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0"];
+        NSArray *osBuilds = @[@"20G75", @"20G81", @"20H19", @"20H30", @"20F66"];
 
         NSString *oui = ouis[seed % ouis.count];
         NSString *ssidPref = ssidPrefixes[(seed >> 3) % ssidPrefixes.count];
@@ -289,8 +348,8 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
         profile = [@{
             @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
             @"containerUUID": uuid,
-            @"containerName": cleanName,
-            @"customAlias": savedAlias,
+            @"craneIdentifier": craneID,
+            @"containerName": cleanCraneName,
             @"bundleID": bundleID,
             @"path": path ?: @"",
             @"enabled": @(wasEnabled),
@@ -299,10 +358,11 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
             @"spoofLocation": @YES,
             @"spoofHardware": @YES,
             @"spoofSecurity": @YES,
+            @"locationAnchored": @(self.state[@"last_ip"] != nil),
             @"deviceModel": @"iPhone10,4",
             @"osBuild": osBuild,
             @"deviceName": [NSString stringWithFormat:@"iPhone-%02X", (unsigned int)(seed & 0xFF)],
-            @"craneOriginalIDFV": profile[@"craneOriginalIDFV"] ?: @"Se captura al abrir la app",
+            @"craneOriginalIDFV": craneID,
             @"idfv": [[NSUUID UUID] UUIDString],
             @"shieldDeviceID": [[NSUUID UUID] UUIDString],
             @"bootSessionUUID": [[NSUUID UUID] UUIDString],
@@ -316,10 +376,13 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
             @"brightness": @(0.30f + (((seed >> 4) % 60) / 100.0f)),
             @"audioVolume": @(0.20f + (((seed >> 6) % 70) / 100.0f)),
             @"pasteboardCount": @(5 + (seed % 90)),
+            @"lastSyncedIP": self.state[@"last_ip"] ?: @"Pendiente de sincronizar",
+            @"ispName": self.state[@"last_isp"] ?: @"ISP",
+            @"cityCountry": self.state[@"last_city_country"] ?: @"Sin sincronizar",
             @"timeZone": self.state[@"defaultTimeZone"] ?: @"America/New_York",
             @"localeID": self.state[@"defaultLocale"] ?: @"en_US",
-            @"CarrierMode": self.state[@"defaultCarrierMode"] ?: @"CELLULAR",
-            @"CarrierName": self.state[@"defaultCarrierName"] ?: @"T-Mobile",
+            @"CarrierMode": self.state[@"defaultCarrierMode"] ?: @"WIFI_ONLY",
+            @"CarrierName": self.state[@"defaultCarrierName"] ?: @"ISP",
             @"CarrierMCC": self.state[@"defaultCarrierMCC"] ?: @"310",
             @"CarrierMNC": self.state[@"defaultCarrierMNC"] ?: @"260",
             @"CarrierISO": self.state[@"defaultCarrierISO"] ?: @"us"
@@ -327,16 +390,11 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     } else {
         profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
         profile[@"containerUUID"] = uuid;
+        profile[@"craneIdentifier"] = craneID;
+        profile[@"containerName"] = cleanCraneName;
         profile[@"bundleID"] = bundleID;
         profile[@"deviceModel"] = @"iPhone10,4";
-        if (!profile[@"osBuild"]) profile[@"osBuild"] = @"20G81";
         if (path.length > 0) profile[@"path"] = path;
-        if (dName && dName.length > 0 && ![dName isEqualToString:@"Default"]) {
-            profile[@"containerName"] = dName;
-            if (!profile[@"customAlias"] || [profile[@"customAlias"] isEqualToString:@"Default"] || [profile[@"customAlias"] hasPrefix:@"Contenedor"]) {
-                profile[@"customAlias"] = dName;
-            }
-        }
     }
 
     [self saveProfile:profile forUUID:uuid];
@@ -346,10 +404,11 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 - (void)scanAndSyncAllContainers {
     self.igContainersList = [NSMutableArray array];
     self.redditContainersList = [NSMutableArray array];
+    NSMutableSet *seenUUIDs = [NSMutableSet set];
     NSMutableSet *seenIDFVs = [NSMutableSet set];
-    NSMutableSet *seenIPs = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
 
+    // 1. Cargar todas las fuentes de preferencias y soporte de Crane
     NSMutableArray *craneSources = [NSMutableArray array];
     NSDictionary *ud1 = [[[NSUserDefaults alloc] initWithSuiteName:@"com.opa334.craneprefs"] dictionaryRepresentation];
     if (ud1) [craneSources addObject:ud1];
@@ -359,82 +418,138 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:cp];
         if (d) [craneSources addObject:d];
     }
+    for (NSString *suppDir in @[@"/var/mobile/Library/Application Support/Crane", @"/var/jb/var/mobile/Library/Application Support/Crane"]) {
+        NSArray *subFiles = [fm subpathsOfDirectoryAtPath:suppDir error:nil];
+        for (NSString *sf in subFiles) {
+            if ([sf hasSuffix:@".plist"]) {
+                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:[suppDir stringByAppendingPathComponent:sf]];
+                if (d) [craneSources addObject:d];
+            }
+        }
+    }
 
+    NSMutableDictionary *igCraneMap = [NSMutableDictionary dictionary];
+    NSMutableDictionary *rdCraneMap = [NSMutableDictionary dictionary];
+    NSString *igActiveCraneID = nil;
+    NSString *rdActiveCraneID = nil;
+
+    for (NSDictionary *src in craneSources) {
+        for (id k in src) {
+            NSString *kStr = [k description];
+            if ([kStr rangeOfString:@"com.burbn.instagram" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                extractCraneContainersFromPrefsNode(src[k], igCraneMap, &igActiveCraneID);
+            } else if ([kStr rangeOfString:@"com.reddit.Reddit" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                extractCraneContainersFromPrefsNode(src[k], rdCraneMap, &rdActiveCraneID);
+            }
+        }
+    }
+
+    // 2. Escanear TODAS las carpetas en /var/mobile/Containers/Data/Application (incluyendo contenedores secundarios de Crane)
     NSString *appsDir = @"/var/mobile/Containers/Data/Application";
     NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
 
-    NSUInteger igCustomCount = 0;
-    NSUInteger rdCustomCount = 0;
-
-    for (NSString *uuid in uuids) {
-        NSString *fullPath = [appsDir stringByAppendingPathComponent:uuid];
+    for (NSString *folderUUID in uuids) {
+        NSString *fullPath = [appsDir stringByAppendingPathComponent:folderUUID];
         NSString *metaPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
         NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
         if (![meta isKindOfClass:[NSDictionary class]]) continue;
 
-        NSString *bundleID = meta[@"MCMMetadataIdentifier"] ?: @"";
-        BOOL isIG = [bundleID isEqualToString:@"com.burbn.instagram"];
-        BOOL isRD = [bundleID isEqualToString:@"com.reddit.Reddit"];
+        BOOL isIG = dictionaryMentionsString(meta, @"com.burbn.instagram");
+        BOOL isRD = dictionaryMentionsString(meta, @"com.reddit.Reddit");
         if (!isIG && !isRD) continue;
 
-        NSString *detectedName = nil;
-        NSString *craneInternalID = nil;
+        NSString *bundleID = isIG ? @"com.burbn.instagram" : @"com.reddit.Reddit";
+        NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
 
-        for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
-            if ([meta[rk] isKindOfClass:[NSString class]] && [meta[rk] length] > 0) detectedName = meta[rk];
-        }
-        for (NSString *ik in @[@"com.opa334.crane.container.identifier", @"com.opa334.crane.container.id"]) {
-            if ([meta[ik] isKindOfClass:[NSString class]] && [meta[ik] length] > 0) craneInternalID = meta[ik];
-        }
+        NSString *craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
+        NSString *detectedName = nil;
 
         NSDictionary *userInfo = meta[@"MCMMetadataUserInfo"];
         if ([userInfo isKindOfClass:[NSDictionary class]] && [userInfo count] > 0) {
             for (NSString *k in userInfo) {
                 NSString *kl = [k lowercaseString];
-                if ([kl containsString:@"name"] && [userInfo[k] isKindOfClass:[NSString class]] && [userInfo[k] length] > 0) {
-                    detectedName = userInfo[k];
-                } else if ([userInfo[k] isKindOfClass:[NSString class]] && [userInfo[k] length] > 0) {
-                    craneInternalID = userInfo[k];
+                id val = userInfo[k];
+                if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
+                    if ([kl containsString:@"name"]) detectedName = val;
+                    else if ([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"]) {
+                        if (![val isEqualToString:bundleID]) craneID = val;
+                    }
                 }
             }
         }
 
+        if (!detectedName && craneMap[craneID]) detectedName = craneMap[craneID];
+        if (!detectedName && craneMap[folderUUID]) detectedName = craneMap[folderUUID];
+
         if (!detectedName) {
             for (NSDictionary *src in craneSources) {
-                if (craneInternalID) {
-                    detectedName = recursiveSearchCraneNamePrefs(src, craneInternalID);
-                    if (detectedName) break;
-                }
-                detectedName = recursiveSearchCraneNamePrefs(src, uuid);
+                detectedName = recursiveSearchCraneNamePrefs(src, craneID);
+                if (detectedName) break;
+                detectedName = recursiveSearchCraneNamePrefs(src, folderUUID);
                 if (detectedName) break;
             }
         }
 
         if (!detectedName || detectedName.length == 0) {
-            if ((!userInfo || [userInfo count] == 0) && !craneInternalID) {
+            if (!userInfo || [userInfo count] == 0 || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
                 detectedName = @"Default";
-            } else if ([craneInternalID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
-                detectedName = @"Default";
-            } else if (craneInternalID && ![craneInternalID isEqualToString:uuid]) {
-                detectedName = craneInternalID;
             } else {
-                NSUInteger idx = isIG ? (++igCustomCount) : (++rdCustomCount);
-                detectedName = [NSString stringWithFormat:@"Contenedor #%lu (%@)", (unsigned long)idx, [uuid substringToIndex:MIN(6, uuid.length)]];
+                detectedName = craneID;
             }
         }
 
-        NSMutableDictionary *prof = [self ensureProfileForBundle:bundleID uuid:uuid defaultName:detectedName path:fullPath forceRotate:NO];
-
-        // Garantía anti-colisión absoluta: si algún IDFV o IP LAN se repite entre dos carpetas, regenerar al instante
-        if ([seenIDFVs containsObject:prof[@"idfv"]] || [seenIPs containsObject:prof[@"localIP"]]) {
-            prof = [self ensureProfileForBundle:bundleID uuid:uuid defaultName:detectedName path:fullPath forceRotate:YES];
+        NSMutableDictionary *prof = [self ensureProfileForBundle:bundleID uuid:folderUUID craneID:craneID defaultName:detectedName path:fullPath forceRotate:NO];
+        if ([seenIDFVs containsObject:prof[@"idfv"]]) {
+            prof = [self ensureProfileForBundle:bundleID uuid:folderUUID craneID:craneID defaultName:detectedName path:fullPath forceRotate:YES];
         }
-        if (prof[@"idfv"]) [seenIDFVs addObject:prof[@"idfv"]];
-        if (prof[@"localIP"]) [seenIPs addObject:prof[@"localIP"]];
+        [seenIDFVs addObject:prof[@"idfv"]];
+        [seenUUIDs addObject:folderUUID];
+        [seenUUIDs addObject:craneID];
 
         if (isIG) [self.igContainersList addObject:prof];
         else [self.redditContainersList addObject:prof];
     }
+
+    // 3. Añadir cualquier contenedor de Crane que aún no tenga carpeta abierta o haya sido registrado por Tweak.x
+    for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
+        BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
+        NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
+        NSMutableArray *targetList = isIG ? self.igContainersList : self.redditContainersList;
+
+        for (NSString *cID in craneMap) {
+            if ([seenUUIDs containsObject:cID]) continue;
+            NSString *cName = craneMap[cID];
+            NSMutableDictionary *prof = [self ensureProfileForBundle:bID uuid:cID craneID:cID defaultName:cName path:@"" forceRotate:NO];
+            [targetList addObject:prof];
+            [seenUUIDs addObject:cID];
+        }
+    }
+
+    NSDictionary *savedByUUID = self.state[@"containersByUUID"];
+    if ([savedByUUID isKindOfClass:[NSDictionary class]]) {
+        for (NSString *uKey in savedByUUID) {
+            if ([seenUUIDs containsObject:uKey]) continue;
+            NSDictionary *p = savedByUUID[uKey];
+            if (![p isKindOfClass:[NSDictionary class]] || [p[@"schemaVersion"] intValue] != CURRENT_SCHEMA_VERSION) continue;
+            NSString *bID = p[@"bundleID"];
+            if ([bID isEqualToString:@"com.burbn.instagram"]) {
+                [self.igContainersList addObject:[p mutableCopy]];
+                [seenUUIDs addObject:uKey];
+            } else if ([bID isEqualToString:@"com.reddit.Reddit"]) {
+                [self.redditContainersList addObject:[p mutableCopy]];
+                [seenUUIDs addObject:uKey];
+            }
+        }
+    }
+
+    // Actualizar contenedor activo si Crane lo reporta en sus preferencias
+    NSMutableDictionary *activeMap = [self.state[@"activeInCrane"] isKindOfClass:[NSDictionary class]]
+        ? [self.state[@"activeInCrane"] mutableCopy]
+        : [NSMutableDictionary dictionary];
+    if (igActiveCraneID) activeMap[@"com.burbn.instagram"] = igActiveCraneID;
+    if (rdActiveCraneID) activeMap[@"com.reddit.Reddit"] = rdActiveCraneID;
+    self.state[@"activeInCrane"] = activeMap;
+    [self saveState];
 }
 
 - (void)calculateResidualTraces {
@@ -510,24 +625,24 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     [self.tableView reloadData];
 
     if (showPopup) {
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Rotación Segura Lista"
-                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados.\n• %lu archivos residuales eliminados (tmp, Caches, WebKit).\n• Portapapeles vaciado.\n\nYa puedes rotar tu IP y cambiar de contenedor en Crane.", (unsigned long)removedCount]
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Limpieza Completada"
+                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados.\n• %lu archivos temporales eliminados.\n• Portapapeles limpio.", (unsigned long)removedCount]
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:ac animated:YES completion:nil];
     }
 }
 
-#pragma mark - TableView Nivel 1 (Menú Principal)
+#pragma mark - TableView Nivel 1
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
     return 3;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"1. ESCUDO MAESTRO, CHOICY+ Y RED EN VIVO";
-    if (section == 1) return @"2. SELECTOR DE CONTENEDORES POR APP (CRANE)";
-    return @"3. LIMPIEZA PROFUNDA ANTES DE CAMBIAR DE CUENTA";
+    if (section == 0) return @"1. CONTROL MAESTRO, SEGURIDAD Y RED EN VIVO";
+    if (section == 1) return @"2. APLICACIONES VINCULADAS A CRANE";
+    return @"3. MANTENIMIENTO RÁPIDO (64 GB)";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -542,10 +657,13 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     if (indexPath.section == 0) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.numberOfLines = 0;
+        cell.detailTextLabel.numberOfLines = 0;
+
         if (indexPath.row == 0) {
             cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
             cell.textLabel.text = @"Habilitar IGFarmShield";
-            cell.detailTextLabel.text = masterOn ? @"🟢 Escudo maestro activo (iPhone 8 Coherente)" : @"⚪ Desactivado";
+            cell.detailTextLabel.text = masterOn ? @"🟢 Activo • Complemento de aislamiento para Crane" : @"⚪ Desactivado";
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = masterOn;
             sw.tag = 10;
@@ -554,8 +672,8 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
         } else if (indexPath.row == 1) {
             BOOL excl = [self.state[@"exclusiveMode"] boolValue];
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-            cell.textLabel.text = @"Modo Exclusivo (1 Contenedor Activo)";
-            cell.detailTextLabel.text = excl ? @"🔒 Al encender uno se apagan los demás + Cierra App" : @"🔓 Múltiples contenedores activos simultáneos";
+            cell.textLabel.text = @"Modo Exclusivo (1 Contenedor a la vez)";
+            cell.detailTextLabel.text = excl ? @"🔒 Al encender un contenedor se apagan los demás y cierra la app" : @"🔓 Múltiples contenedores activos simultáneos";
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = excl;
             sw.tag = 11;
@@ -565,18 +683,20 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
             cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-            cell.textLabel.text = @"🛡️ Estado de Choicy y Escudo Choicy+";
+            cell.textLabel.text = @"🛡️ Estado de Seguridad y Choicy";
             cell.detailTextLabel.textColor = self.choicyAllSafe ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
             cell.detailTextLabel.text = self.choicySummary;
         } else {
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.textLabel.text = @"📡 Estado de Red / Proxy Actual (Transparente)";
-            NSString *vpnTxt = self.vpnActive ? [NSString stringWithFormat:@"🟢 VPN (%@)", self.vpnInterfaceName] : @"⚠️ Sin VPN";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ • IP: %@ (%@)",
+            cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
+            cell.textLabel.text = @"🌐 Red Saliente Actual (Toca para refrescar)";
+            NSString *vpnTxt = self.vpnActive ? [NSString stringWithFormat:@"🟢 VPN (%@)", self.vpnInterfaceName] : @"⚠️ Red Directa";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ • IP: %@\nISP: %@ • Zona: %@",
                                          vpnTxt,
-                                         self.state[@"last_ip"] ?: @"Toca para auditar",
-                                         self.state[@"last_isp"] ?: @"..."];
+                                         self.state[@"last_ip"] ?: @"Consultando...",
+                                         self.state[@"last_isp"] ?: @"...",
+                                         self.state[@"defaultTimeZone"] ?: @"..."];
         }
         return cell;
     }
@@ -584,43 +704,47 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     if (indexPath.section == 1) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.textLabel.numberOfLines = 0;
+        cell.detailTextLabel.numberOfLines = 0;
         NSDictionary *activeMap = self.state[@"activeInCrane"];
 
         if (indexPath.row == 0) {
-            NSString *actUUID = activeMap[@"com.burbn.instagram"];
-            NSString *actName = @"Abre IG para detectar";
+            NSString *actID = activeMap[@"com.burbn.instagram"];
+            NSString *actName = @"Ninguno abierto aún";
             for (NSDictionary *p in self.igContainersList) {
-                if ([p[@"containerUUID"] isEqualToString:actUUID]) {
-                    actName = p[@"customAlias"] ?: p[@"containerName"];
+                if ([p[@"containerUUID"] isEqualToString:actID] || [p[@"craneIdentifier"] isEqualToString:actID]) {
+                    actName = p[@"containerName"];
                     break;
                 }
             }
             cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
             cell.textLabel.text = [NSString stringWithFormat:@"📸 Instagram (%lu Contenedores)", (unsigned long)self.igContainersList.count];
             cell.detailTextLabel.textColor = [UIColor systemGreenColor];
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"🎯 Último abierto en Crane: %@", actName];
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"🎯 Contenedor Activo: %@", actName];
         } else {
-            NSString *actUUID = activeMap[@"com.reddit.Reddit"];
-            NSString *actName = @"Abre Reddit para detectar";
+            NSString *actID = activeMap[@"com.reddit.Reddit"];
+            NSString *actName = @"Ninguno abierto aún";
             for (NSDictionary *p in self.redditContainersList) {
-                if ([p[@"containerUUID"] isEqualToString:actUUID]) {
-                    actName = p[@"customAlias"] ?: p[@"containerName"];
+                if ([p[@"containerUUID"] isEqualToString:actID] || [p[@"craneIdentifier"] isEqualToString:actID]) {
+                    actName = p[@"containerName"];
                     break;
                 }
             }
             cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
             cell.textLabel.text = [NSString stringWithFormat:@"🤖 Reddit (%lu Contenedores)", (unsigned long)self.redditContainersList.count];
             cell.detailTextLabel.textColor = [UIColor systemGreenColor];
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"🎯 Último abierto en Crane: %@", actName];
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"🎯 Contenedor Activo: %@", actName];
         }
         return cell;
     }
 
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    cell.textLabel.numberOfLines = 0;
+    cell.detailTextLabel.numberOfLines = 0;
     cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
     cell.textLabel.textColor = [UIColor systemRedColor];
-    cell.textLabel.text = @"🧹 Cerrar Apps + Limpiar Rastro y Caché (64GB)";
-    cell.detailTextLabel.text = self.residualSummary ?: @"Cierra IG/Reddit y purga tmp, Caches y Portapapeles";
+    cell.textLabel.text = @"🧹 Cerrar Apps y Limpiar Caché Temporal";
+    cell.detailTextLabel.text = self.residualSummary;
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     return cell;
 }
@@ -637,10 +761,10 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 
     if (indexPath.section == 0) {
         if (indexPath.row == 2) {
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Diagnóstico Choicy + Choicy+"
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Resumen de Seguridad"
                                                                         message:self.choicyDetailReport
                                                                  preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDefault handler:nil]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:ac animated:YES completion:nil];
         } else if (indexPath.row == 3) {
             [self detectCurrentNetworkSilently:NO];
@@ -653,12 +777,12 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
         appVC.parentRoot = self;
         if (indexPath.row == 0) {
             appVC.bundleID = @"com.burbn.instagram";
-            appVC.appTitle = @"📸 Instagram (Crane)";
+            appVC.appTitle = @"📸 Instagram";
             appVC.appStateKey = @"enableIG";
             appVC.containers = self.igContainersList;
         } else {
             appVC.bundleID = @"com.reddit.Reddit";
-            appVC.appTitle = @"🤖 Reddit (Crane)";
+            appVC.appTitle = @"🤖 Reddit";
             appVC.appStateKey = @"enableReddit";
             appVC.containers = self.redditContainersList;
         }
@@ -671,9 +795,8 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     }
 }
 
-// Detección 100% transparente de la IP y red actual (sin ocultar ni bloquear nada)
 - (void)detectCurrentNetworkSilently:(BOOL)silent {
-    NSURL *url = [NSURL URLWithString:@"http://ip-api.com/json/?fields=status,countryCode,city,timezone,isp,query"];
+    NSURL *url = [NSURL URLWithString:@"http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,timezone,isp,mobile,query"];
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     cfg.timeoutIntervalForRequest = 6.0;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
@@ -681,30 +804,37 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     [[session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         if (!data || err) return;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (![json isKindOfClass:[NSDictionary class]]) return;
+        if (![json isKindOfClass:[NSDictionary class]] || ![json[@"status"] isEqualToString:@"success"]) return;
 
         NSString *ip = json[@"query"] ?: @"Desconocida";
         NSString *ispRaw = json[@"isp"] ?: @"ISP";
         NSString *ispUp = [ispRaw uppercaseString];
         NSString *cc = [json[@"countryCode"] lowercaseString] ?: @"us";
+        NSString *city = json[@"city"] ?: @"";
+        NSString *region = json[@"regionName"] ?: @"";
         NSString *tz = json[@"timezone"] ?: @"America/New_York";
+        BOOL isMobileISP = [json[@"mobile"] boolValue];
 
         self.state[@"last_ip"] = ip;
         self.state[@"last_isp"] = [NSString stringWithFormat:@"%@ (%@)", ispRaw, [cc uppercaseString]];
+        self.state[@"last_city_country"] = [NSString stringWithFormat:@"%@, %@ (%@)", city, region, [cc uppercaseString]];
         self.state[@"defaultTimeZone"] = tz;
         self.state[@"defaultLocale"] = [NSString stringWithFormat:@"en_%@", [cc uppercaseString]];
 
         if ([ispUp containsString:@"T-MOBILE"] || [ispUp containsString:@"METRO"] || [ispUp containsString:@"MINT"]) {
             self.state[@"defaultCarrierMode"] = @"CELLULAR"; self.state[@"defaultCarrierName"] = @"T-Mobile";
-            self.state[@"defaultCarrierMCC"] = @"310"; self.state[@"defaultCarrierMNC"] = @"260"; self.state[@"defaultCarrierISO"] = @"us";
+            self.state[@"defaultCarrierMCC"] = @"310"; self.state[@"defaultCarrierMNC"] = @"260"; self.state[@"defaultCarrierISO"] = cc;
         } else if ([ispUp containsString:@"AT&T"] || [ispUp containsString:@"CRICKET"]) {
             self.state[@"defaultCarrierMode"] = @"CELLULAR"; self.state[@"defaultCarrierName"] = @"AT&T";
-            self.state[@"defaultCarrierMCC"] = @"310"; self.state[@"defaultCarrierMNC"] = @"410"; self.state[@"defaultCarrierISO"] = @"us";
+            self.state[@"defaultCarrierMCC"] = @"310"; self.state[@"defaultCarrierMNC"] = @"410"; self.state[@"defaultCarrierISO"] = cc;
         } else if ([ispUp containsString:@"VERIZON"] || [ispUp containsString:@"VISIBLE"]) {
             self.state[@"defaultCarrierMode"] = @"CELLULAR"; self.state[@"defaultCarrierName"] = @"Verizon";
-            self.state[@"defaultCarrierMCC"] = @"311"; self.state[@"defaultCarrierMNC"] = @"480"; self.state[@"defaultCarrierISO"] = @"us";
+            self.state[@"defaultCarrierMCC"] = @"311"; self.state[@"defaultCarrierMNC"] = @"480"; self.state[@"defaultCarrierISO"] = cc;
+        } else if (isMobileISP) {
+            self.state[@"defaultCarrierMode"] = @"CELLULAR"; self.state[@"defaultCarrierName"] = ispRaw;
+            self.state[@"defaultCarrierMCC"] = @"310"; self.state[@"defaultCarrierMNC"] = @"260"; self.state[@"defaultCarrierISO"] = cc;
         } else {
-            self.state[@"defaultCarrierMode"] = @"WIFI_ONLY"; self.state[@"defaultCarrierName"] = @"Wi-Fi";
+            self.state[@"defaultCarrierMode"] = @"WIFI_ONLY"; self.state[@"defaultCarrierName"] = ispRaw;
             self.state[@"defaultCarrierMCC"] = @""; self.state[@"defaultCarrierMNC"] = @""; self.state[@"defaultCarrierISO"] = cc;
         }
         [self saveState];
@@ -713,9 +843,9 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
             [self calculateResidualTraces];
             [self.tableView reloadData];
             if (!silent) {
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Estado de Red Transparente"
-                                                                            message:[NSString stringWithFormat:@"VPN: %@\nIP Saliente: %@\nISP: %@ (%@)\nZona Horaria Real de la IP: %@",
-                                                                                     self.vpnActive ? @"🟢 Activa" : @"⚠️ Inactiva (Red Directa)", ip, ispRaw, [cc uppercaseString], tz]
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Red Saliente Detectada"
+                                                                            message:[NSString stringWithFormat:@"• IP Pública: %@\n• ISP: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
+                                                                                     ip, ispRaw, city, region, [cc uppercaseString], tz]
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
@@ -727,7 +857,7 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 @end
 
 // ============================================================================
-// NIVEL 2: LISTA DE CONTENEDORES DE UNA APP (SINCRONIZACIÓN REAL DE SWITCHES)
+// NIVEL 2: SELECTOR DE CONTENEDORES POR APLICACIÓN (ESTILO GHOST / CRANE)
 // ============================================================================
 @implementation IGFarmAppContainersController
 
@@ -737,6 +867,8 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 64.0;
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.tableView];
 }
@@ -755,8 +887,8 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"INTERRUPTOR GENERAL DE LA APLICACIÓN";
-    return [NSString stringWithFormat:@"CONTENEDORES INDEPENDIENTES (%lu) — TOCA PARA VER SU HUELLA", (unsigned long)self.containers.count];
+    if (section == 0) return @"ESTADO EN ESTA APLICACIÓN";
+    return [NSString stringWithFormat:@"CONTENEDORES DE CRANE (%lu) — TOCA UNO PARA VER SU FINGERPRINT", (unsigned long)self.containers.count];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -772,8 +904,8 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
         cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
-        cell.textLabel.text = [NSString stringWithFormat:@"Proteger %@", self.appTitle];
-        cell.detailTextLabel.text = (masterOn && appOn) ? @"🟢 Activo para esta aplicación" : @"⚪ Desactivado";
+        cell.textLabel.text = [NSString stringWithFormat:@"Habilitar Escudo en %@", self.appTitle];
+        cell.detailTextLabel.text = (masterOn && appOn) ? @"🟢 Activo para los contenedores seleccionados" : @"⚪ Desactivado";
         UISwitch *sw = [[UISwitch alloc] init];
         sw.on = appOn;
         sw.enabled = masterOn;
@@ -784,35 +916,40 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 
     if (self.containers.count == 0) {
         UITableViewCell *empty = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        empty.textLabel.text = @"No se detectaron contenedores";
-        empty.detailTextLabel.text = @"Abre la app una vez para que se registre";
+        empty.textLabel.text = @"No se encontraron contenedores";
+        empty.detailTextLabel.text = @"Abre la app en tu contenedor de Crane para sincronizarlo";
         return empty;
     }
 
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    cell.textLabel.numberOfLines = 0;
+    cell.detailTextLabel.numberOfLines = 0;
+
     NSMutableDictionary *prof = self.containers[indexPath.row];
-    NSString *uuid = prof[@"containerUUID"] ?: @"Default_UUID";
-    NSString *displayName = prof[@"customAlias"] ?: (prof[@"containerName"] ?: uuid);
+    NSString *uuid = prof[@"containerUUID"] ?: @"Default";
+    NSString *craneID = prof[@"craneIdentifier"] ?: uuid;
+    NSString *cName = prof[@"containerName"] ?: @"Default";
     BOOL contOn = prof[@"enabled"] ? [prof[@"enabled"] boolValue] : YES;
 
     NSDictionary *activeMap = self.parentRoot.state[@"activeInCrane"];
-    BOOL isCurrentInCrane = [activeMap[self.bundleID] isEqualToString:uuid];
+    NSString *activeID = activeMap[self.bundleID];
+    BOOL isCurrentInCrane = ([activeID isEqualToString:uuid] || [activeID isEqualToString:craneID]);
 
-    cell.textLabel.font = [UIFont boldSystemFontOfSize:15.5];
+    cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
     cell.textLabel.text = isCurrentInCrane
-        ? [NSString stringWithFormat:@"🎯 %@ (Activo en Crane)", displayName]
-        : [NSString stringWithFormat:@"📦 %@", displayName];
+        ? [NSString stringWithFormat:@"🎯 %@ (Activo en Crane)", cName]
+        : [NSString stringWithFormat:@"📦 %@", cName];
 
-    NSString *shortIDFV = [prof[@"idfv"] length] > 8 ? [prof[@"idfv"] substringToIndex:8] : (prof[@"idfv"] ?: @"");
-    NSString *netTxt = [prof[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"] ? @"Wi-Fi" : (prof[@"CarrierName"] ?: @"T-Mobile");
+    NSString *shortCraneID = (craneID.length > 13) ? [craneID substringToIndex:13] : craneID;
+    NSString *tz = prof[@"timeZone"] ?: @"Sin sincronizar";
+    NSString *ip = prof[@"lastSyncedIP"] ?: @"Sin IP";
 
     if (masterOn && appOn && contOn) {
         cell.detailTextLabel.textColor = [UIColor systemGreenColor];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"🟢 ON • %@ • LAN:%@ • IDFV:%@...",
-                                     netTxt, prof[@"localIP"] ?: @"", shortIDFV];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"🟢 Protegido • Crane ID: %@...\nIP: %@ • %@", shortCraneID, ip, tz];
     } else {
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ En pausa • LAN:%@ • IDFV:%@...", prof[@"localIP"] ?: @"", shortIDFV];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ En pausa • Crane ID: %@...", shortCraneID];
     }
 
     UISwitch *sw = [[UISwitch alloc] init];
@@ -854,7 +991,7 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 @end
 
 // ============================================================================
-// NIVEL 3: DETALLE DEL CONTENEDOR (HUELLA ÚNICA VERIFICADA + RED TRANSPARENTE)
+// NIVEL 3: VISTA ESTRUCTURADA DE SPOOFING Y FINGERPRINT DEL CONTENEDOR
 // ============================================================================
 @implementation IGFarmContainerDetailController
 
@@ -863,6 +1000,8 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
     self.tableView.dataSource = self;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 62.0;
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [self.view addSubview:self.tableView];
 }
@@ -871,7 +1010,7 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     [super viewWillAppear:animated];
     NSMutableDictionary *fresh = [self.parentRoot profileForUUID:self.containerUUID];
     if (fresh) self.profile = fresh;
-    self.title = self.profile[@"customAlias"] ?: (self.profile[@"containerName"] ?: @"Contenedor");
+    self.title = self.profile[@"containerName"] ?: @"Contenedor";
     [self.tableView reloadData];
 }
 
@@ -882,27 +1021,25 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return 5;
+    return 4;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     switch (section) {
-        case 0: return @"1. CONTROL DEL CONTENEDOR Y NOMBRE DE CUENTA";
-        case 1: return @"2. OPERADORA, ZONA HORARIA Y SINCRONIZACIÓN TRANSPARENTE";
-        case 2: return @"3. MÓDULOS DE AISLAMIENTO ACTIVOS";
-        case 3: return @"4. HUELLA ÚNICA INYECTADA + RECIBO DE LA APP EN VIVO";
-        case 4: return @"5. ACCIONES DE ESTE CONTENEDOR";
+        case 0: return @"1. ESTADO Y SINCRONIZACIÓN CON LA IP EN VIVO";
+        case 1: return @"2. MÓDULOS DE SPOOFING (ACTIVA O DESACTIVA)";
+        case 2: return @"3. FINGERPRINT ASIGNADO A ESTE CONTENEDOR";
+        case 3: return @"4. ROTACIÓN DE FINGERPRINT";
         default: return nil;
     }
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
-        case 0: return 2;
-        case 1: return 3;
-        case 2: return 5;
-        case 3: return 9;
-        case 4: return 2;
+        case 0: return 3;
+        case 1: return 5;
+        case 2: return 8;
+        case 3: return 1;
         default: return 0;
     }
 }
@@ -910,154 +1047,148 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     BOOL contOn = self.profile[@"enabled"] ? [self.profile[@"enabled"] boolValue] : YES;
 
+    // SECCIÓN 1: CONTROL Y SINCRONIZACIÓN DE IP EN VIVO
     if (indexPath.section == 0) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        cell.textLabel.numberOfLines = 0;
+        cell.detailTextLabel.numberOfLines = 0;
+
         if (indexPath.row == 0) {
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             cell.textLabel.font = [UIFont boldSystemFontOfSize:16];
-            cell.textLabel.text = @"Habilitar Contenedor para Operar";
-            cell.detailTextLabel.text = contOn ? @"🟢 Activo (Inyectando identidad en la App)" : @"⚪ En pausa";
+            cell.textLabel.text = @"Protección Activa en este Contenedor";
+            cell.detailTextLabel.text = contOn ? @"🟢 Inyectando Fingerprint aislado en la aplicación" : @"⚪ En pausa";
             cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = contOn;
             sw.tag = 100;
             [sw addTarget:self action:@selector(toggleSwitch:) forControlEvents:UIControlEventValueChanged];
             cell.accessoryView = sw;
+        } else if (indexPath.row == 1) {
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
+            cell.textLabel.textColor = [UIColor systemBlueColor];
+            cell.textLabel.text = @"⚡ Sincronizar con la IP Actual en Vivo";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"Toma ISP, Zona Horaria y Región de tu IP actual (%@)",
+                                         self.profile[@"lastSyncedIP"] ?: @"Sin sincronizar"];
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
             cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
             cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.textLabel.text = @"✏️ Cambiar Etiqueta / @Usuario de este Contenedor";
-            NSString *shortUUID = (self.containerUUID.length > 8) ? [self.containerUUID substringToIndex:8] : self.containerUUID;
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"Nombre: %@ • Carpeta UUID: %@...",
-                                         self.profile[@"customAlias"] ?: self.profile[@"containerName"], shortUUID];
+            cell.textLabel.text = @"🔍 Auditar IP en Proxy Center (Telegram)";
+            cell.detailTextLabel.text = @"Verifica en tu servidor si la IP actual está limpia o en cooldown";
         }
         return cell;
     }
 
+    // SECCIÓN 2: MÓDULOS DE SPOOFING (TEXTO COMPLETO Y CLARO)
     if (indexPath.section == 1) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        cell.detailTextLabel.textColor = [UIColor systemBlueColor];
-
-        if (indexPath.row == 0) {
-            cell.textLabel.text = @"📡 Operadora / Modo de Red";
-            if ([self.profile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"]) {
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"🛜 Wi-Fi Residencial Puro (Sin SIM • %@)", [self.profile[@"CarrierISO"] ?: @"us" uppercaseString]];
-            } else {
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"📱 4G LTE %@ (MCC %@ / MNC %@)",
-                                             self.profile[@"CarrierName"] ?: @"T-Mobile",
-                                             self.profile[@"CarrierMCC"] ?: @"310",
-                                             self.profile[@"CarrierMNC"] ?: @"260"];
-            }
-        } else if (indexPath.row == 1) {
-            cell.textLabel.text = @"🌎 Zona Horaria e Idioma (C + ObjC)";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ • Locale: %@",
-                                         self.profile[@"timeZone"] ?: @"America/New_York",
-                                         self.profile[@"localeID"] ?: @"en_US"];
-        } else {
-            cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-            cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.textLabel.text = @"⚡ Sincronizar con la IP Actual en Vivo";
-            cell.detailTextLabel.text = self.profile[@"lastSyncedIP"]
-                ? [NSString stringWithFormat:@"Última IP sincronizada: %@", self.profile[@"lastSyncedIP"]]
-                : @"Refleja de forma transparente el ISP, país y hora de la IP actual";
-        }
-        return cell;
-    }
-
-    if (indexPath.section == 2) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.numberOfLines = 0;
+        cell.detailTextLabel.numberOfLines = 0;
+
         NSArray *titles = @[
-            @"Camuflar IDs (Shield IDFV / BootUUID / iCloud)",
-            @"Camuflar Subred Local y Ocultar VPN (utun)",
-            @"Camuflar Zona Horaria e Idioma (TZ + NSLocale)",
-            @"Camuflar Disco (statfs), Batería y Audio (iPhone 8)",
-            @"Escudo Choicy+ (dladdr / stat / Ocultar JB y Crane)"
+            @"1. Identificadores (IDFV / BootUUID / iCloud)",
+            @"2. Red Local (IP LAN / Router Wi-Fi / Ocultar VPN)",
+            @"3. Ubicación de Red (Zona Horaria / Idioma / ISP)",
+            @"4. Hardware iPhone 8 (Disco / Batería / Audio / Uptime)",
+            @"5. Escudo Anti-Detección (Ocultar Jailbreak y Crane)"
+        ];
+        NSArray *subtitles = @[
+            @"Aísla el Vendor ID, el UUID de arranque del kernel y el token de iCloud",
+            @"Asigna una subred doméstica propia y oculta la interfaz utun del VPN",
+            @"Adapta automáticamente el huso horario y la región a los datos de la IP",
+            @"Varía los gigabytes libres, nivel de batería, volumen y tiempo de encendido",
+            @"Bloquea el escaneo de /var/jb, palera1n y librerías en memoria"
         ];
         NSArray *keys = @[@"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity"];
-        cell.textLabel.font = [UIFont systemFontOfSize:14.5];
+
+        cell.textLabel.font = [UIFont boldSystemFontOfSize:14.5];
         cell.textLabel.text = titles[indexPath.row];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:12.0];
+        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+        cell.detailTextLabel.text = subtitles[indexPath.row];
+
         UISwitch *sw = [[UISwitch alloc] init];
         NSString *k = keys[indexPath.row];
         sw.on = (self.profile[k] == nil) ? YES : [self.profile[k] boolValue];
+        sw.enabled = contOn;
         sw.tag = 200 + indexPath.row;
         [sw addTarget:self action:@selector(toggleSwitch:) forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = sw;
         return cell;
     }
 
-    if (indexPath.section == 3) {
+    // SECCIÓN 3: FINGERPRINT ESTRUCTURADO Y LEGIBLE
+    if (indexPath.section == 2) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.textLabel.font = [UIFont boldSystemFontOfSize:13];
-        cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:11.5 weight:UIFontWeightRegular];
-        cell.detailTextLabel.numberOfLines = 2;
+        cell.textLabel.numberOfLines = 0;
+        cell.detailTextLabel.numberOfLines = 0;
+        cell.textLabel.font = [UIFont boldSystemFontOfSize:13.5];
+        cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:12.0 weight:UIFontWeightRegular];
         cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
 
         double freeGB = [self.profile[@"freeBytes"] unsignedLongLongValue] / (1024.0*1024.0*1024.0);
         int batPct = (int)([self.profile[@"batteryLevel"] floatValue] * 100.0f);
         int volPct = (int)([self.profile[@"audioVolume"] floatValue] * 100.0f);
         NSUInteger upMin = [self.profile[@"uptimeOffset"] unsignedIntegerValue] / 60;
+        NSString *craneID = self.profile[@"craneIdentifier"] ?: self.containerUUID;
 
-        if (indexPath.row == 0) {
-            cell.textLabel.text = @"✅ Prueba Real en Vivo (Leído por la App)";
-            if (self.profile[@"verifiedLiveIDFV"]) {
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"Hora: %@ • App recibió IDFV: %@...\nApp recibió TZ: %@ • Bat: %@%%",
-                                             self.profile[@"lastInjectedTime"] ?: @"Hoy",
-                                             [self.profile[@"verifiedLiveIDFV"] substringToIndex:MIN(12, [self.profile[@"verifiedLiveIDFV"] length])],
-                                             self.profile[@"verifiedLiveTZ"] ?: @"",
-                                             self.profile[@"verifiedLiveBat"] ?: @50];
-            } else {
-                cell.detailTextLabel.text = @"Abre la app en este contenedor para registrar el recibo de inyección en vivo";
-            }
-        } else if (indexPath.row == 1) {
-            cell.textLabel.text = @"📦 UUID Carpeta Contenedor + IDFV Base de Crane";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"Carpeta: %@\nCrane IDFV: %@",
-                                         self.containerUUID, self.profile[@"craneOriginalIDFV"] ?: @"Se captura al abrir la app"];
-        } else if (indexPath.row == 2) {
-            cell.textLabel.text = @"🔑 Nuevo Vendor ID (Shield IDFV Único)";
-            cell.detailTextLabel.text = self.profile[@"idfv"] ?: @"N/A";
-        } else if (indexPath.row == 3) {
-            cell.textLabel.text = @"🛡️ Nuevo Shield Device ID + iCloud Token";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"DevID: %@\niCloud: %@",
-                                         self.profile[@"shieldDeviceID"] ?: @"N/A", self.profile[@"cloudUUID"] ?: @"N/A"];
-        } else if (indexPath.row == 4) {
-            cell.textLabel.text = @"🔄 Kernel BootSession UUID + Build OS";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@\nBuild iOS (kern.osversion): %@",
-                                         self.profile[@"bootSessionUUID"] ?: @"N/A",
-                                         self.profile[@"osBuild"] ?: @"20G81"];
-        } else if (indexPath.row == 5) {
-            cell.textLabel.text = @"📱 Modelo Físico Coherente + Disco (statfs + NSFileManager)";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"iPhone 8 (iPhone10,4) • %.2f GB libres de 64 GB", freeGB];
-        } else if (indexPath.row == 6) {
-            cell.textLabel.text = @"🔋 Batería Simulada + Volumen Audio + Uptime";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"Bat: %d%% (Unplugged) • Vol: %d%% • Boot: +%lu min",
-                                         batPct, volPct, (unsigned long)upMin];
-        } else if (indexPath.row == 7) {
-            cell.textLabel.text = @"📡 Subred LAN (en0) y Router Wi-Fi (BSSID)";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"IP LAN: %@ • %@ (%@)",
-                                         self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]];
-        } else {
-            cell.textLabel.text = @"🌎 Operadora y Zona Horaria Activa";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ (%@) • %@ (%@)",
-                                         self.profile[@"CarrierName"], self.profile[@"CarrierMode"],
-                                         self.profile[@"timeZone"], self.profile[@"localeID"]];
+        switch (indexPath.row) {
+            case 0:
+                cell.textLabel.text = @"📦 Contenedor y Container ID (Base de Crane)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"Nombre en Crane: %@\nContainer ID: %@",
+                                             self.profile[@"containerName"] ?: @"Default", craneID];
+                break;
+            case 1:
+                cell.textLabel.text = @"🔑 Vendor ID Inyectado (Shield IDFV)";
+                cell.detailTextLabel.text = self.profile[@"idfv"] ?: @"N/A";
+                break;
+            case 2:
+                cell.textLabel.text = @"🔄 Kernel BootSession UUID y Token iCloud";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"BootUUID: %@\niCloud:   %@",
+                                             self.profile[@"bootSessionUUID"] ?: @"N/A", self.profile[@"cloudUUID"] ?: @"N/A"];
+                break;
+            case 3:
+                cell.textLabel.text = @"📱 Dispositivo y Compilación del Sistema";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"Modelo: iPhone 8 (iPhone10,4)\nNombre: %@ • Build iOS: %@",
+                                             self.profile[@"deviceName"] ?: @"iPhone", self.profile[@"osBuild"] ?: @"20G81"];
+                break;
+            case 4:
+                cell.textLabel.text = @"🌐 Red Pública e ISP Sincronizado";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"IP Actual: %@\nISP: %@ (%@)",
+                                             self.profile[@"lastSyncedIP"] ?: @"Sin sincronizar",
+                                             self.profile[@"ispName"] ?: @"ISP",
+                                             [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"] ? @"Datos Móviles 4G LTE" : @"Red Residencial / Wi-Fi"];
+                break;
+            case 5:
+                cell.textLabel.text = @"🌎 Ubicación Estática del Contenedor (Hora e Idioma)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"Ubicación: %@\nZona Horaria: %@ • Locale: %@",
+                                             self.profile[@"cityCountry"] ?: @"Sincroniza con tu IP",
+                                             self.profile[@"timeZone"] ?: @"America/New_York",
+                                             self.profile[@"localeID"] ?: @"en_US"];
+                break;
+            case 6:
+                cell.textLabel.text = @"📡 Red Doméstica Simulada (LAN y Router Wi-Fi)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"IP Local (en0): %@\nSSID: %@ • BSSID: %@",
+                                             self.profile[@"localIP"] ?: @"", self.profile[@"ssid"] ?: @"", self.profile[@"bssid"] ?: @""];
+                break;
+            case 7:
+                cell.textLabel.text = @"🔋 Métricas Físicas (Disco, Batería, Audio y Arranque)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"Espacio Libre: %.2f GB de 64 GB\nBatería: %d%% • Volumen: %d%% • Uptime: +%lu min",
+                                             freeGB, batPct, volPct, (unsigned long)upMin];
+                break;
         }
         return cell;
     }
 
+    // SECCIÓN 4: REGENERAR FINGERPRINT
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-    if (indexPath.row == 0) {
-        cell.textLabel.textColor = [UIColor systemBlueColor];
-        cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-        cell.textLabel.text = @"🔍 Auditar Contenedor + IP en Proxy Center (Telegram)";
-    } else {
-        cell.textLabel.textColor = [UIColor systemRedColor];
-        cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-        cell.textLabel.text = @"🔄 Regenerar Todos los IDs de este Contenedor";
-    }
+    cell.textLabel.textColor = [UIColor systemRedColor];
+    cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
+    cell.textLabel.text = @"🔄 Generar Nuevo Fingerprint para este Contenedor";
     return cell;
 }
 
@@ -1076,108 +1207,30 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
-    if (indexPath.section == 0 && indexPath.row == 1) {
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Renombrar Contenedor"
-                                                                    message:@"Ponle el nombre o @usuario de la cuenta que manejas en este contenedor de Crane:"
+    if (indexPath.section == 0) {
+        if (indexPath.row == 1) [self syncWithLiveIPAndAuditVPS:NO];
+        else if (indexPath.row == 2) [self syncWithLiveIPAndAuditVPS:YES];
+        return;
+    }
+
+    if (indexPath.section == 3 && indexPath.row == 0) {
+        self.profile = [self.parentRoot ensureProfileForBundle:self.bundleID
+                                                          uuid:self.containerUUID
+                                                       craneID:self.profile[@"craneIdentifier"]
+                                                   defaultName:self.profile[@"containerName"]
+                                                          path:self.profile[@"path"]
+                                                   forceRotate:YES];
+        [self.tableView reloadData];
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Fingerprint Renovado"
+                                                                    message:@"Se generaron nuevos identificadores y métricas físicas para este contenedor manteniendo su vínculo con Crane."
                                                              preferredStyle:UIAlertControllerStyleAlert];
-        [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-            tf.text = self.profile[@"customAlias"] ?: self.profile[@"containerName"];
-            tf.placeholder = @"Ej: @cheekychiix, Reddit_02...";
-        }];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Guardar" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            NSString *newName = ac.textFields.firstObject.text;
-            if (newName && newName.length > 0) {
-                self.profile[@"customAlias"] = newName;
-                self.title = newName;
-                [self saveCurrentProfile];
-                [self.tableView reloadData];
-            }
-        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:ac animated:YES completion:nil];
-        return;
-    }
-
-    if (indexPath.section == 1) {
-        if (indexPath.row == 0) [self showCarrierSelector];
-        else if (indexPath.row == 1) [self showTimeZoneSelector];
-        else [self autoSyncNetworkAndAuditOnVPS:NO];
-        return;
-    }
-
-    if (indexPath.section == 4) {
-        if (indexPath.row == 0) {
-            [self autoSyncNetworkAndAuditOnVPS:YES];
-        } else {
-            self.profile = [self.parentRoot ensureProfileForBundle:self.bundleID
-                                                              uuid:self.containerUUID
-                                                       defaultName:self.profile[@"containerName"]
-                                                              path:self.profile[@"path"]
-                                                       forceRotate:YES];
-            [self.tableView reloadData];
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Huella Regenerada"
-                                                                        message:@"Se generaron nuevos Shield IDFV, Device ID, BootSession UUID, Build iOS, Subred LAN, Router BSSID y métricas de iPhone 8 exclusivos para este contenedor."
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:ac animated:YES completion:nil];
-        }
     }
 }
 
-- (void)showCarrierSelector {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Operadora / Red del Contenedor"
-                                                                message:@"Elige cómo se identificará la red en este contenedor:"
-                                                         preferredStyle:UIAlertControllerStyleActionSheet];
-    NSArray *presets = @[
-        @{@"title": @"📱 T-Mobile US 4G LTE (310 / 260)", @"mode": @"CELLULAR", @"name": @"T-Mobile", @"mcc": @"310", @"mnc": @"260", @"iso": @"us"},
-        @{@"title": @"📱 AT&T US 4G LTE (310 / 410)", @"mode": @"CELLULAR", @"name": @"AT&T", @"mcc": @"310", @"mnc": @"410", @"iso": @"us"},
-        @{@"title": @"📱 Verizon US 4G LTE (311 / 480)", @"mode": @"CELLULAR", @"name": @"Verizon", @"mcc": @"311", @"mnc": @"480", @"iso": @"us"},
-        @{@"title": @"🛜 Wi-Fi Residencial Puro (Sin SIM • US)", @"mode": @"WIFI_ONLY", @"name": @"Wi-Fi", @"mcc": @"", @"mnc": @"", @"iso": @"us"},
-        @{@"title": @"🇬🇧 Vodafone UK 4G LTE (234 / 15)", @"mode": @"CELLULAR", @"name": @"Vodafone UK", @"mcc": @"234", @"mnc": @"15", @"iso": @"gb"},
-        @{@"title": @"🇪🇸 Movistar ES 4G LTE (214 / 07)", @"mode": @"CELLULAR", @"name": @"Movistar", @"mcc": @"214", @"mnc": @"07", @"iso": @"es"}
-    ];
-    for (NSDictionary *p in presets) {
-        [ac addAction:[UIAlertAction actionWithTitle:p[@"title"] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            self.profile[@"CarrierMode"] = p[@"mode"];
-            self.profile[@"CarrierName"] = p[@"name"];
-            self.profile[@"CarrierMCC"] = p[@"mcc"];
-            self.profile[@"CarrierMNC"] = p[@"mnc"];
-            self.profile[@"CarrierISO"] = p[@"iso"];
-            [self saveCurrentProfile];
-            [self.tableView reloadData];
-        }]];
-    }
-    [ac addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)showTimeZoneSelector {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Zona Horaria y Región"
-                                                                message:@"Selecciona la ubicación horaria de este contenedor:"
-                                                         preferredStyle:UIAlertControllerStyleActionSheet];
-    NSArray *zones = @[
-        @{@"title": @"🇺🇸 USA Este - Miami / NY (America/New_York)", @"tz": @"America/New_York", @"loc": @"en_US"},
-        @{@"title": @"🇺🇸 USA Centro - Texas / Chicago (America/Chicago)", @"tz": @"America/Chicago", @"loc": @"en_US"},
-        @{@"title": @"🇺🇸 USA Montaña - Denver (America/Denver)", @"tz": @"America/Denver", @"loc": @"en_US"},
-        @{@"title": @"🇺🇸 USA Oeste - Los Ángeles (America/Los_Angeles)", @"tz": @"America/Los_Angeles", @"loc": @"en_US"},
-        @{@"title": @"🇬🇧 Reino Unido - Londres (Europe/London)", @"tz": @"Europe/London", @"loc": @"en_GB"},
-        @{@"title": @"🇪🇸 España - Madrid (Europe/Madrid)", @"tz": @"Europe/Madrid", @"loc": @"es_ES"}
-    ];
-    for (NSDictionary *z in zones) {
-        [ac addAction:[UIAlertAction actionWithTitle:z[@"title"] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            self.profile[@"timeZone"] = z[@"tz"];
-            self.profile[@"localeID"] = z[@"loc"];
-            [self saveCurrentProfile];
-            [self.tableView reloadData];
-        }]];
-    }
-    [ac addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-
-// Sincronización 100% transparente con la IP actual (muestra y aplica la IP/Zona Horaria real de la conexión)
-- (void)autoSyncNetworkAndAuditOnVPS:(BOOL)sendToVPS {
-    NSURL *ipUrl = [NSURL URLWithString:@"http://ip-api.com/json/?fields=status,countryCode,city,timezone,isp,query"];
+- (void)syncWithLiveIPAndAuditVPS:(BOOL)sendToVPS {
+    NSURL *ipUrl = [NSURL URLWithString:@"http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,timezone,isp,mobile,query"];
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     cfg.timeoutIntervalForRequest = 6.0;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
@@ -1185,7 +1238,7 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
     [[session dataTaskWithURL:ipUrl completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         if (!data || err) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Error de Red" message:@"No se pudo detectar la IP saliente." preferredStyle:UIAlertControllerStyleAlert];
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Error de Conexión" message:@"No se pudo leer la IP actual." preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
             });
@@ -1193,34 +1246,38 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
         }
 
         NSDictionary *ipJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (![ipJson isKindOfClass:[NSDictionary class]]) return;
+        if (![ipJson isKindOfClass:[NSDictionary class]] || ![ipJson[@"status"] isEqualToString:@"success"]) return;
+
         NSString *ip = ipJson[@"query"] ?: @"";
         NSString *ispRaw = ipJson[@"isp"] ?: @"ISP";
         NSString *ispUp = [ispRaw uppercaseString];
         NSString *cc = [ipJson[@"countryCode"] lowercaseString] ?: @"us";
+        NSString *city = ipJson[@"city"] ?: @"";
+        NSString *region = ipJson[@"regionName"] ?: @"";
         NSString *tz = ipJson[@"timezone"] ?: @"America/New_York";
+        BOOL isMobileISP = [ipJson[@"mobile"] boolValue];
 
+        self.profile[@"locationAnchored"] = @YES;
         self.profile[@"lastSyncedIP"] = ip;
+        self.profile[@"ispName"] = ispRaw;
+        self.profile[@"cityCountry"] = [NSString stringWithFormat:@"%@, %@ (%@)", city, region, [cc uppercaseString]];
         self.profile[@"timeZone"] = tz;
         self.profile[@"localeID"] = [NSString stringWithFormat:@"en_%@", [cc uppercaseString]];
 
         if ([ispUp containsString:@"T-MOBILE"] || [ispUp containsString:@"METRO"] || [ispUp containsString:@"MINT"]) {
             self.profile[@"CarrierMode"] = @"CELLULAR"; self.profile[@"CarrierName"] = @"T-Mobile";
-            self.profile[@"CarrierMCC"] = @"310"; self.profile[@"CarrierMNC"] = @"260"; self.profile[@"CarrierISO"] = @"us";
+            self.profile[@"CarrierMCC"] = @"310"; self.profile[@"CarrierMNC"] = @"260"; self.profile[@"CarrierISO"] = cc;
         } else if ([ispUp containsString:@"AT&T"] || [ispUp containsString:@"CRICKET"]) {
             self.profile[@"CarrierMode"] = @"CELLULAR"; self.profile[@"CarrierName"] = @"AT&T";
-            self.profile[@"CarrierMCC"] = @"310"; self.profile[@"CarrierMNC"] = @"410"; self.profile[@"CarrierISO"] = @"us";
+            self.profile[@"CarrierMCC"] = @"310"; self.profile[@"CarrierMNC"] = @"410"; self.profile[@"CarrierISO"] = cc;
         } else if ([ispUp containsString:@"VERIZON"] || [ispUp containsString:@"VISIBLE"]) {
             self.profile[@"CarrierMode"] = @"CELLULAR"; self.profile[@"CarrierName"] = @"Verizon";
-            self.profile[@"CarrierMCC"] = @"311"; self.profile[@"CarrierMNC"] = @"480"; self.profile[@"CarrierISO"] = @"us";
-        } else if ([ispUp containsString:@"VODAFONE"] && [cc isEqualToString:@"gb"]) {
-            self.profile[@"CarrierMode"] = @"CELLULAR"; self.profile[@"CarrierName"] = @"Vodafone UK";
-            self.profile[@"CarrierMCC"] = @"234"; self.profile[@"CarrierMNC"] = @"15"; self.profile[@"CarrierISO"] = @"gb";
-        } else if ([ispUp containsString:@"MOVISTAR"] && [cc isEqualToString:@"es"]) {
-            self.profile[@"CarrierMode"] = @"CELLULAR"; self.profile[@"CarrierName"] = @"Movistar";
-            self.profile[@"CarrierMCC"] = @"214"; self.profile[@"CarrierMNC"] = @"07"; self.profile[@"CarrierISO"] = @"es";
+            self.profile[@"CarrierMCC"] = @"311"; self.profile[@"CarrierMNC"] = @"480"; self.profile[@"CarrierISO"] = cc;
+        } else if (isMobileISP) {
+            self.profile[@"CarrierMode"] = @"CELLULAR"; self.profile[@"CarrierName"] = ispRaw;
+            self.profile[@"CarrierMCC"] = @"310"; self.profile[@"CarrierMNC"] = @"260"; self.profile[@"CarrierISO"] = cc;
         } else {
-            self.profile[@"CarrierMode"] = @"WIFI_ONLY"; self.profile[@"CarrierName"] = @"Wi-Fi";
+            self.profile[@"CarrierMode"] = @"WIFI_ONLY"; self.profile[@"CarrierName"] = ispRaw;
             self.profile[@"CarrierMCC"] = @""; self.profile[@"CarrierMNC"] = @""; self.profile[@"CarrierISO"] = cc;
         }
 
@@ -1229,9 +1286,9 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
         if (!sendToVPS) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self.tableView reloadData];
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Red Sincronizada (Transparente)"
-                                                                            message:[NSString stringWithFormat:@"IP Actual: %@ (%@)\n\n• Modo Red: %@ (%@)\n• Zona Horaria: %@\n• Locale: %@",
-                                                                                     ip, ispRaw, self.profile[@"CarrierMode"], self.profile[@"CarrierName"], tz, self.profile[@"localeID"]]
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"IP y Ubicación Sincronizadas"
+                                                                            message:[NSString stringWithFormat:@"• Contenedor: %@\n• IP: %@\n• ISP: %@\n• Ubicación fijada: %@, %@ (%@)\n• Zona Horaria: %@",
+                                                                                     self.profile[@"containerName"], ip, ispRaw, city, region, [cc uppercaseString], tz]
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
@@ -1240,8 +1297,8 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
         }
 
         NSString *plat = [self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"INSTAGRAM" : @"REDDIT";
-        NSString *alias = self.profile[@"customAlias"] ?: self.profile[@"containerName"];
-        NSString *contEnc = [alias stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"Default";
+        NSString *cName = self.profile[@"containerName"] ?: @"Default";
+        NSString *contEnc = [cName stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"Default";
         NSString *ispEnc = [ispRaw stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
         NSString *vpsUrlStr = [NSString stringWithFormat:@"%@?ip=%@&contenedor=%@&plataforma=%@&choicy=1&bssid=%@&isp=%@&cc=%@",
                                VPS_AUDIT_URL, ip, contEnc, plat, self.profile[@"bssid"] ?: @"", ispEnc, cc];
@@ -1250,10 +1307,10 @@ static NSString *recursiveSearchCraneNamePrefs(id node, NSString *targetKey) {
             NSDictionary *vpsJson = vData ? [NSJSONSerialization JSONObjectWithData:vData options:0 error:nil] : nil;
             NSString *msj = ([vpsJson isKindOfClass:[NSDictionary class]] && vpsJson[@"mensaje_iphone"])
                 ? vpsJson[@"mensaje_iphone"]
-                : [NSString stringWithFormat:@"IP: %@ (%@)\nSincronizado localmente.", ip, ispRaw];
+                : [NSString stringWithFormat:@"IP: %@ (%@)\nUbicación sincronizada en el contenedor.", ip, ispRaw];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self.tableView reloadData];
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Auditoría Proxy Center + Telegram" message:msj preferredStyle:UIAlertControllerStyleAlert];
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Auditoría Proxy Center" message:msj preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
             });
