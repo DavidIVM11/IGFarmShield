@@ -608,6 +608,7 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
     NSMutableSet *validLiveUUIDs = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
 
+    // 1. Leer la base de datos viva de Crane (incluyendo Application Support/Crane)
     NSMutableArray *craneSources = [NSMutableArray array];
     for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
         NSDictionary *ud = [[[NSUserDefaults alloc] initWithSuiteName:domain] dictionaryRepresentation];
@@ -616,6 +617,24 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
     for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_PREFS_VAR, CRANE_MAIN_JB, CRANE_MAIN_VAR]) {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:pPath];
         if ([d count] > 0) [craneSources addObject:d];
+    }
+
+    NSArray *prefDirs = @[
+        @"/var/mobile/Library/Preferences",
+        @"/var/jb/var/mobile/Library/Preferences",
+        @"/var/mobile/Library/Application Support/Crane",
+        @"/var/jb/var/mobile/Library/Application Support/Crane"
+    ];
+    for (NSString *pDir in prefDirs) {
+        NSArray *files = [fm subpathsOfDirectoryAtPath:pDir error:nil];
+        for (NSString *f in files) {
+            if ([[f lowercaseString] containsString:@"crane"] && [f hasSuffix:@".plist"]) {
+                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:[pDir stringByAppendingPathComponent:f]];
+                if ([d isKindOfClass:[NSDictionary class]] && [d count] > 0) {
+                    [craneSources addObject:d];
+                }
+            }
+        }
     }
 
     NSMutableDictionary *igCraneMap = [NSMutableDictionary dictionary];
@@ -641,14 +660,13 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
     [igCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
     [rdCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
 
+    // 2. Escanear carpetas en /var/mobile/Containers/Data/Application y subcarpetas ___Crane_Containers
     NSString *appsDir = @"/var/mobile/Containers/Data/Application";
     NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
 
     for (NSString *folderUUID in uuids) {
         NSString *fullPath = [appsDir stringByAppendingPathComponent:folderUUID];
         NSString *metaPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-        if (![fm fileExistsAtPath:metaPath]) continue;
-
         NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
         if (![meta isKindOfClass:[NSDictionary class]]) continue;
 
@@ -658,6 +676,7 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
 
         NSString *bundleID = isIG ? @"com.burbn.instagram" : @"com.reddit.Reddit";
         NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
+        NSMutableArray *targetList = isIG ? self.igContainersList : self.redditContainersList;
 
         NSString *craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
         NSString *detectedName = nil;
@@ -705,11 +724,40 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
 
         NSMutableDictionary *prof = [self ensureProfileForBundle:bundleID uuid:folderUUID craneID:craneID defaultName:detectedName path:fullPath forceRotate:NO];
         [validLiveUUIDs addObject:folderUUID];
+        [validLiveUUIDs addObject:craneID];
+        [targetList addObject:prof];
 
-        if (isIG) [self.igContainersList addObject:prof];
-        else [self.redditContainersList addObject:prof];
+        // Escanear subcarpetas ___Crane_Containers dentro de la app si existen
+        NSString *subCraneDir = [fullPath stringByAppendingPathComponent:@"___Crane_Containers"];
+        if ([fm fileExistsAtPath:subCraneDir]) {
+            NSArray *subUUIDs = [fm contentsOfDirectoryAtPath:subCraneDir error:nil];
+            for (NSString *subID in subUUIDs) {
+                if ([validLiveUUIDs containsObject:subID]) continue;
+                NSString *subPath = [subCraneDir stringByAppendingPathComponent:subID];
+                NSString *subName = craneMap[subID] ?: subID;
+                NSMutableDictionary *subProf = [self ensureProfileForBundle:bundleID uuid:subID craneID:subID defaultName:subName path:subPath forceRotate:NO];
+                [validLiveUUIDs addObject:subID];
+                [targetList addObject:subProf];
+            }
+        }
     }
 
+    // 3. Añadir los contenedores activos registrados en el plist de Crane
+    for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
+        BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
+        NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
+        NSMutableArray *targetList = isIG ? self.igContainersList : self.redditContainersList;
+
+        for (NSString *cID in craneMap) {
+            if ([validLiveUUIDs containsObject:cID]) continue;
+            NSString *cName = craneMap[cID];
+            NSMutableDictionary *prof = [self ensureProfileForBundle:bID uuid:cID craneID:cID defaultName:cName path:@"" forceRotate:NO];
+            [targetList addObject:prof];
+            [validLiveUUIDs addObject:cID];
+        }
+    }
+
+    // 4. Purgar automáticamente cualquier contenedor que ya no exista en Crane
     NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
         ? [self.state[@"containersByUUID"] mutableCopy]
         : [NSMutableDictionary dictionary];
