@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <QuartzCore/QuartzCore.h>
 #import <AVFoundation/AVFoundation.h>
 #import <ifaddrs.h>
 #import <arpa/inet.h>
@@ -96,7 +97,6 @@ static BOOL nodeMentionsString(id node, NSString *needle) {
     return NO;
 }
 
-// Parsea el subárbol exclusivo de una aplicación dentro de las preferencias de Crane
 static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
     if (!node || !outContainers) return;
     if ([node isKindOfClass:[NSDictionary class]]) {
@@ -120,6 +120,14 @@ static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
             outContainers[cID] = cName;
         }
 
+        NSArray *reservedKeys = @[
+            @"activeContainer", @"selectedContainer", @"currentContainer",
+            @"activeContainerIdentifier", @"active", @"defaultContainer",
+            @"bundleIdentifier", @"appIdentifier", @"identifier", @"id",
+            @"UUID", @"uuid", @"containerIdentifier", @"craneIdentifier",
+            @"name", @"displayName", @"label", @"title", @"containerName"
+        ];
+
         for (id k in dict) {
             NSString *kStr = [k description];
             id val = dict[k];
@@ -135,7 +143,7 @@ static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
                 parseCraneAppSubtree(val, outContainers);
             } else if ([val isKindOfClass:[NSString class]]) {
                 NSString *vStr = (NSString *)val;
-                BOOL isMetaKey = [@[@"activeContainer", @"selectedContainer", @"currentContainer", @"activeContainerIdentifier", @"active", @"defaultContainer", @"bundleIdentifier", @"appIdentifier", @"identifier", @"id", @"UUID", @"uuid", @"containerIdentifier", @"craneIdentifier", @"name", @"displayName", @"label", @"title", @"containerName"] containsObject:kStr];
+                BOOL isMetaKey = [reservedKeys containsObject:kStr];
                 if (!isMetaKey && ([kStr caseInsensitiveCompare:@"default"] == NSOrderedSame || (kStr.length >= 6 && [kStr containsString:@"-"])) && vStr.length > 0 && vStr.length < 60 && ![vStr containsString:@"/"]) {
                     outContainers[kStr] = vStr;
                 }
@@ -148,7 +156,6 @@ static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
     }
 }
 
-// Busca recursivamente solo el nodo que pertenece al bundleID indicado (sin mezclar Instagram con Reddit)
 static void extractCraneConfigForBundle(id node, NSString *bundleID, NSMutableDictionary *outContainers) {
     if (!node || !bundleID || !outContainers) return;
     if ([node isKindOfClass:[NSDictionary class]]) {
@@ -549,7 +556,6 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
         byUUID[uuid][@"idfv"]) {
         profile = [byUUID[uuid] mutableCopy];
     }
-    // Si el contenedor había sido creado en Crane antes de abrir la app (guardado bajo craneID), migrar su perfil a la carpeta
     if (!profile && ![craneID isEqualToString:uuid] && [byUUID[craneID] isKindOfClass:[NSDictionary class]] && byUUID[craneID][@"idfv"]) {
         profile = [byUUID[craneID] mutableCopy];
         [byUUID removeObjectForKey:craneID];
@@ -631,7 +637,6 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
     return profile;
 }
 
-// Sincronización bidireccional exacta con Crane (Crear, Renombrar, Contenedor Activo y Borrar)
 - (void)scanAndSyncAllContainers {
     self.igContainersList = [NSMutableArray array];
     self.redditContainersList = [NSMutableArray array];
@@ -639,12 +644,11 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
     NSMutableSet *matchedCraneIDs = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // 1. Leer todas las fuentes vivas de Crane (CFPreferences + Application Support/Crane + Preferences)
     NSMutableArray *craneSources = [NSMutableArray array];
     for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
         CFPreferencesAppSynchronize((__bridge CFStringRef)domain);
-        for (CFStringRef user in @[CFSTR("mobile"), CFSTR("root")]) {
-            CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, (__bridge CFStringRef)domain, user, kCFPreferencesAnyHost);
+        for (NSString *user in @[@"mobile", @"root"]) {
+            CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, (__bridge CFStringRef)domain, (__bridge CFStringRef)user, kCFPreferencesAnyHost);
             if (cfDict) {
                 NSDictionary *d = CFBridgingRelease(cfDict);
                 if ([d count] > 0) [craneSources addObject:d];
@@ -663,8 +667,7 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
         @"/var/mobile/Library/Application Support/Crane",
         @"/var/jb/var/mobile/Library/Application Support/Crane",
         @"/var/mobile/Library/Crane",
-        @"/var/jb/var/mobile/Library/Crane",
-        @"/var/containers/Shared/SystemGroup/systemgroup.com.apple.configurationprofiles/Library/ConfigurationProfiles"
+        @"/var/jb/var/mobile/Library/Crane"
     ];
     for (NSString *sDir in searchDirs) {
         if (![fm fileExistsAtPath:sDir]) continue;
@@ -693,7 +696,6 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
     [igCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
     [rdCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
 
-    // 2. Escanear carpetas en /var/mobile/Containers/Data/Application y vincularlas con la lista de Crane
     NSString *appsDir = @"/var/mobile/Containers/Data/Application";
     NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
 
@@ -737,7 +739,6 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
 
         BOOL isDefaultContainer = (!userInfo || [userInfo count] == 0 || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame);
 
-        // Si Crane tiene su lista de contenedores para esta app y este contenedor NO es Default ni está en Crane, fue borrado en Crane
         if (!isDefaultContainer && craneMap.count > 0 && !craneMap[craneID] && !craneMap[folderUUID] && !detectedName) {
             continue;
         }
@@ -767,7 +768,6 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
             [targetList addObject:prof];
         }
 
-        // Escanear subcarpetas ___Crane_Containers si existen
         NSString *subCraneDir = [fullPath stringByAppendingPathComponent:@"___Crane_Containers"];
         if ([fm fileExistsAtPath:subCraneDir]) {
             NSArray *subUUIDs = [fm contentsOfDirectoryAtPath:subCraneDir error:nil];
@@ -795,7 +795,6 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
         }
     }
 
-    // 3. Añadir cualquier contenedor recién creado en Crane (en craneMap o en Application Support/Crane/Containers) que aún no haya sido abierto
     for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
         BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
         NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
@@ -835,7 +834,6 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
         }
     }
 
-    // 4. Purga automática de cualquier contenedor borrado en Crane
     NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
         ? [self.state[@"containersByUUID"] mutableCopy]
         : [NSMutableDictionary dictionary];
