@@ -4,8 +4,8 @@
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <CoreTelephony/CTCarrier.h>
 #import <CoreTelephony/CTTelephonyNetworkInfo.h>
+#import <DeviceCheck/DeviceCheck.h>
 #import <SystemConfiguration/CaptiveNetwork.h>
-#import <SystemConfiguration/SCNetworkReachability.h>
 #import <AVFoundation/AVFoundation.h>
 #import <ifaddrs.h>
 #import <arpa/inet.h>
@@ -24,7 +24,7 @@
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
-#define CURRENT_SCHEMA_VERSION 14
+#define CURRENT_SCHEMA_VERSION 15
 
 static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
@@ -100,6 +100,10 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
     NSString *craneID = nil;
     NSString *craneName = nil;
 
+    NSDictionary *env = [[NSProcessInfo processInfo] environment];
+    if ([env[@"CRANE_CONTAINER_NAME"] length] > 0) craneName = env[@"CRANE_CONTAINER_NAME"];
+    if ([env[@"CRANE_CONTAINER_ID"] length] > 0) craneID = env[@"CRANE_CONTAINER_ID"];
+
     if ([meta isKindOfClass:[NSDictionary class]]) {
         for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
             if ([meta[rk] isKindOfClass:[NSString class]] && [meta[rk] length] > 0) craneName = meta[rk];
@@ -126,7 +130,7 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
     if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
 
     NSMutableArray *sources = [NSMutableArray array];
-    for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_PREFS_VAR, CRANE_MAIN_JB, CRANE_MAIN_VAR]) {
+    for (NSString *pPath in @[CRANE_MAIN_JB, CRANE_MAIN_VAR, CRANE_PREFS_JB, CRANE_PREFS_VAR]) {
         NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
         if ([cPrefs count] > 0) [sources addObject:cPrefs];
     }
@@ -179,19 +183,26 @@ static NSMutableDictionary *getContainerProfile() {
         NSMutableDictionary *profile = nil;
         NSDictionary *diskLoaded = [NSDictionary dictionaryWithContentsOfFile:localPlist];
 
-        if ([diskLoaded isKindOfClass:[NSDictionary class]] && diskLoaded[@"idfv"]) {
+        if ([diskLoaded isKindOfClass:[NSDictionary class]] &&
+            [diskLoaded[@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION &&
+            diskLoaded[@"idfv"]) {
             profile = [diskLoaded mutableCopy];
-        } else if ([byUUID[keyUUID] isKindOfClass:[NSDictionary class]] && byUUID[keyUUID][@"idfv"]) {
+        } else if ([byUUID[keyUUID] isKindOfClass:[NSDictionary class]] &&
+                   [byUUID[keyUUID][@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION &&
+                   byUUID[keyUUID][@"idfv"]) {
             profile = [byUUID[keyUUID] mutableCopy];
         }
 
-        // Sincronizar cambios realizados desde el panel para este UUID exclusivo
         if (profile && [byUUID[keyUUID] isKindOfClass:[NSDictionary class]]) {
             NSDictionary *stCopy = byUUID[keyUUID];
-            for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"ssid", @"bssid", @"idfv", @"bootSessionUUID", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"uptimeOffset"]) {
+            for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"ssid", @"bssid", @"idfv", @"bootSessionUUID", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness"]) {
                 if (stCopy[k] != nil) profile[k] = stCopy[k];
             }
         }
+
+        NSString *nativeCraneUUID = (origCraneIDFV && origCraneIDFV.length >= 32)
+            ? [origCraneIDFV uppercaseString]
+            : (([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString]);
 
         if (!profile || !profile[@"idfv"]) {
             uint64_t seed = randomSeed64(keyUUID);
@@ -209,13 +220,10 @@ static NSMutableDictionary *getContainerProfile() {
             NSString *localIP = [NSString stringWithFormat:@"%@.%d", subnet, 15 + (int)(seed % 220)];
             unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
 
-            NSString *baseIDFV = ([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString];
-
-            // Inicialización 100% aislada (No hereda IPs ni zonas horarias globales de otros contenedores)
             profile = [@{
                 @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
                 @"containerUUID": keyUUID,
-                @"craneIdentifier": craneID,
+                @"craneIdentifier": nativeCraneUUID,
                 @"containerName": craneName,
                 @"bundleID": bundleID,
                 @"path": homePath,
@@ -227,8 +235,8 @@ static NSMutableDictionary *getContainerProfile() {
                 @"spoofSecurity": @YES,
                 @"locationAnchored": @NO,
                 @"deviceModel": @"iPhone10,4",
-                @"craneOriginalIDFV": craneID,
-                @"idfv": baseIDFV,
+                @"craneOriginalIDFV": nativeCraneUUID,
+                @"idfv": nativeCraneUUID,
                 @"shieldDeviceID": [[NSUUID UUID] UUIDString],
                 @"bootSessionUUID": [[NSUUID UUID] UUIDString],
                 @"cloudUUID": [[NSUUID UUID] UUIDString],
@@ -236,7 +244,6 @@ static NSMutableDictionary *getContainerProfile() {
                 @"ssid": ssid,
                 @"localIP": localIP,
                 @"freeBytes": @(freeBytes),
-                @"uptimeOffset": @(1800 + (NSUInteger)(seed % 82000)),
                 @"batteryLevel": @(0.32f + ((seed % 60) / 100.0f)),
                 @"brightness": @(0.30f + (((seed >> 4) % 60) / 100.0f)),
                 @"audioVolume": @(0.20f + (((seed >> 6) % 70) / 100.0f)),
@@ -253,19 +260,11 @@ static NSMutableDictionary *getContainerProfile() {
                 @"CarrierISO": @"us"
             } mutableCopy];
         } else {
-            // Variación ligera y natural de sensores puros al abrir la app para no reportar valores estáticos
-            uint32_t sessionJitter = arc4random_uniform(1000);
-            float prevBat = [profile[@"batteryLevel"] floatValue];
-            float newBat = prevBat + ((sessionJitter % 2 == 0) ? 0.02f : -0.03f);
-            if (newBat < 0.22f || newBat > 0.94f) newBat = 0.35f + (arc4random_uniform(55) / 100.0f);
-            profile[@"batteryLevel"] = @(newBat);
-            profile[@"audioVolume"] = @(0.20f + (arc4random_uniform(65) / 100.0f));
-            profile[@"brightness"] = @(0.28f + (arc4random_uniform(60) / 100.0f));
-            profile[@"pasteboardCount"] = @([profile[@"pasteboardCount"] integerValue] + 1 + arc4random_uniform(3));
-
             profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
             profile[@"containerUUID"] = keyUUID;
-            profile[@"craneIdentifier"] = craneID;
+            profile[@"craneIdentifier"] = nativeCraneUUID;
+            profile[@"craneOriginalIDFV"] = nativeCraneUUID;
+            profile[@"idfv"] = nativeCraneUUID;
             profile[@"bundleID"] = bundleID;
             profile[@"path"] = homePath;
             if (craneName && ![craneName isEqualToString:keyUUID]) {
@@ -356,7 +355,6 @@ static void applyAutomaticNetworkCoherenceToProfile(NSMutableDictionary *prof, N
     }
 }
 
-// Sincronización efímera HTTPS exclusiva del contenedor actual (sin caché ni variables globales)
 static void syncContainerWithLiveIP() {
     if (!isModuleActive(@"spoofNetwork")) return;
 
@@ -449,7 +447,6 @@ static void showStartupBanner() {
     });
 }
 
-// Permite las rutas internas de Crane para no bloquear el guardado del Keychain OAuth en Reddit
 static BOOL isSuspiciousJailbreakPathC(const char *path) {
     if (!path) return NO;
     if (strstr(path, "igfarmshield") != NULL ||
@@ -495,6 +492,13 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
     }
     return ret;
 }
+
+%hook DCDevice
+- (BOOL)isSupported {
+    if (!isModuleActive(@"spoofSecurity")) return %orig;
+    return NO;
+}
+%end
 
 %hook LAContext
 - (BOOL)canEvaluatePolicy:(LAPolicy)policy error:(NSError * __autoreleasing *)error {
@@ -603,21 +607,6 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 }
 %end
 
-static Boolean (*orig_SCNetworkReachabilityGetFlags)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *);
-static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
-    Boolean ok = orig_SCNetworkReachabilityGetFlags(target, flags);
-    if (ok && flags && isModuleActive(@"spoofNetwork")) {
-        NSDictionary *prof = getContainerProfile();
-        *flags &= ~kSCNetworkReachabilityFlagsTransientConnection;
-        if ([prof[@"CarrierMode"] isEqualToString:@"CELLULAR"]) {
-            *flags |= kSCNetworkReachabilityFlagsIsWWAN;
-        } else {
-            *flags &= ~kSCNetworkReachabilityFlagsIsWWAN;
-        }
-    }
-    return ok;
-}
-
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef);
 static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
     if (!isModuleActive(@"spoofNetwork")) return orig_CNCopyCurrentNetworkInfo(interfaceName);
@@ -633,28 +622,6 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
     return (__bridge_retained CFDictionaryRef)fakeWifi;
 }
 
-static int (*orig_getifaddrs)(struct ifaddrs **);
-static int custom_getifaddrs(struct ifaddrs **ifap) {
-    int res = orig_getifaddrs(ifap);
-    if (!isModuleActive(@"spoofNetwork") || res != 0 || !ifap || !*ifap) return res;
-
-    struct ifaddrs *curr = *ifap;
-    while (curr) {
-        if (curr->ifa_name) {
-            if (strncmp(curr->ifa_name, "utun", 4) == 0 ||
-                strncmp(curr->ifa_name, "ppp", 3) == 0 ||
-                strncmp(curr->ifa_name, "ipsec", 5) == 0 ||
-                strncmp(curr->ifa_name, "tun", 3) == 0 ||
-                strncmp(curr->ifa_name, "tap", 3) == 0) {
-                strcpy(curr->ifa_name, "en0");
-                curr->ifa_flags &= ~IFF_POINTOPOINT;
-            }
-        }
-        curr = curr->ifa_next;
-    }
-    return res;
-}
-
 %hook UIDevice
 - (NSString *)name {
     if (!isModuleActive(@"spoofHardware")) return %orig;
@@ -665,10 +632,8 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     if (!origCraneIDFV && origUUID) {
         origCraneIDFV = [origUUID UUIDString];
     }
-    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-    if ([bundleID isEqualToString:@"com.reddit.Reddit"] && origUUID) {
-        return origUUID;
-    }
+    // Respetar el UUID aislado que Crane inyecta para no desincronizar el Keychain OAuth de la app
+    if (origUUID) return origUUID;
     if (!isModuleActive(@"spoofIDs")) return origUUID;
     NSDictionary *prof = getContainerProfile();
     NSUUID *customUUID = [[NSUUID alloc] initWithUUIDString:prof[@"idfv"]];
@@ -714,6 +679,11 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 }
 
 %hook NSFileManager
+- (id)ubiquityIdentityToken {
+    // Evita que Reddit/Instagram intenten usar iCloud Drive o muestren el prompt de sesión de iCloud
+    if (isModuleActive(@"spoofIDs") || isModuleActive(@"spoofSecurity")) return nil;
+    return %orig;
+}
 - (NSDictionary<NSFileAttributeKey, id> *)attributesOfFileSystemForPath:(NSString *)path error:(NSError * _Nullable *)error {
     NSDictionary *orig = %orig;
     if (!isModuleActive(@"spoofHardware") || !orig) return orig;
@@ -734,12 +704,6 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 %end
 
 %hook NSProcessInfo
-- (NSTimeInterval)systemUptime {
-    NSTimeInterval orig = %orig;
-    if (!isModuleActive(@"spoofHardware")) return orig;
-    NSDictionary *prof = getContainerProfile();
-    return orig + [prof[@"uptimeOffset"] doubleValue];
-}
 - (NSDictionary<NSString *, NSString *> *)environment {
     NSDictionary *orig = %orig;
     if (!isModuleActive(@"spoofSecurity") || !orig) return orig;
@@ -755,11 +719,8 @@ static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
 static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     if (ret == 0 && name && oldlenp && !isInitializingProfile) {
-        NSDictionary *prof = getContainerProfile();
-        if (strcmp(name, "kern.boottime") == 0 && isModuleActive(@"spoofHardware") && oldp && *oldlenp >= sizeof(struct timeval)) {
-            struct timeval *tv = (struct timeval *)oldp;
-            tv->tv_sec -= [prof[@"uptimeOffset"] longValue];
-        } else if (strcmp(name, "kern.bootsessionuuid") == 0 && isModuleActive(@"spoofIDs")) {
+        if (strcmp(name, "kern.bootsessionuuid") == 0 && isModuleActive(@"spoofIDs")) {
+            NSDictionary *prof = getContainerProfile();
             NSString *bootUUID = prof[@"bootSessionUUID"];
             if (bootUUID) {
                 const char *uuidStr = [bootUUID UTF8String];
@@ -786,15 +747,14 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 
 %ctor {
     %init;
+    origCraneIDFV = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
     getContainerProfile();
 
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
     MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
-    MSHookFunction((void *)SCNetworkReachabilityGetFlags, (void *)custom_SCNetworkReachabilityGetFlags, (void **)&orig_SCNetworkReachabilityGetFlags);
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
-    MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         syncContainerWithLiveIP();
