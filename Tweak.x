@@ -19,7 +19,7 @@
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
-#define CURRENT_SCHEMA_VERSION 17
+#define CURRENT_SCHEMA_VERSION 18
 
 static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
@@ -51,7 +51,12 @@ static uint64_t randomSeed64(NSString *salt) {
     return hash ^ r;
 }
 
-// Verifica si la llamada proviene del binario de la App (Instagram/Reddit) y NO de Crane o daemons de iOS
+static void applyLowLevelCTimeZone(NSString *tzName) {
+    if (!tzName || [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "] || tzName.length == 0) return;
+    setenv("TZ", [tzName UTF8String], 1);
+    tzset();
+}
+
 static BOOL isCallerFromTargetApp(const void *retAddr) {
     if (!retAddr || !orig_dladdr) return YES;
     Dl_info info;
@@ -62,6 +67,42 @@ static BOOL isCallerFromTargetApp(const void *retAddr) {
         return NO;
     }
     return YES;
+}
+
+static NSString *findCraneNameInNode(id node, NSString *targetID) {
+    if (!node || !targetID || targetID.length == 0) return nil;
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)node;
+        for (id k in dict) {
+            NSString *kStr = [k description];
+            id val = dict[k];
+            if ([kStr caseInsensitiveCompare:targetID] == NSOrderedSame) {
+                if ([val isKindOfClass:[NSString class]] && [val length] > 0) return val;
+                if ([val isKindOfClass:[NSDictionary class]]) {
+                    for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+                        if ([val[nk] isKindOfClass:[NSString class]] && [val[nk] length] > 0) return val[nk];
+                    }
+                }
+            }
+            if ([val isKindOfClass:[NSString class]] && [val caseInsensitiveCompare:targetID] == NSOrderedSame) {
+                for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+                    if ([dict[nk] isKindOfClass:[NSString class]] && [dict[nk] length] > 0 && ![dict[nk] isEqualToString:targetID]) {
+                        return dict[nk];
+                    }
+                }
+            }
+            if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
+                NSString *found = findCraneNameInNode(val, targetID);
+                if (found) return found;
+            }
+        }
+    } else if ([node isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)node) {
+            NSString *found = findCraneNameInNode(item, targetID);
+            if (found) return found;
+        }
+    }
+    return nil;
 }
 
 static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
@@ -89,20 +130,50 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
                 NSString *kl = [k lowercaseString];
                 id val = userInfo[k];
                 if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
-                    if ([kl containsString:@"name"]) craneName = val;
-                    else if (([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"]) && ![val hasPrefix:@"com."]) {
-                        craneID = val;
+                    if ([kl containsString:@"name"] || [kl containsString:@"label"] || [kl containsString:@"title"]) {
+                        craneName = val;
+                    } else if ([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"] || [kl containsString:@"uuid"]) {
+                        if (![val hasPrefix:@"com."]) craneID = val;
                     }
                 }
             }
         }
     }
 
+    if (!craneID && origCraneIDFV && origCraneIDFV.length > 0) craneID = origCraneIDFV;
     if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
+
+    NSMutableArray *sources = [NSMutableArray array];
+    for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
+        NSDictionary *ud = [[[NSUserDefaults alloc] initWithSuiteName:domain] dictionaryRepresentation];
+        if ([ud count] > 0) [sources addObject:ud];
+    }
+    for (NSString *pPath in @[CRANE_MAIN_JB, CRANE_MAIN_VAR, CRANE_PREFS_JB, CRANE_PREFS_VAR]) {
+        NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
+        if ([cPrefs count] > 0) [sources addObject:cPrefs];
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *sDir in @[@"/var/mobile/Library/Application Support/Crane", @"/var/jb/var/mobile/Library/Application Support/Crane"]) {
+        if (![fm fileExistsAtPath:sDir]) continue;
+        NSArray *subFiles = [fm subpathsOfDirectoryAtPath:sDir error:nil];
+        for (NSString *sf in subFiles) {
+            if ([sf hasSuffix:@".plist"]) {
+                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:[sDir stringByAppendingPathComponent:sf]];
+                if ([d isKindOfClass:[NSDictionary class]] && [d count] > 0) [sources addObject:d];
+            }
+        }
+    }
+
+    for (NSDictionary *src in sources) {
+        if (!craneName && craneID) craneName = findCraneNameInNode(src, craneID);
+        if (!craneName && origCraneIDFV) craneName = findCraneNameInNode(src, origCraneIDFV);
+        if (!craneName) craneName = findCraneNameInNode(src, folderUUID);
+    }
 
     if (!craneName || craneName.length == 0) {
         NSDictionary *userInfo = [meta isKindOfClass:[NSDictionary class]] ? meta[@"MCMMetadataUserInfo"] : nil;
-        if (!userInfo || [userInfo count] == 0 || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
+        if ((!userInfo || [userInfo count] == 0) || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
             craneName = @"Default";
         } else {
             craneName = craneID;
@@ -111,7 +182,7 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
 
     return @{
         @"keyUUID": folderUUID ?: @"Default",
-        @"craneID": craneID ?: @"Default",
+        @"craneID": (origCraneIDFV ?: craneID) ?: @"Default",
         @"craneName": craneName ?: @"Default"
     };
 }
@@ -143,13 +214,28 @@ static NSMutableDictionary *getContainerProfile() {
         NSDictionary *diskLoaded = [NSDictionary dictionaryWithContentsOfFile:localPlist];
         NSDictionary *settingsEntry = [byUUID[keyUUID] isKindOfClass:[NSDictionary class]] ? byUUID[keyUUID] : nil;
 
-        if ([diskLoaded isKindOfClass:[NSDictionary class]] && diskLoaded[@"idfv"]) {
-            profile = [diskLoaded mutableCopy];
-        } else if (settingsEntry && settingsEntry[@"idfv"]) {
-            profile = [settingsEntry mutableCopy];
+        if (!settingsEntry) {
+            for (NSString *existingKey in [byUUID allKeys]) {
+                if ([existingKey caseInsensitiveCompare:keyUUID] == NSOrderedSame ||
+                    [existingKey caseInsensitiveCompare:craneID] == NSOrderedSame) {
+                    NSDictionary *cand = byUUID[existingKey];
+                    if ([cand isKindOfClass:[NSDictionary class]] && [cand[@"bundleID"] isEqualToString:bundleID] && cand[@"idfv"]) {
+                        settingsEntry = cand;
+                        if (![existingKey isEqualToString:keyUUID]) {
+                            [byUUID removeObjectForKey:existingKey];
+                        }
+                        break;
+                    }
+                }
+            }
         }
 
-        // Respetar siempre el estado de los switches configurados manualmente en Settings
+        if (settingsEntry && settingsEntry[@"idfv"]) {
+            profile = [settingsEntry mutableCopy];
+        } else if ([diskLoaded isKindOfClass:[NSDictionary class]] && diskLoaded[@"idfv"]) {
+            profile = [diskLoaded mutableCopy];
+        }
+
         if (profile && settingsEntry) {
             for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"ssid", @"bssid", @"bootSessionUUID", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness"]) {
                 if (settingsEntry[k] != nil) profile[k] = settingsEntry[k];
@@ -192,7 +278,7 @@ static NSMutableDictionary *getContainerProfile() {
             profile = [@{
                 @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
                 @"containerUUID": keyUUID,
-                @"craneIdentifier": craneID,
+                @"craneIdentifier": nativeCraneUUID,
                 @"containerName": craneName,
                 @"bundleID": bundleID,
                 @"path": homePath,
@@ -231,7 +317,7 @@ static NSMutableDictionary *getContainerProfile() {
         } else {
             profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
             profile[@"containerUUID"] = keyUUID;
-            profile[@"craneIdentifier"] = craneID;
+            profile[@"craneIdentifier"] = nativeCraneUUID;
             profile[@"craneOriginalIDFV"] = nativeCraneUUID;
             profile[@"idfv"] = nativeCraneUUID;
             profile[@"bundleID"] = bundleID;
@@ -241,18 +327,19 @@ static NSMutableDictionary *getContainerProfile() {
             }
         }
 
-        [profile writeToFile:localPlist atomically:YES];
+        if ([profile[@"spoofLocation"] boolValue] && profile[@"timeZone"]) {
+            applyLowLevelCTimeZone(profile[@"timeZone"]);
+        }
 
-        // Registrar únicamente qué contenedor se abrió sin pisar el estado "enabled" cambiado en Settings
+        [profile writeToFile:localPlist atomically:YES];
+        byUUID[keyUUID] = profile;
+        globalSt[@"containersByUUID"] = byUUID;
+
         NSMutableDictionary *activeMap = [globalSt[@"activeInCrane"] isKindOfClass:[NSDictionary class]]
             ? [globalSt[@"activeInCrane"] mutableCopy]
             : [NSMutableDictionary dictionary];
         activeMap[bundleID] = keyUUID;
         globalSt[@"activeInCrane"] = activeMap;
-        if (!byUUID[keyUUID]) {
-            byUUID[keyUUID] = profile;
-            globalSt[@"containersByUUID"] = byUUID;
-        }
         [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
 
         liveContainerProfile = profile;
@@ -271,7 +358,6 @@ static BOOL isModuleActive(NSString *moduleKey) {
     if ([bundleID isEqualToString:@"com.burbn.instagram"] && state[@"enableIG"] != nil && ![state[@"enableIG"] boolValue]) return NO;
     if ([bundleID isEqualToString:@"com.reddit.Reddit"] && state[@"enableReddit"] != nil && ![state[@"enableReddit"] boolValue]) return NO;
 
-    // Verificar en tiempo real si el usuario apagó este contenedor desde Settings
     NSString *keyUUID = liveContainerProfile[@"containerUUID"];
     NSDictionary *byUUID = state[@"containersByUUID"];
     if (keyUUID && [byUUID isKindOfClass:[NSDictionary class]] && [byUUID[keyUUID] isKindOfClass:[NSDictionary class]]) {
@@ -538,6 +624,10 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 }
 
 %hook NSFileManager
+- (id)ubiquityIdentityToken {
+    if (isModuleActive(@"spoofIDs") || isModuleActive(@"spoofSecurity")) return nil;
+    return %orig;
+}
 - (NSDictionary<NSFileAttributeKey, id> *)attributesOfFileSystemForPath:(NSString *)path error:(NSError * _Nullable *)error {
     NSDictionary *orig = %orig;
     if (!isModuleActive(@"spoofHardware") || !orig) return orig;
