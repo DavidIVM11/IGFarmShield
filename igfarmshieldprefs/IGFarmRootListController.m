@@ -17,7 +17,7 @@ extern char **environ;
 #define CHOICY_PLIST_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define CHOICY_PLIST_VAR @"/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 11
+#define CURRENT_SCHEMA_VERSION 12
 
 @interface PSViewController : UIViewController
 @end
@@ -195,6 +195,7 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
 - (void)saveCurrentProfile;
 - (BOOL)isModOn:(NSString *)key;
 - (void)toggleSwitch:(UISwitch *)sender;
+- (void)showNetworkCoherenceSelector;
 - (void)refreshPurePhoneTelemetryWithPopup;
 - (void)syncWithLiveIPAndAuditVPS:(BOOL)sendToVPS;
 @end
@@ -266,8 +267,8 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
     self.choicyDetailReport = [NSString stringWithFormat:
         @"1. Filtro Choicy en Instagram: %@\n"
         @"2. Filtro Choicy en Reddit: %@\n"
-        @"3. Ocultación de Jailbreak (/var/jb): Activa\n"
-        @"4. Ocultación de librerías en memoria: Activa",
+        @"3. Apple DeviceCheck (Login Reddit): Permitido\n"
+        @"4. Ocultación de Jailbreak (/var/jb): Activa",
         igOK ? @"✅ Activo" : @"⚠️ No configurado",
         rdOK ? @"✅ Activo" : @"⚠️ No configurado"];
 }
@@ -300,7 +301,6 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
     }
 }
 
-// Aplica Modo Exclusivo automáticamente dejando solo 1 contenedor activo por aplicación
 - (NSString *)enforceExclusiveModeAutomatic {
     NSDictionary *activeMap = self.state[@"activeInCrane"];
     NSMutableArray *keptNames = [NSMutableArray array];
@@ -397,19 +397,23 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
         uint64_t seed = randomSeedPrefs64(uuid);
         NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
         NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
-        NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0", @"192.168.10", @"10.0.1"];
-        NSArray *osBuilds = @[@"20G75", @"20G81", @"20H19", @"20H30", @"20F66"];
+        NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0", @"192.168.10"];
 
         NSString *oui = ouis[seed % ouis.count];
         NSString *ssidPref = ssidPrefixes[(seed >> 3) % ssidPrefixes.count];
         NSString *subnet = subnets[(seed >> 5) % subnets.count];
-        NSString *osBuild = osBuilds[(seed >> 7) % osBuilds.count];
 
         NSString *bssid = [NSString stringWithFormat:@"%@:%02x:%02x:%02x",
                            oui, (unsigned int)((seed >> 8) & 0xFF), (unsigned int)((seed >> 16) & 0xFF), (unsigned int)((seed >> 24) & 0xFF)];
         NSString *ssid = [NSString stringWithFormat:@"%@-%02X-5G", ssidPref, (unsigned int)(seed & 0xFF)];
         NSString *localIP = [NSString stringWithFormat:@"%@.%d", subnet, 12 + (int)(seed % 230)];
+        NSString *cellIP = [NSString stringWithFormat:@"100.%d.%d.%d", 64 + (int)(seed % 30), 1 + (int)((seed >> 4) % 250), 2 + (int)((seed >> 8) % 250)];
         unsigned long long freeBytes = ((14200ULL + (seed % 32000ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
+
+        // Si no es rotación forzada y Crane ya dio un UUID válido, lo conserva para evitar error de Keychain en Reddit
+        NSString *shieldIDFV = ([craneID containsString:@"-"] && craneID.length >= 32 && !rotate)
+            ? [craneID uppercaseString]
+            : [[NSUUID UUID] UUIDString];
 
         profile = [@{
             @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
@@ -426,16 +430,15 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
             @"spoofSecurity": profile[@"spoofSecurity"] ?: @YES,
             @"locationAnchored": @(self.state[@"last_ip"] != nil),
             @"deviceModel": @"iPhone10,4",
-            @"osBuild": osBuild,
-            @"deviceName": [NSString stringWithFormat:@"iPhone-%02X", (unsigned int)(seed & 0xFF)],
             @"craneOriginalIDFV": craneID,
-            @"idfv": [[NSUUID UUID] UUIDString],
+            @"idfv": shieldIDFV,
             @"shieldDeviceID": [[NSUUID UUID] UUIDString],
             @"bootSessionUUID": [[NSUUID UUID] UUIDString],
             @"cloudUUID": [[NSUUID UUID] UUIDString],
             @"bssid": bssid,
             @"ssid": ssid,
             @"localIP": localIP,
+            @"cellularIP": cellIP,
             @"freeBytes": @(freeBytes),
             @"uptimeOffset": @(1800 + (NSUInteger)(seed % 82000)),
             @"batteryLevel": @(0.28f + ((seed % 64) / 100.0f)),
@@ -447,13 +450,17 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
             @"cityCountry": profile[@"cityCountry"] ?: (self.state[@"last_city_country"] ?: @"Toca Sincronizar con IP"),
             @"timeZone": profile[@"timeZone"] ?: (self.state[@"defaultTimeZone"] ?: @"America/New_York"),
             @"localeID": profile[@"localeID"] ?: (self.state[@"defaultLocale"] ?: @"en_US"),
-            @"CarrierMode": profile[@"CarrierMode"] ?: (self.state[@"defaultCarrierMode"] ?: @"WIFI_ONLY"),
-            @"CarrierName": profile[@"CarrierName"] ?: (self.state[@"defaultCarrierName"] ?: @"ISP"),
+            @"CarrierMode": profile[@"CarrierMode"] ?: (self.state[@"defaultCarrierMode"] ?: @"CELLULAR"),
+            @"CarrierName": profile[@"CarrierName"] ?: (self.state[@"defaultCarrierName"] ?: @"T-Mobile"),
             @"CarrierMCC": profile[@"CarrierMCC"] ?: (self.state[@"defaultCarrierMCC"] ?: @"310"),
             @"CarrierMNC": profile[@"CarrierMNC"] ?: (self.state[@"defaultCarrierMNC"] ?: @"260"),
             @"CarrierISO": profile[@"CarrierISO"] ?: (self.state[@"defaultCarrierISO"] ?: @"us")
         } mutableCopy];
     } else {
+        if (!profile[@"cellularIP"]) {
+            uint64_t s = randomSeedPrefs64(uuid);
+            profile[@"cellularIP"] = [NSString stringWithFormat:@"100.%d.%d.%d", 64 + (int)(s % 30), 1 + (int)((s >> 4) % 250), 2 + (int)((s >> 8) % 250)];
+        }
         profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
         profile[@"containerUUID"] = uuid;
         profile[@"craneIdentifier"] = craneID;
@@ -832,7 +839,7 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
             NSString *keptSummary = [self enforceExclusiveModeAutomatic];
             [self.tableView reloadData];
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔒 Modo Exclusivo Aplicado"
-                                                                        message:[NSString stringWithFormat:@"Se desactivaron automáticamente los contenedores secundarios para evitar cruces de sesión.\n\nContenedores activos ahora:\n• %@", keptSummary ?: @"Default"]
+                                                                        message:[NSString stringWithFormat:@"Se desactivaron automáticamente los contenedores secundarios.\n\nContenedores activos ahora:\n• %@", keptSummary ?: @"Default"]
                                                                  preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:ac animated:YES completion:nil];
@@ -930,8 +937,8 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
             [self.tableView reloadData];
             if (!silent) {
                 UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Red Saliente Detectada"
-                                                                            message:[NSString stringWithFormat:@"• IP Pública: %@\n• ISP: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
-                                                                                     ip, ispRaw, city, region, [cc uppercaseString], tz]
+                                                                            message:[NSString stringWithFormat:@"• IP Pública: %@\n• ISP: %@\n• Modo Coherente: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
+                                                                                     ip, ispRaw, [self.state[@"defaultCarrierMode"] isEqualToString:@"CELLULAR"] ? @"4G Móvil (Wi-Fi Oculto)" : @"Wi-Fi Residencial", city, region, [cc uppercaseString], tz]
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
@@ -1024,13 +1031,16 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
         : [NSString stringWithFormat:@"📦 %@", cName];
 
     NSString *shortIDFV = [prof[@"idfv"] length] >= 8 ? [prof[@"idfv"] substringToIndex:8] : prof[@"idfv"];
-    NSString *localIP = prof[@"localIP"] ?: @"192.168.1.x";
+    BOOL isCell = [prof[@"CarrierMode"] isEqualToString:@"CELLULAR"];
+    NSString *netDesc = isCell
+        ? [NSString stringWithFormat:@"4G %@ (Sin Wi-Fi)", prof[@"CarrierName"] ?: @"LTE"]
+        : [NSString stringWithFormat:@"Wi-Fi (%@)", prof[@"localIP"] ?: @"LAN"];
     int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
     if (masterOn && appOn && contOn) {
         cell.detailTextLabel.textColor = [UIColor systemGreenColor];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"🟢 ON • IDFV: %@... • LAN: %@\nWi-Fi: %@ • Bat: %d%%",
-                                     shortIDFV, localIP, prof[@"ssid"] ?: @"Wi-Fi", batPct];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"🟢 ON • IDFV: %@... • %@\nIP: %@ • Bat: %d%%",
+                                     shortIDFV, netDesc, prof[@"lastSyncedIP"] ?: @"Sincronizar", batPct];
     } else {
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
         cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ En pausa (Datos reales) • IDFV: %@...", shortIDFV];
@@ -1125,7 +1135,7 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     switch (section) {
-        case 0: return @"1. ESTADO Y SINCRONIZACIÓN CON LA IP EN VIVO";
+        case 0: return @"1. ESTADO, MODO DE RED Y SINCRONIZACIÓN IP";
         case 1: return @"2. OPCIONES DE SPOOFING (CON CONFIRMACIÓN EN VIVO)";
         case 2: return @"3. FINGERPRINT EN VIVO DE ESTE CONTENEDOR";
         case 3: return @"4. ACTUALIZAR DATOS PUROS DEL TELÉFONO Y ROTACIÓN";
@@ -1135,7 +1145,7 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
-        case 0: return 3;
+        case 0: return 4;
         case 1: return 5;
         case 2: return 6;
         case 3: return 2;
@@ -1165,9 +1175,18 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
         } else if (indexPath.row == 1) {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
             cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
+            cell.textLabel.text = @"📶 Modo de Coherencia de Red (4G vs Wi-Fi)";
+            BOOL isCell = [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"];
+            cell.detailTextLabel.textColor = [UIColor systemBlueColor];
+            cell.detailTextLabel.text = isCell
+                ? [NSString stringWithFormat:@"📱 Proxy Móvil 4G (%@) • Oculta Wi-Fi y usa interfaz pdp_ip0", self.profile[@"CarrierName"] ?: @"T-Mobile"]
+                : [NSString stringWithFormat:@"🛜 Proxy Residencial Wi-Fi • Usa LAN %@ y Router %@", self.profile[@"localIP"], self.profile[@"ssid"]];
+        } else if (indexPath.row == 2) {
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
             cell.textLabel.textColor = [UIColor systemBlueColor];
             cell.textLabel.text = @"⚡ Sincronizar con la IP Actual en Vivo";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"Asigna ISP, País y Zona Horaria de tu IP actual (%@)",
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"Detecta automáticamente si tu IP es Móvil 4G o Wi-Fi Residencial (%@)",
                                          self.profile[@"lastSyncedIP"] ?: @"Sin sincronizar"];
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -1187,14 +1206,14 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
 
         NSArray *titles = @[
             @"1. Identificadores del Sistema",
-            @"2. Red Local y Ocultación de VPN",
+            @"2. Coherencia de Red y Ocultación de VPN",
             @"3. Ubicación de Red (Hora e Idioma por IP)",
             @"4. Datos Puros del Teléfono (Batería, Volumen, Disco)",
             @"5. Ocultación de Jailbreak y Crane"
         ];
         NSArray *subtitles = @[
-            @"Aísla IDFV, BootSessionUUID y token de iCloud por contenedor",
-            @"Inyecta IP doméstica (en0), Router BSSID/SSID y oculta el túnel VPN (utun)",
+            @"Aísla IDFV (compatible con Keychain de Reddit) y BootSessionUUID",
+            @"Si es Proxy Móvil apaga Wi-Fi y usa pdp_ip0; si es Residencial usa Wi-Fi LAN",
             @"Sincroniza huso horario y región del contenedor con los datos de tu IP",
             @"Aísla porcentaje de batería, volumen, brillo, gigabytes libres y arranque",
             @"Bloquea el escaneo de /var/jb, palera1n, Choicy y librerías en memoria"
@@ -1217,7 +1236,6 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
         return cell;
     }
 
-    // SECCIÓN 2: FINGERPRINT EN VIVO (REFLEJA EN TIEMPO REAL SI CADA OPCIÓN ESTÁ ACTIVA O APAGADA)
     if (indexPath.section == 2) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -1246,19 +1264,28 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
                 cell.textLabel.text = @"🔑 1. Identificadores del Sistema";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"🟢 SPOOF ACTIVO:\nIDFV:     %@\nBootUUID: %@\niCloud:   %@",
-                       self.profile[@"idfv"], self.profile[@"bootSessionUUID"], self.profile[@"cloudUUID"]]
+                    ? [NSString stringWithFormat:@"🟢 SPOOF ACTIVO:\nIDFV:     %@\nBootUUID: %@",
+                       self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
                     : @"⚪ DESACTIVADO (Exponiendo UUIDs nativos del sistema)";
                 break;
             }
             case 2: {
                 BOOL on = [self isModOn:@"spoofNetwork"];
-                cell.textLabel.text = @"📡 2. Red Local (en0) y Ocultación de VPN";
+                BOOL isCell = [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"];
+                cell.textLabel.text = @"📡 2. Interfaz de Red y Anti-VPN";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-                cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"🟢 SPOOF ACTIVO (VPN utun Oculto):\nIP LAN (en0): %@ (Máscara 255.255.255.0)\nWi-Fi SSID:   %@\nRouter BSSID: %@",
-                       self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]]
-                    : [NSString stringWithFormat:@"⚪ DESACTIVADO (Exponiendo IP real %@ y estado VPN)", self.parentRoot.realLocalIP ?: @"LAN"];
+                if (!on) {
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"⚪ DESACTIVADO (Exponiendo IP real %@ y estado VPN)", self.parentRoot.realLocalIP ?: @"LAN"];
+                } else if (isCell) {
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"🟢 MODO 4G MÓVIL PURO (Wi-Fi Apagado / VPN Oculto):\nInterfaz: pdp_ip0 (%@)\nOperadora: %@ 4G LTE (MCC %@ / MNC %@)",
+                                                 self.profile[@"cellularIP"] ?: @"100.68.42.19",
+                                                 self.profile[@"CarrierName"] ?: @"T-Mobile",
+                                                 self.profile[@"CarrierMCC"] ?: @"310",
+                                                 self.profile[@"CarrierMNC"] ?: @"260"];
+                } else {
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"🟢 MODO WI-FI RESIDENCIAL (VPN Oculto):\nIP LAN (en0): %@\nWi-Fi SSID:   %@\nRouter BSSID: %@",
+                                                 self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]];
+                }
                 break;
             }
             case 3: {
@@ -1266,7 +1293,7 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
                 cell.textLabel.text = @"🌎 3. Ubicación de Red, ISP y Zona Horaria";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"🟢 SPOOF ACTIVO:\nIP / ISP:     %@ (%@)\nUbicación:    %@\nZona / Idioma: %@ (%@)",
+                    ? [NSString stringWithFormat:@"🟢 SPOOF ACTIVO:\nIP / ISP:      %@ (%@)\nUbicación:     %@\nZona / Idioma: %@ (%@)",
                        self.profile[@"lastSyncedIP"] ?: @"Sincronizar", self.profile[@"ispName"] ?: @"ISP",
                        self.profile[@"cityCountry"] ?: @"USA", self.profile[@"timeZone"], self.profile[@"localeID"]]
                     : [NSString stringWithFormat:@"⚪ DESACTIVADO (Usando hora local %@)", [[NSTimeZone localTimeZone] name]];
@@ -1274,11 +1301,10 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
             }
             case 4: {
                 BOOL on = [self isModOn:@"spoofHardware"];
-                cell.textLabel.text = @"🔋 4. Datos Puros del Teléfono (Hardware)";
+                cell.textLabel.text = @"🔋 4. Datos Puros del Teléfono (Sin tocar OS Build)";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"🟢 SPOOF ACTIVO (%@ • Build %@):\nBatería: %d%% (Desconectado) • Volumen: %d%% • Brillo: %d%%\nDisco Libre: %.2f GB • Uptime: +%lu min",
-                       self.profile[@"deviceName"] ?: @"iPhone", self.profile[@"osBuild"] ?: @"20G81",
+                    ? [NSString stringWithFormat:@"🟢 SPOOF ACTIVO (iPhone10,4 • iOS Nativo):\nBatería: %d%% (Desconectado) • Volumen: %d%% • Brillo: %d%%\nDisco Libre: %.2f GB • Uptime: +%lu min",
                        batPct, volPct, briPct, freeGB, (unsigned long)upMin]
                     : [NSString stringWithFormat:@"⚪ DESACTIVADO (Real: Bat %d%% • Vol %d%% • %@)",
                        self.parentRoot.realBatteryPct, self.parentRoot.realVolumePct, self.parentRoot.realFreeDisk ?: @"64GB"];
@@ -1289,7 +1315,7 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
                 cell.textLabel.text = @"🛡️ 5. Protocolo Anti-Leak (Jailbreak / Crane)";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? @"🟢 BLINDAJE ACTIVO:\ndyld / dladdr / EnvVars / /var/jb / Portapapeles aislados"
+                    ? @"🟢 BLINDAJE ACTIVO:\ndyld / dladdr / /var/jb ocultos • DeviceCheck nativo para Reddit"
                     : @"⚪ DESACTIVADO (Rutas de Jailbreak visibles)";
                 break;
             }
@@ -1297,7 +1323,6 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
         return cell;
     }
 
-    // SECCIÓN 3: BOTONES PARA REFRESCAR DATOS PUROS DEL TELÉFONO Y REGENERAR HUELLA
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
     cell.textLabel.numberOfLines = 0;
     cell.detailTextLabel.numberOfLines = 0;
@@ -1305,31 +1330,26 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
         cell.textLabel.textColor = [UIColor systemBlueColor];
         cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
         cell.textLabel.text = @"🔋 Actualizar Datos Puros del Teléfono (Batería, Volumen, Disco)";
-        cell.detailTextLabel.text = @"Cambia al instante batería, volumen, brillo, espacio libre y uptime sin alterar el IDFV";
+        cell.detailTextLabel.text = @"Renueva batería, volumen, brillo, espacio libre y uptime (mantiene iOS Build y IDFV intactos)";
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     } else {
         cell.textLabel.textColor = [UIColor systemRedColor];
         cell.textLabel.font = [UIFont boldSystemFontOfSize:15];
-        cell.textLabel.text = @"🔄 Regenerar Huella Completa del Contenedor (Nuevo IDFV y Red LAN)";
-        cell.detailTextLabel.text = @"Genera un nuevo IDFV, BootUUID, IP LAN (en0), Router Wi-Fi y telemetría desde cero";
+        cell.textLabel.text = @"🔄 Regenerar Huella Completa del Contenedor";
+        cell.detailTextLabel.text = @"Genera un nuevo IDFV, BootUUID, IP y telemetría desde cero";
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     }
     return cell;
 }
 
-// Genera nuevos valores para el módulo activado, actualiza el panel y muestra un Pop-up detallando los datos aplicados
 - (void)toggleSwitch:(UISwitch *)sender {
     if (sender.tag == 100) {
         [self.parentRoot setContainer:self.containerUUID enabled:sender.isOn inBundle:self.bundleID];
         self.profile[@"enabled"] = @(sender.isOn);
         [self.tableView reloadData];
 
-        NSString *msg = sender.isOn
-            ? [NSString stringWithFormat:@"Escudo activado para el contenedor \"%@\".\n• IDFV: %@\n• IP LAN: %@\n• Router: %@",
-               self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"localIP"], self.profile[@"ssid"]]
-            : @"Se pausó el escudo en este contenedor. La aplicación verá los datos nativos del iPhone.";
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:sender.isOn ? @"🟢 Contenedor Protegido" : @"⚪ Contenedor en Pausa"
-                                                                    message:msg
+                                                                    message:sender.isOn ? @"Escudo activado para este contenedor." : @"Escudo pausado en este contenedor."
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:ac animated:YES completion:nil];
@@ -1347,44 +1367,39 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
         NSString *popupMsg = @"";
 
         if (idx == 0) {
-            if (sender.isOn) {
-                popupTitle = @"🔑 Identificadores Aplicados";
-                popupMsg = [NSString stringWithFormat:@"Se activó el aislamiento de IDs en este contenedor:\n\n• IDFV: %@\n• BootUUID: %@\n• iCloud Token: %@",
-                            self.profile[@"idfv"], self.profile[@"bootSessionUUID"], self.profile[@"cloudUUID"]];
-            } else {
-                popupTitle = @"⚪ Identificadores Desactivados";
-                popupMsg = @"Este contenedor usará los UUIDs originales del sistema.";
-            }
+            popupTitle = sender.isOn ? @"🔑 Identificadores Aplicados" : @"⚪ Identificadores Desactivados";
+            popupMsg = sender.isOn
+                ? [NSString stringWithFormat:@"Aislamiento de IDs activo:\n\n• IDFV: %@\n• BootUUID: %@", self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
+                : @"Usando UUIDs nativos del sistema.";
         } else if (idx == 1) {
             if (sender.isOn) {
-                NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
-                NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
-                NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0", @"192.168.10"];
-                NSString *oui = ouis[seed % ouis.count];
-                NSString *ssidPref = ssidPrefixes[(seed >> 3) % ssidPrefixes.count];
-                NSString *subnet = subnets[(seed >> 5) % subnets.count];
-
-                self.profile[@"bssid"] = [NSString stringWithFormat:@"%@:%02x:%02x:%02x",
-                                          oui, (unsigned int)((seed >> 8) & 0xFF), (unsigned int)((seed >> 16) & 0xFF), (unsigned int)((seed >> 24) & 0xFF)];
-                self.profile[@"ssid"] = [NSString stringWithFormat:@"%@-%02X-5G", ssidPref, (unsigned int)(seed & 0xFF)];
-                self.profile[@"localIP"] = [NSString stringWithFormat:@"%@.%d", subnet, 12 + (int)(seed % 230)];
-
-                popupTitle = @"📡 Red Local y Anti-VPN Aplicados";
-                popupMsg = [NSString stringWithFormat:@"Se asignó una nueva red doméstica exclusiva a este contenedor y se ocultó el túnel VPN:\n\n• IP Local (en0): %@\n• Máscara LAN: 255.255.255.0\n• Wi-Fi SSID: %@\n• Router BSSID: %@\n• Túnel utun/Proxy: Oculto",
-                            self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]];
+                BOOL isCell = [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"];
+                if (isCell) {
+                    self.profile[@"cellularIP"] = [NSString stringWithFormat:@"100.%d.%d.%d", 64 + (int)(seed % 30), 1 + (int)((seed >> 4) % 250), 2 + (int)((seed >> 8) % 250)];
+                    popupTitle = @"📱 Modo 4G Móvil Puro Aplicado";
+                    popupMsg = [NSString stringWithFormat:@"Coherencia con Proxy Móvil activada:\n\n• Wi-Fi Simulado: Apagado (NULL)\n• Interfaz Celular: pdp_ip0 (%@)\n• Operadora: %@ 4G LTE\n• Túnel VPN utun: Oculto",
+                                self.profile[@"cellularIP"], self.profile[@"CarrierName"] ?: @"T-Mobile"];
+                } else {
+                    NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2"];
+                    NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR"];
+                    NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50"];
+                    self.profile[@"bssid"] = [NSString stringWithFormat:@"%@:%02x:%02x:%02x",
+                                              ouis[seed % ouis.count], (unsigned int)((seed >> 8) & 0xFF), (unsigned int)((seed >> 16) & 0xFF), (unsigned int)((seed >> 24) & 0xFF)];
+                    self.profile[@"ssid"] = [NSString stringWithFormat:@"%@-%02X-5G", ssidPrefixes[(seed >> 3) % ssidPrefixes.count], (unsigned int)(seed & 0xFF)];
+                    self.profile[@"localIP"] = [NSString stringWithFormat:@"%@.%d", subnets[(seed >> 5) % subnets.count], 12 + (int)(seed % 230)];
+                    popupTitle = @"🛜 Modo Wi-Fi Residencial Aplicado";
+                    popupMsg = [NSString stringWithFormat:@"Coherencia con Proxy Residencial activada:\n\n• IP LAN (en0): %@\n• Wi-Fi SSID: %@\n• Router BSSID: %@\n• Túnel VPN utun: Oculto",
+                                self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]];
+                }
             } else {
-                popupTitle = @"⚪ Spoof de Red Local Desactivado";
-                popupMsg = [NSString stringWithFormat:@"Se mostrará la red real del teléfono (%@).", self.parentRoot.realLocalIP ?: @"LAN"];
+                popupTitle = @"⚪ Spoof de Red Desactivado";
+                popupMsg = @"Mostrando red real del teléfono.";
             }
         } else if (idx == 2) {
-            if (sender.isOn) {
-                popupTitle = @"🌎 Ubicación de Red Aplicada";
-                popupMsg = [NSString stringWithFormat:@"Huso horario e idioma anclados al contenedor:\n\n• Región: %@\n• Zona Horaria: %@\n• Idioma/Locale: %@",
-                            self.profile[@"cityCountry"] ?: @"Sincronizado", self.profile[@"timeZone"], self.profile[@"localeID"]];
-            } else {
-                popupTitle = @"⚪ Ubicación de Red Desactivada";
-                popupMsg = @"El contenedor usará el reloj e idioma reales del iPhone.";
-            }
+            popupTitle = sender.isOn ? @"🌎 Ubicación de Red Aplicada" : @"⚪ Ubicación de Red Desactivada";
+            popupMsg = sender.isOn
+                ? [NSString stringWithFormat:@"• Región: %@\n• Zona Horaria: %@\n• Idioma: %@", self.profile[@"cityCountry"], self.profile[@"timeZone"], self.profile[@"localeID"]]
+                : @"Usando reloj e idioma reales del iPhone.";
         } else if (idx == 3) {
             if (sender.isOn) {
                 [self refreshPurePhoneTelemetryValuesOnly];
@@ -1393,17 +1408,17 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
                 int volPct = (int)([self.profile[@"audioVolume"] floatValue] * 100.0f);
                 int briPct = (int)([self.profile[@"brightness"] floatValue] * 100.0f);
                 popupTitle = @"🔋 Datos Puros del Teléfono Aplicados";
-                popupMsg = [NSString stringWithFormat:@"Se renovaron las métricas físicas para este contenedor:\n\n• Batería: %d%% (Desconectado)\n• Volumen de Audio: %d%%\n• Brillo de Pantalla: %d%%\n• Espacio Libre: %.2f GB\n• Dispositivo: %@ (Build %@)",
-                            batPct, volPct, briPct, freeGB, self.profile[@"deviceName"], self.profile[@"osBuild"]];
+                popupMsg = [NSString stringWithFormat:@"Métricas renovadas (sin alterar el Build de iOS):\n\n• Batería: %d%%\n• Volumen: %d%%\n• Brillo: %d%%\n• Espacio Libre: %.2f GB",
+                            batPct, volPct, briPct, freeGB];
             } else {
                 popupTitle = @"⚪ Datos de Hardware Desactivados";
-                popupMsg = @"El contenedor reportará la batería, volumen y almacenamiento reales del iPhone.";
+                popupMsg = @"Reportando batería, volumen y disco reales.";
             }
         } else if (idx == 4) {
             popupTitle = sender.isOn ? @"🛡️ Escudo Anti-Jailbreak Aplicado" : @"⚪ Escudo Anti-Jailbreak Desactivado";
             popupMsg = sender.isOn
-                ? @"Se activó la ocultación de /var/jb, palera1n, Choicy, variables de entorno de Crane y librerías dyld/dladdr."
-                : @"Se desactivó el filtro de rutas de Jailbreak en este contenedor.";
+                ? @"Rutas /var/jb, palera1n y librerías dyld/dladdr ocultas."
+                : @"Filtro de rutas de Jailbreak desactivado.";
         }
 
         [self saveCurrentProfile];
@@ -1417,9 +1432,9 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
     }
 }
 
+// Solo actualiza sensores puros (Batería, Volumen, Brillo, Disco, Uptime) SIN tocar osBuild
 - (void)refreshPurePhoneTelemetryValuesOnly {
     uint64_t seed = randomSeedPrefs64(self.containerUUID);
-    NSArray *osBuilds = @[@"20G75", @"20G81", @"20H19", @"20H30", @"20F66"];
     unsigned long long freeBytes = ((14200ULL + (seed % 32000ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
 
     self.profile[@"batteryLevel"] = @(0.26f + ((seed % 66) / 100.0f));
@@ -1428,8 +1443,6 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
     self.profile[@"freeBytes"] = @(freeBytes);
     self.profile[@"uptimeOffset"] = @(1800 + (NSUInteger)(seed % 82000));
     self.profile[@"pasteboardCount"] = @(4 + (seed % 95));
-    self.profile[@"osBuild"] = osBuilds[(seed >> 7) % osBuilds.count];
-    self.profile[@"deviceName"] = [NSString stringWithFormat:@"iPhone-%02X", (unsigned int)(seed & 0xFF)];
 }
 
 - (void)refreshPurePhoneTelemetryWithPopup {
@@ -1444,10 +1457,36 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
     NSUInteger upMin = [self.profile[@"uptimeOffset"] unsignedIntegerValue] / 60;
 
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔋 Datos Puros del Teléfono Renovados"
-                                                                message:[NSString stringWithFormat:@"Se actualizaron los sensores de \"%@\" sin alterar su IDFV:\n\n• Batería Simulada: %d%%\n• Volumen de Audio: %d%%\n• Brillo de Pantalla: %d%%\n• Espacio Libre: %.2f GB\n• Uptime / Arranque: +%lu min\n• Nombre / Build: %@ (%@)",
-                                                                         self.profile[@"containerName"], batPct, volPct, briPct, freeGB, (unsigned long)upMin, self.profile[@"deviceName"], self.profile[@"osBuild"]]
+                                                                message:[NSString stringWithFormat:@"Sensores actualizados en \"%@\" (conservando iOS Build nativo e IDFV):\n\n• Batería Simulada: %d%%\n• Volumen de Audio: %d%%\n• Brillo de Pantalla: %d%%\n• Espacio Libre: %.2f GB\n• Uptime / Arranque: +%lu min",
+                                                                         self.profile[@"containerName"], batPct, volPct, briPct, freeGB, (unsigned long)upMin]
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"Perfecto" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)showNetworkCoherenceSelector {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Modo de Coherencia de Red"
+                                                                message:@"Elige según el tipo de Proxy que uses en este contenedor para no generar contradicciones:"
+                                                         preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray *presets = @[
+        @{@"title": @"📱 Proxy Móvil 4G: T-Mobile US (Apaga Wi-Fi, usa pdp_ip0)", @"mode": @"CELLULAR", @"name": @"T-Mobile", @"mcc": @"310", @"mnc": @"260", @"iso": @"us"},
+        @{@"title": @"📱 Proxy Móvil 4G: AT&T US (Apaga Wi-Fi, usa pdp_ip0)", @"mode": @"CELLULAR", @"name": @"AT&T", @"mcc": @"310", @"mnc": @"410", @"iso": @"us"},
+        @{@"title": @"📱 Proxy Móvil 4G: Verizon US (Apaga Wi-Fi, usa pdp_ip0)", @"mode": @"CELLULAR", @"name": @"Verizon", @"mcc": @"311", @"mnc": @"480", @"iso": @"us"},
+        @{@"title": @"🛜 Proxy Residencial / ISP Fijo (Activa Wi-Fi LAN en0)", @"mode": @"WIFI_ONLY", @"name": @"Wi-Fi", @"mcc": @"", @"mnc": @"", @"iso": @"us"}
+    ];
+
+    for (NSDictionary *p in presets) {
+        [ac addAction:[UIAlertAction actionWithTitle:p[@"title"] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            self.profile[@"CarrierMode"] = p[@"mode"];
+            self.profile[@"CarrierName"] = p[@"name"];
+            self.profile[@"CarrierMCC"] = p[@"mcc"];
+            self.profile[@"CarrierMNC"] = p[@"mnc"];
+            self.profile[@"CarrierISO"] = p[@"iso"];
+            [self saveCurrentProfile];
+            [self.tableView reloadData];
+        }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:ac animated:YES completion:nil];
 }
 
@@ -1455,8 +1494,9 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
     if (indexPath.section == 0) {
-        if (indexPath.row == 1) [self syncWithLiveIPAndAuditVPS:NO];
-        else if (indexPath.row == 2) [self syncWithLiveIPAndAuditVPS:YES];
+        if (indexPath.row == 1) [self showNetworkCoherenceSelector];
+        else if (indexPath.row == 2) [self syncWithLiveIPAndAuditVPS:NO];
+        else if (indexPath.row == 3) [self syncWithLiveIPAndAuditVPS:YES];
         return;
     }
 
@@ -1539,9 +1579,10 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
         if (!sendToVPS) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self.tableView reloadData];
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"IP y Ubicación Sincronizadas"
-                                                                            message:[NSString stringWithFormat:@"• Contenedor: %@\n• IP: %@\n• ISP: %@\n• Ubicación fijada: %@, %@ (%@)\n• Zona Horaria: %@",
-                                                                                     self.profile[@"containerName"], ip, ispRaw, city, region, [cc uppercaseString], tz]
+                BOOL isCell = [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"];
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"IP y Coherencia Sincronizadas"
+                                                                            message:[NSString stringWithFormat:@"• Contenedor: %@\n• IP: %@\n• ISP: %@\n• Modo Aplicado: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
+                                                                                     self.profile[@"containerName"], ip, ispRaw, isCell ? @"4G Móvil (Wi-Fi Apagado / pdp_ip0)" : @"Wi-Fi Residencial (en0)", city, region, [cc uppercaseString], tz]
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
