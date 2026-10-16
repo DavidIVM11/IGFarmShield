@@ -1,7 +1,5 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <QuartzCore/QuartzCore.h>
-#import <CoreFoundation/CoreFoundation.h>
 #import <CFNetwork/CFNetwork.h>
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <CoreTelephony/CTCarrier.h>
@@ -9,6 +7,9 @@
 #import <DeviceCheck/DeviceCheck.h>
 #import <SystemConfiguration/CaptiveNetwork.h>
 #import <AVFoundation/AVFoundation.h>
+#import <ifaddrs.h>
+#import <arpa/inet.h>
+#import <net/if.h>
 #import <sys/sysctl.h>
 #import <sys/mount.h>
 #import <mach-o/dyld.h>
@@ -130,12 +131,8 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
 
     NSMutableArray *sources = [NSMutableArray array];
     for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
-        CFPreferencesAppSynchronize((__bridge CFStringRef)domain);
-        CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, (__bridge CFStringRef)domain, CFSTR("mobile"), kCFPreferencesAnyHost);
-        if (cfDict) {
-            NSDictionary *d = CFBridgingRelease(cfDict);
-            if ([d count] > 0) [sources addObject:d];
-        }
+        NSDictionary *ud = [[[NSUserDefaults alloc] initWithSuiteName:domain] dictionaryRepresentation];
+        if ([ud count] > 0) [sources addObject:ud];
     }
     for (NSString *pPath in @[CRANE_MAIN_JB, CRANE_MAIN_VAR, CRANE_PREFS_JB, CRANE_PREFS_VAR]) {
         NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
@@ -213,7 +210,6 @@ static NSMutableDictionary *getContainerProfile() {
         } else if (![craneID isEqualToString:keyUUID] &&
                    [byUUID[craneID] isKindOfClass:[NSDictionary class]] &&
                    byUUID[craneID][@"idfv"]) {
-            // Migrar perfil pre-creado en Crane cuando se abre la app por primera vez
             profile = [byUUID[craneID] mutableCopy];
             [byUUID removeObjectForKey:craneID];
         }
@@ -450,7 +446,6 @@ static void showStartupBanner() {
     int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
     UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(16, 44, keyWin.bounds.size.width - 32, 42)];
-    toast.layer.cornerRadius = 10.0;
     toast.clipsToBounds = YES;
     toast.textAlignment = NSTextAlignmentCenter;
     toast.font = [UIFont boldSystemFontOfSize:11.5];
