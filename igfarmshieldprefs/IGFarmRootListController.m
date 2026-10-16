@@ -24,6 +24,11 @@ extern char **environ;
 @interface PSViewController : UIViewController
 @end
 
+@interface LSApplicationProxy : NSObject
++ (instancetype)applicationProxyForIdentifier:(NSString *)identifier;
+@property (nonatomic, readonly) NSURL *dataContainerURL;
+@end
+
 @class IGFarmRootListController;
 
 static UIImage *settingsBadgeIcon(NSString *symbolName, UIColor *bgColor) {
@@ -79,22 +84,16 @@ static void killAppProcess(NSString *procName) {
     posix_spawn(&pid, args[0], NULL, NULL, (char *const *)args, environ);
 }
 
-static BOOL nodeMentionsString(id node, NSString *needle) {
-    if (!node || !needle) return NO;
-    if ([node isKindOfClass:[NSString class]]) {
-        return [(NSString *)node rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
-    }
-    if ([node isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *d = (NSDictionary *)node;
-        for (id k in d) {
-            if (nodeMentionsString(k, needle) || nodeMentionsString(d[k], needle)) return YES;
-        }
-    } else if ([node isKindOfClass:[NSArray class]]) {
-        for (id item in (NSArray *)node) {
-            if (nodeMentionsString(item, needle)) return YES;
+static NSString *liveDataContainerPathForBundle(NSString *bundleID) {
+    Class proxyCls = NSClassFromString(@"LSApplicationProxy");
+    if (proxyCls && [proxyCls respondsToSelector:@selector(applicationProxyForIdentifier:)]) {
+        LSApplicationProxy *proxy = [proxyCls applicationProxyForIdentifier:bundleID];
+        NSURL *url = [proxy respondsToSelector:@selector(dataContainerURL)] ? proxy.dataContainerURL : nil;
+        if (url && url.path.length > 0) {
+            return url.path;
         }
     }
-    return NO;
+    return nil;
 }
 
 static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
@@ -556,8 +555,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     self.choicyDetailReport = [NSString stringWithFormat:
         @"• Choicy en Instagram: %@\n"
         @"• Choicy en Reddit: %@\n"
-        @"• Modo Manual Estricto: Todos los contenedores permanecen en pausa hasta que los actives manualmente.\n"
-        @"• Blindaje en C activo: access(), stat(), lstat(), getifaddrs() y bloqueo de alertas Apple ID.",
+        @"• Modo Manual Estricto: Todos los contenedores nacen en pausa hasta que los enciendas manualmente.\n"
+        @"• Blindaje C/Kernel: access(), stat(), lstat(), getifaddrs() y bloqueo de popup Apple ID activos.",
         igOK ? @"✅ Activo" : @"⚠️ No configurado",
         rdOK ? @"✅ Activo" : @"⚠️ No configurado"];
 }
@@ -694,7 +693,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     killAppProcess([bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
 }
 
-// Todo contenedor nuevo nace con enabled = NO (pausa manual) y con un IDFV único generado por contenedor
 - (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path allowEnableDefault:(BOOL)allowEnable forceRotate:(BOOL)rotate {
     if (!bundleID) bundleID = @"com.burbn.instagram";
     if (!uuid || uuid.length == 0) uuid = craneID ?: @"Default";
@@ -737,7 +735,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     NSString *cleanCraneName = (dName && dName.length > 0) ? dName : @"Default";
 
     if (!profile || !profile[@"idfv"] || rotate) {
-        // Respeta el estado anterior si ya existía, pero si es nuevo nace SIEMPRE DESACTIVADO (NO)
+        // Todo contenedor nuevo nace SIEMPRE en pausa (@NO) hasta que lo actives manualmente
         BOOL wasEnabled = (profile && profile[@"enabled"] != nil) ? [profile[@"enabled"] boolValue] : NO;
 
         uint64_t seed = randomSeedPrefs64(uuid);
@@ -809,7 +807,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     return profile;
 }
 
-// Escaneo estricto basado en carpetas existentes en disco (NUNCA crea contenedores vacíos desde cachés viejas)
 - (void)scanAndSyncAllContainers {
     self.igContainersList = [NSMutableArray array];
     self.redditContainersList = [NSMutableArray array];
@@ -824,7 +821,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }
     }
 
-    // 1. Leer los nombres configurados en Crane (solo para ponerle su nombre a las carpetas reales)
     NSMutableArray *craneSources = [NSMutableArray array];
     for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
         CFPreferencesAppSynchronize((__bridge CFStringRef)domain);
@@ -873,13 +869,28 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [igCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
     [rdCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
 
-    // 2. Clasificar únicamente las carpetas que existen físicamente en /var/mobile/Containers/Data/Application
     NSString *appsDir = @"/var/mobile/Containers/Data/Application";
     NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
 
     NSMutableDictionary *bestDefaultFolderByApp = [NSMutableDictionary dictionary];
     NSMutableDictionary *bestDefaultDateByApp = [NSMutableDictionary dictionary];
     NSMutableArray *secondaryFolders = [NSMutableArray array];
+
+    // Consultar a LaunchServices cuál es el contenedor activo principal de cada app
+    for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
+        NSString *livePath = liveDataContainerPathForBundle(bID);
+        if (livePath && [fm fileExistsAtPath:livePath]) {
+            NSString *fUUID = [livePath lastPathComponent];
+            if (fUUID.length > 0 && ![hiddenSet containsObject:[fUUID lowercaseString]]) {
+                bestDefaultFolderByApp[bID] = @{
+                    @"folderUUID": fUUID,
+                    @"fullPath": livePath,
+                    @"bundleID": bID
+                };
+                bestDefaultDateByApp[bID] = [NSDate date];
+            }
+        }
+    }
 
     for (NSString *folderUUID in uuids) {
         if ([hiddenSet containsObject:[folderUUID lowercaseString]]) continue;
@@ -924,17 +935,19 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                           (!detectedName || [detectedName caseInsensitiveCompare:@"default"] == NSOrderedSame));
 
         if (isDefault) {
-            NSDictionary *fAttrs = [fm attributesOfItemAtPath:[fullPath stringByAppendingPathComponent:@"Library"] error:nil]
-                                ?: [fm attributesOfItemAtPath:fullPath error:nil];
-            NSDate *modDate = fAttrs[NSFileModificationDate] ?: [NSDate distantPast];
-            NSDate *prevDate = bestDefaultDateByApp[bundleID];
-            if (!prevDate || [modDate compare:prevDate] == NSOrderedDescending) {
-                bestDefaultDateByApp[bundleID] = modDate;
-                bestDefaultFolderByApp[bundleID] = @{
-                    @"folderUUID": folderUUID,
-                    @"fullPath": fullPath,
-                    @"bundleID": bundleID
-                };
+            if (!bestDefaultFolderByApp[bundleID]) {
+                NSDictionary *fAttrs = [fm attributesOfItemAtPath:[fullPath stringByAppendingPathComponent:@"Library"] error:nil]
+                                    ?: [fm attributesOfItemAtPath:fullPath error:nil];
+                NSDate *modDate = fAttrs[NSFileModificationDate] ?: [NSDate distantPast];
+                NSDate *prevDate = bestDefaultDateByApp[bundleID];
+                if (!prevDate || [modDate compare:prevDate] == NSOrderedDescending) {
+                    bestDefaultDateByApp[bundleID] = modDate;
+                    bestDefaultFolderByApp[bundleID] = @{
+                        @"folderUUID": folderUUID,
+                        @"fullPath": fullPath,
+                        @"bundleID": bundleID
+                    };
+                }
             }
         } else {
             [secondaryFolders addObject:@{
@@ -947,7 +960,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }
     }
 
-    // 3. Registrar el contenedor Default físico de cada app y sus subcarpetas reales ___Crane_Containers
     for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
         NSDictionary *defInfo = bestDefaultFolderByApp[bID];
         if (!defInfo) continue;
@@ -1002,7 +1014,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }
     }
 
-    // 4. Registrar carpetas secundarias físicas de Data/Application
     for (NSDictionary *sec in secondaryFolders) {
         NSString *bundleID = sec[@"bundleID"];
         NSString *folderUUID = sec[@"folderUUID"];
@@ -1070,7 +1081,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [self.igContainersList sortUsingComparator:sortBlock];
     [self.redditContainersList sortUsingComparator:sortBlock];
 
-    // 5. Purgar de state.plist cualquier contenedor que no exista físicamente en la lista activa
     NSMutableSet *activeProfileKeys = [NSMutableSet set];
     for (NSDictionary *p in self.igContainersList) { if (p[@"containerUUID"]) [activeProfileKeys addObject:p[@"containerUUID"]]; }
     for (NSDictionary *p in self.redditContainersList) { if (p[@"containerUUID"]) [activeProfileKeys addObject:p[@"containerUUID"]]; }
@@ -1296,7 +1306,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Interfaz de Túnel Local (Shadowrocket)";
             cell.detailTextLabel.text = self.vpnActive
-                ? [NSString stringWithFormat:@"Túnel %@ activo • Enmascarado como en0 ante las apps", self.vpnInterfaceName]
+                ? [NSString stringWithFormat:@"Túnel %@ activo • Enmascarado ante las apps", self.vpnInterfaceName]
                 : @"Sin túnel VPN activo (La IP se verifica dentro de cada contenedor)";
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
