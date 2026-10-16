@@ -1,15 +1,10 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <CFNetwork/CFNetwork.h>
-#import <LocalAuthentication/LocalAuthentication.h>
 #import <CoreTelephony/CTCarrier.h>
 #import <CoreTelephony/CTTelephonyNetworkInfo.h>
-#import <DeviceCheck/DeviceCheck.h>
 #import <SystemConfiguration/CaptiveNetwork.h>
 #import <AVFoundation/AVFoundation.h>
-#import <ifaddrs.h>
-#import <arpa/inet.h>
-#import <net/if.h>
 #import <sys/sysctl.h>
 #import <sys/mount.h>
 #import <mach-o/dyld.h>
@@ -24,7 +19,7 @@
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
-#define CURRENT_SCHEMA_VERSION 15
+#define CURRENT_SCHEMA_VERSION 16
 
 static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
@@ -199,22 +194,27 @@ static NSMutableDictionary *getContainerProfile() {
         NSMutableDictionary *profile = nil;
         NSDictionary *diskLoaded = [NSDictionary dictionaryWithContentsOfFile:localPlist];
 
-        if ([diskLoaded isKindOfClass:[NSDictionary class]] &&
-            [diskLoaded[@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION &&
-            diskLoaded[@"idfv"]) {
+        if ([diskLoaded isKindOfClass:[NSDictionary class]] && diskLoaded[@"idfv"]) {
             profile = [diskLoaded mutableCopy];
-        } else if ([byUUID[keyUUID] isKindOfClass:[NSDictionary class]] &&
-                   [byUUID[keyUUID][@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION &&
-                   byUUID[keyUUID][@"idfv"]) {
+        } else if ([byUUID[keyUUID] isKindOfClass:[NSDictionary class]] && byUUID[keyUUID][@"idfv"]) {
             profile = [byUUID[keyUUID] mutableCopy];
-        } else if (![craneID isEqualToString:keyUUID] &&
-                   [byUUID[craneID] isKindOfClass:[NSDictionary class]] &&
-                   byUUID[craneID][@"idfv"]) {
-            profile = [byUUID[craneID] mutableCopy];
-            [byUUID removeObjectForKey:craneID];
+        } else {
+            for (NSString *existingKey in [byUUID allKeys]) {
+                if ([existingKey caseInsensitiveCompare:keyUUID] == NSOrderedSame ||
+                    [existingKey caseInsensitiveCompare:craneID] == NSOrderedSame) {
+                    NSDictionary *cand = byUUID[existingKey];
+                    if ([cand isKindOfClass:[NSDictionary class]] && [cand[@"bundleID"] isEqualToString:bundleID] && cand[@"idfv"]) {
+                        profile = [cand mutableCopy];
+                        if (![existingKey isEqualToString:keyUUID]) {
+                            [byUUID removeObjectForKey:existingKey];
+                        }
+                        break;
+                    }
+                }
+            }
         }
 
-        NSDictionary *stCopy = [byUUID[keyUUID] isKindOfClass:[NSDictionary class]] ? byUUID[keyUUID] : byUUID[craneID];
+        NSDictionary *stCopy = [byUUID[keyUUID] isKindOfClass:[NSDictionary class]] ? byUUID[keyUUID] : nil;
         if (profile && [stCopy isKindOfClass:[NSDictionary class]]) {
             for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"ssid", @"bssid", @"idfv", @"bootSessionUUID", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness"]) {
                 if (stCopy[k] != nil) profile[k] = stCopy[k];
@@ -226,6 +226,17 @@ static NSMutableDictionary *getContainerProfile() {
             : (([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString]);
 
         if (!profile || !profile[@"idfv"]) {
+            BOOL exclusive = globalSt[@"exclusiveMode"] ? [globalSt[@"exclusiveMode"] boolValue] : YES;
+            BOOL hasActiveInApp = NO;
+            for (NSString *k in byUUID) {
+                NSDictionary *p = byUUID[k];
+                if ([p isKindOfClass:[NSDictionary class]] && [p[@"bundleID"] isEqualToString:bundleID] && [p[@"enabled"] boolValue]) {
+                    hasActiveInApp = YES;
+                    break;
+                }
+            }
+            BOOL enableByDefault = (!exclusive || !hasActiveInApp);
+
             uint64_t seed = randomSeed64(keyUUID);
             NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
             NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
@@ -248,7 +259,7 @@ static NSMutableDictionary *getContainerProfile() {
                 @"containerName": craneName,
                 @"bundleID": bundleID,
                 @"path": homePath,
-                @"enabled": @YES,
+                @"enabled": @(enableByDefault),
                 @"spoofIDs": @YES,
                 @"spoofNetwork": @YES,
                 @"spoofLocation": @YES,
@@ -376,38 +387,115 @@ static void applyAutomaticNetworkCoherenceToProfile(NSMutableDictionary *prof, N
     }
 }
 
+static void fetchLiveIPCascadeTweak(NSArray<NSString *> *urls, NSUInteger idx, void (^completion)(NSDictionary *parsed)) {
+    if (idx >= urls.count) return;
+    NSURL *url = [NSURL URLWithString:urls[idx]];
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    cfg.URLCache = nil;
+    cfg.timeoutIntervalForRequest = 7.0;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X)" forHTTPHeaderField:@"User-Agent"];
+
+    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        if (!data || err) {
+            fetchLiveIPCascadeTweak(urls, idx + 1, completion);
+            return;
+        }
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![json isKindOfClass:[NSDictionary class]]) {
+            fetchLiveIPCascadeTweak(urls, idx + 1, completion);
+            return;
+        }
+
+        NSString *ip = nil;
+        NSString *isp = nil;
+        NSString *cc = nil;
+        NSString *city = nil;
+        NSString *region = nil;
+        NSString *tz = nil;
+        BOOL isMobile = NO;
+
+        if (json[@"ip"] && [json[@"success"] boolValue]) {
+            ip = json[@"ip"];
+            NSDictionary *conn = [json[@"connection"] isKindOfClass:[NSDictionary class]] ? json[@"connection"] : @{};
+            NSDictionary *tzD = [json[@"timezone"] isKindOfClass:[NSDictionary class]] ? json[@"timezone"] : @{};
+            isp = conn[@"isp"] ?: (conn[@"org"] ?: @"ISP");
+            cc = json[@"country_code"];
+            city = json[@"city"];
+            region = json[@"region"];
+            tz = tzD[@"id"];
+        } else if (json[@"ip"] && json[@"country_code"] && !json[@"error"]) {
+            ip = json[@"ip"];
+            isp = json[@"org"] ?: @"ISP";
+            cc = json[@"country_code"];
+            city = json[@"city"];
+            region = json[@"region"];
+            tz = json[@"timezone"];
+        } else if (json[@"ip"] && json[@"country"] && json[@"timezone"]) {
+            ip = json[@"ip"];
+            isp = json[@"org"] ?: @"ISP";
+            cc = json[@"country"];
+            city = json[@"city"];
+            region = json[@"region"];
+            tz = json[@"timezone"];
+        } else if ([json[@"status"] isEqualToString:@"success"] && json[@"query"]) {
+            ip = json[@"query"];
+            isp = json[@"isp"] ?: @"ISP";
+            cc = json[@"countryCode"];
+            city = json[@"city"];
+            region = json[@"regionName"];
+            tz = json[@"timezone"];
+            isMobile = [json[@"mobile"] boolValue];
+        }
+
+        if (ip && ip.length > 0 && tz && tz.length > 0) {
+            if (completion) {
+                completion(@{
+                    @"ip": ip,
+                    @"isp": isp ?: @"ISP",
+                    @"cc": [cc ?: @"us" lowercaseString],
+                    @"city": city ?: @"",
+                    @"region": region ?: @"",
+                    @"tz": tz ?: @"America/New_York",
+                    @"mobile": @(isMobile)
+                });
+            }
+        } else {
+            fetchLiveIPCascadeTweak(urls, idx + 1, completion);
+        }
+    }] resume];
+}
+
 static void syncContainerWithLiveIP() {
     if (!isModuleActive(@"spoofNetwork")) return;
 
-    NSURL *httpsUrl = [NSURL URLWithString:@"https://ipwho.is/"];
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    cfg.timeoutIntervalForRequest = 6.0;
-    cfg.URLCache = nil;
-    cfg.HTTPCookieStorage = nil;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+    NSArray *endpoints = @[
+        @"https://ipwho.is/",
+        @"https://ipapi.co/json/",
+        @"https://ipinfo.io/json",
+        @"http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,timezone,isp,mobile,query"
+    ];
 
-    [[session dataTaskWithURL:httpsUrl completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if (!data || err) return;
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (![json isKindOfClass:[NSDictionary class]] || ![json[@"success"] boolValue]) return;
-
-        NSString *ip = json[@"ip"] ?: @"";
-        NSDictionary *conn = [json[@"connection"] isKindOfClass:[NSDictionary class]] ? json[@"connection"] : @{};
-        NSDictionary *tzDict = [json[@"timezone"] isKindOfClass:[NSDictionary class]] ? json[@"timezone"] : @{};
-        NSString *ispRaw = conn[@"isp"] ?: (conn[@"org"] ?: @"ISP");
-        NSString *cc = [json[@"country_code"] lowercaseString] ?: @"us";
-        NSString *city = json[@"city"] ?: @"";
-        NSString *region = json[@"region"] ?: @"";
-        NSString *tz = tzDict[@"id"] ?: @"America/New_York";
-
+    fetchLiveIPCascadeTweak(endpoints, 0, ^(NSDictionary *parsed) {
+        if (!parsed) return;
         NSMutableDictionary *prof = getContainerProfile();
         if (!prof) return;
         NSString *localPlist = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
 
-        applyAutomaticNetworkCoherenceToProfile(prof, ip, ispRaw, cc, city, region, tz, NO);
+        applyAutomaticNetworkCoherenceToProfile(prof,
+                                                parsed[@"ip"],
+                                                parsed[@"isp"],
+                                                parsed[@"cc"],
+                                                parsed[@"city"],
+                                                parsed[@"region"],
+                                                parsed[@"tz"],
+                                                [parsed[@"mobile"] boolValue]);
 
         if (isModuleActive(@"spoofLocation")) {
-            applyLowLevelCTimeZone(tz);
+            applyLowLevelCTimeZone(parsed[@"tz"]);
         }
 
         [prof writeToFile:localPlist atomically:YES];
@@ -420,7 +508,7 @@ static void syncContainerWithLiveIP() {
             gSt[@"containersByUUID"] = byUUID;
             [gSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
         }
-    }] resume];
+    });
 }
 
 static void showStartupBanner() {
@@ -512,21 +600,6 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
     }
     return ret;
 }
-
-%hook DCDevice
-- (BOOL)isSupported {
-    if (!isModuleActive(@"spoofSecurity")) return %orig;
-    return NO;
-}
-%end
-
-%hook LAContext
-- (BOOL)canEvaluatePolicy:(LAPolicy)policy error:(NSError * __autoreleasing *)error {
-    if (!isModuleActive(@"spoofSecurity")) return %orig;
-    if (error) *error = nil;
-    return YES;
-}
-%end
 
 %hook UIApplication
 - (BOOL)isProtectedDataAvailable {
