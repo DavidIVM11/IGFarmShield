@@ -6,6 +6,7 @@
 #import <CoreTelephony/CTTelephonyNetworkInfo.h>
 #import <DeviceCheck/DeviceCheck.h>
 #import <SystemConfiguration/CaptiveNetwork.h>
+#import <SystemConfiguration/SCNetworkReachability.h>
 #import <AVFoundation/AVFoundation.h>
 #import <ifaddrs.h>
 #import <arpa/inet.h>
@@ -24,7 +25,7 @@
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
-#define CURRENT_SCHEMA_VERSION 10
+#define CURRENT_SCHEMA_VERSION 11
 
 static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
@@ -35,15 +36,18 @@ static NSDictionary *getGlobalState() {
     return [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST] ?: @{};
 }
 
-static uint64_t fnv1aHash(NSString *input) {
+static uint64_t randomSeed64(NSString *salt) {
     uint64_t hash = 14695981039346656037ULL;
-    const char *bytes = [input UTF8String];
-    if (!bytes) return arc4random();
-    while (*bytes) {
-        hash ^= (uint8_t)(*bytes++);
-        hash *= 1099511628211ULL;
+    const char *bytes = [salt UTF8String];
+    if (bytes) {
+        while (*bytes) {
+            hash ^= (uint8_t)(*bytes++);
+            hash *= 1099511628211ULL;
+        }
     }
-    return hash;
+    uint64_t r = 0;
+    arc4random_buf(&r, sizeof(r));
+    return hash ^ r;
 }
 
 static void applyLowLevelCTimeZone(NSString *tzName) {
@@ -118,12 +122,8 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
         }
     }
 
-    if (!craneID && origCraneIDFV && origCraneIDFV.length > 0) {
-        craneID = origCraneIDFV;
-    }
-    if (!craneID) {
-        craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
-    }
+    if (!craneID && origCraneIDFV && origCraneIDFV.length > 0) craneID = origCraneIDFV;
+    if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
 
     NSMutableArray *sources = [NSMutableArray array];
     for (NSString *suite in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
@@ -158,133 +158,138 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
 }
 
 static NSMutableDictionary *getContainerProfile() {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        sessionStartTimestamp = [[NSDate date] timeIntervalSince1970];
-        NSString *homePath = NSHomeDirectory();
-        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.burbn.instagram";
+    if (liveContainerProfile) return liveContainerProfile;
 
-        NSDictionary *ident = resolveCraneIdentityDict(homePath);
-        NSString *keyUUID = ident[@"keyUUID"];
-        NSString *craneID = ident[@"craneID"];
-        NSString *craneName = ident[@"craneName"];
+    sessionStartTimestamp = [[NSDate date] timeIntervalSince1970];
+    NSString *homePath = NSHomeDirectory();
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.burbn.instagram";
 
-        NSString *localPlist = [homePath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
-        NSDictionary *loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST];
-        NSMutableDictionary *globalSt = loadedGlobal ? [loadedGlobal mutableCopy] : [NSMutableDictionary dictionary];
-        NSMutableDictionary *byUUID = [globalSt[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
-            ? [globalSt[@"containersByUUID"] mutableCopy]
-            : [NSMutableDictionary dictionary];
+    NSDictionary *ident = resolveCraneIdentityDict(homePath);
+    NSString *keyUUID = ident[@"keyUUID"];
+    NSString *craneID = ident[@"craneID"];
+    NSString *craneName = ident[@"craneName"];
 
-        NSMutableDictionary *profile = nil;
-        NSDictionary *diskLoaded = [NSDictionary dictionaryWithContentsOfFile:localPlist];
+    NSString *localPlist = [homePath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
+    NSDictionary *loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST];
+    NSMutableDictionary *globalSt = loadedGlobal ? [loadedGlobal mutableCopy] : [NSMutableDictionary dictionary];
+    NSMutableDictionary *byUUID = [globalSt[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
+        ? [globalSt[@"containersByUUID"] mutableCopy]
+        : [NSMutableDictionary dictionary];
 
-        if ([diskLoaded isKindOfClass:[NSDictionary class]] &&
-            [diskLoaded[@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION &&
-            diskLoaded[@"idfv"]) {
-            profile = [diskLoaded mutableCopy];
-        } else if ([byUUID[keyUUID] isKindOfClass:[NSDictionary class]] &&
-                   [byUUID[keyUUID][@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION) {
-            profile = [byUUID[keyUUID] mutableCopy];
+    NSMutableDictionary *profile = nil;
+    NSDictionary *diskLoaded = [NSDictionary dictionaryWithContentsOfFile:localPlist];
+
+    if ([diskLoaded isKindOfClass:[NSDictionary class]] && diskLoaded[@"idfv"]) {
+        profile = [diskLoaded mutableCopy];
+    } else if ([byUUID[keyUUID] isKindOfClass:[NSDictionary class]] && byUUID[keyUUID][@"idfv"]) {
+        profile = [byUUID[keyUUID] mutableCopy];
+    }
+
+    // Sincronizar switches y parámetros editados desde Settings para este contenedor específico
+    if (profile && [byUUID[keyUUID] isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *stCopy = byUUID[keyUUID];
+        for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"ssid", @"bssid", @"idfv", @"bootSessionUUID", @"cloudUUID", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"uptimeOffset", @"osBuild", @"deviceName"]) {
+            if (stCopy[k] != nil) profile[k] = stCopy[k];
         }
+    }
 
-        if (profile && [byUUID[keyUUID] isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *stCopy = byUUID[keyUUID];
-            for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP"]) {
-                if (stCopy[k] != nil) profile[k] = stCopy[k];
-            }
+    if (!profile || !profile[@"idfv"]) {
+        uint64_t seed = randomSeed64(keyUUID);
+        NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
+        NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
+        NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0"];
+        NSArray *osBuilds = @[@"20G75", @"20G81", @"20H19", @"20H30", @"20F66"];
+
+        NSString *oui = ouis[seed % ouis.count];
+        NSString *ssidPref = ssidPrefixes[(seed >> 3) % ssidPrefixes.count];
+        NSString *subnet = subnets[(seed >> 5) % subnets.count];
+        NSString *osBuild = osBuilds[(seed >> 7) % osBuilds.count];
+
+        NSString *bssid = [NSString stringWithFormat:@"%@:%02x:%02x:%02x",
+                           oui, (unsigned int)((seed >> 8) & 0xFF), (unsigned int)((seed >> 16) & 0xFF), (unsigned int)((seed >> 24) & 0xFF)];
+        NSString *ssid = [NSString stringWithFormat:@"%@-%02X-5G", ssidPref, (unsigned int)(seed & 0xFF)];
+        NSString *localIP = [NSString stringWithFormat:@"%@.%d", subnet, 15 + (int)(seed % 220)];
+        unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
+
+        profile = [@{
+            @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
+            @"containerUUID": keyUUID,
+            @"craneIdentifier": craneID,
+            @"containerName": craneName,
+            @"bundleID": bundleID,
+            @"path": homePath,
+            @"enabled": @YES,
+            @"spoofIDs": @YES,
+            @"spoofNetwork": @YES,
+            @"spoofLocation": @YES,
+            @"spoofHardware": @YES,
+            @"spoofSecurity": @YES,
+            @"locationAnchored": @NO,
+            @"deviceModel": @"iPhone10,4",
+            @"osBuild": osBuild,
+            @"deviceName": [NSString stringWithFormat:@"iPhone-%02X", (unsigned int)(seed & 0xFF)],
+            @"craneOriginalIDFV": craneID,
+            @"idfv": [[NSUUID UUID] UUIDString],
+            @"shieldDeviceID": [[NSUUID UUID] UUIDString],
+            @"bootSessionUUID": [[NSUUID UUID] UUIDString],
+            @"cloudUUID": [[NSUUID UUID] UUIDString],
+            @"bssid": bssid,
+            @"ssid": ssid,
+            @"localIP": localIP,
+            @"freeBytes": @(freeBytes),
+            @"uptimeOffset": @(1800 + (NSUInteger)(seed % 82000)),
+            @"batteryLevel": @(0.32f + ((seed % 60) / 100.0f)),
+            @"brightness": @(0.30f + (((seed >> 4) % 60) / 100.0f)),
+            @"audioVolume": @(0.20f + (((seed >> 6) % 70) / 100.0f)),
+            @"pasteboardCount": @(5 + (seed % 90)),
+            @"lastSyncedIP": @"Sincronizando...",
+            @"ispName": @"ISP",
+            @"cityCountry": @"Sincronizando con IP...",
+            @"timeZone": @"America/New_York",
+            @"localeID": @"en_US",
+            @"CarrierMode": @"WIFI_ONLY",
+            @"CarrierName": @"ISP",
+            @"CarrierMCC": @"310",
+            @"CarrierMNC": @"260",
+            @"CarrierISO": @"us"
+        } mutableCopy];
+    } else {
+        // Variación natural de datos volátiles en cada apertura de sesión para no dejar telemetría congelada
+        uint32_t sessionJitter = arc4random_uniform(1000);
+        float prevBat = [profile[@"batteryLevel"] floatValue];
+        float newBat = prevBat + ((sessionJitter % 2 == 0) ? 0.03f : -0.04f);
+        if (newBat < 0.22f || newBat > 0.94f) newBat = 0.35f + (arc4random_uniform(55) / 100.0f);
+        profile[@"batteryLevel"] = @(newBat);
+        profile[@"audioVolume"] = @(0.20f + (arc4random_uniform(65) / 100.0f));
+        profile[@"brightness"] = @(0.28f + (arc4random_uniform(60) / 100.0f));
+        profile[@"pasteboardCount"] = @([profile[@"pasteboardCount"] integerValue] + 1 + arc4random_uniform(4));
+
+        profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
+        profile[@"containerUUID"] = keyUUID;
+        profile[@"craneIdentifier"] = craneID;
+        profile[@"bundleID"] = bundleID;
+        profile[@"path"] = homePath;
+        if (craneName && ![craneName isEqualToString:keyUUID]) {
+            profile[@"containerName"] = craneName;
         }
+    }
 
-        if (!profile || !profile[@"idfv"]) {
-            uint64_t seed = fnv1aHash(keyUUID) ^ (((uint64_t)arc4random() << 32) | arc4random());
-            NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
-            NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
-            NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0"];
-            NSArray *osBuilds = @[@"20G75", @"20G81", @"20H19", @"20H30", @"20F66"];
+    if ([profile[@"spoofLocation"] boolValue] && profile[@"timeZone"]) {
+        applyLowLevelCTimeZone(profile[@"timeZone"]);
+    }
 
-            NSString *oui = ouis[seed % ouis.count];
-            NSString *ssidPref = ssidPrefixes[(seed >> 3) % ssidPrefixes.count];
-            NSString *subnet = subnets[(seed >> 5) % subnets.count];
-            NSString *osBuild = osBuilds[(seed >> 7) % osBuilds.count];
+    [profile writeToFile:localPlist atomically:YES];
+    byUUID[keyUUID] = profile;
+    globalSt[@"containersByUUID"] = byUUID;
 
-            NSString *bssid = [NSString stringWithFormat:@"%@:%02x:%02x:%02x",
-                               oui, (unsigned int)((seed >> 8) & 0xFF), (unsigned int)((seed >> 16) & 0xFF), (unsigned int)((seed >> 24) & 0xFF)];
-            NSString *ssid = [NSString stringWithFormat:@"%@-%02X-5G", ssidPref, (unsigned int)(seed & 0xFF)];
-            NSString *localIP = [NSString stringWithFormat:@"%@.%d", subnet, 15 + (int)(seed % 220)];
-            unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
+    NSMutableDictionary *activeMap = [globalSt[@"activeInCrane"] isKindOfClass:[NSDictionary class]]
+        ? [globalSt[@"activeInCrane"] mutableCopy]
+        : [NSMutableDictionary dictionary];
+    activeMap[bundleID] = keyUUID;
+    globalSt[@"activeInCrane"] = activeMap;
+    [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
 
-            NSString *baseIDFV = (origCraneIDFV && origCraneIDFV.length >= 32) ? origCraneIDFV : [[NSUUID UUID] UUIDString];
-
-            profile = [@{
-                @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
-                @"containerUUID": keyUUID,
-                @"craneIdentifier": craneID,
-                @"containerName": craneName,
-                @"bundleID": bundleID,
-                @"path": homePath,
-                @"enabled": @YES,
-                @"spoofIDs": @YES,
-                @"spoofNetwork": @YES,
-                @"spoofLocation": @YES,
-                @"spoofHardware": @YES,
-                @"spoofSecurity": @YES,
-                @"locationAnchored": @NO,
-                @"deviceModel": @"iPhone10,4",
-                @"osBuild": osBuild,
-                @"deviceName": [NSString stringWithFormat:@"iPhone-%02X", (unsigned int)(seed & 0xFF)],
-                @"craneOriginalIDFV": craneID,
-                @"idfv": baseIDFV,
-                @"shieldDeviceID": [[NSUUID UUID] UUIDString],
-                @"bootSessionUUID": [[NSUUID UUID] UUIDString],
-                @"cloudUUID": [[NSUUID UUID] UUIDString],
-                @"bssid": bssid,
-                @"ssid": ssid,
-                @"localIP": localIP,
-                @"freeBytes": @(freeBytes),
-                @"uptimeOffset": @(1800 + (NSUInteger)(seed % 82000)),
-                @"batteryLevel": @(0.35f + ((seed % 58) / 100.0f)),
-                @"brightness": @(0.30f + (((seed >> 4) % 60) / 100.0f)),
-                @"audioVolume": @(0.20f + (((seed >> 6) % 70) / 100.0f)),
-                @"pasteboardCount": @(5 + (seed % 90)),
-                @"lastSyncedIP": @"Sincronizando...",
-                @"ispName": @"ISP",
-                @"cityCountry": @"Sincronizando con IP...",
-                @"timeZone": @"America/New_York",
-                @"localeID": @"en_US",
-                @"CarrierMode": @"WIFI_ONLY",
-                @"CarrierName": @"ISP",
-                @"CarrierMCC": @"310",
-                @"CarrierMNC": @"260",
-                @"CarrierISO": @"us"
-            } mutableCopy];
-        } else {
-            profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
-            profile[@"containerUUID"] = keyUUID;
-            profile[@"craneIdentifier"] = craneID;
-            profile[@"bundleID"] = bundleID;
-            profile[@"path"] = homePath;
-            if (craneName && ![craneName isEqualToString:keyUUID]) {
-                profile[@"containerName"] = craneName;
-            }
-        }
-
-        if ([profile[@"spoofLocation"] boolValue] && profile[@"timeZone"]) {
-            applyLowLevelCTimeZone(profile[@"timeZone"]);
-        }
-
-        [profile writeToFile:localPlist atomically:YES];
-        byUUID[keyUUID] = profile;
-        globalSt[@"containersByUUID"] = byUUID;
-
-        NSMutableDictionary *activeMap = [globalSt[@"activeInCrane"] isKindOfClass:[NSDictionary class]]
-            ? [globalSt[@"activeInCrane"] mutableCopy]
-            : [NSMutableDictionary dictionary];
-        activeMap[bundleID] = keyUUID;
-        globalSt[@"activeInCrane"] = activeMap;
-        [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
-
-        liveContainerProfile = profile;
-    });
+    liveContainerProfile = profile;
     return liveContainerProfile;
 }
 
@@ -329,33 +334,29 @@ static void syncContainerWithLiveIP() {
 
         prof[@"lastSyncedIP"] = ip;
         prof[@"ispName"] = ispRaw;
+        prof[@"timeZone"] = tz;
+        prof[@"localeID"] = [NSString stringWithFormat:@"en_%@", [cc uppercaseString]];
+        prof[@"cityCountry"] = [NSString stringWithFormat:@"%@, %@ (%@)", city, region, [cc uppercaseString]];
 
-        if (![prof[@"locationAnchored"] boolValue]) {
-            prof[@"locationAnchored"] = @YES;
-            prof[@"timeZone"] = tz;
-            prof[@"localeID"] = [NSString stringWithFormat:@"en_%@", [cc uppercaseString]];
-            prof[@"cityCountry"] = [NSString stringWithFormat:@"%@, %@ (%@)", city, region, [cc uppercaseString]];
+        if ([ispUp containsString:@"T-MOBILE"] || [ispUp containsString:@"METRO"] || [ispUp containsString:@"MINT"]) {
+            prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"T-Mobile";
+            prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"260"; prof[@"CarrierISO"] = cc;
+        } else if ([ispUp containsString:@"AT&T"] || [ispUp containsString:@"CRICKET"]) {
+            prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"AT&T";
+            prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"410"; prof[@"CarrierISO"] = cc;
+        } else if ([ispUp containsString:@"VERIZON"] || [ispUp containsString:@"VISIBLE"]) {
+            prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"Verizon";
+            prof[@"CarrierMCC"] = @"311"; prof[@"CarrierMNC"] = @"480"; prof[@"CarrierISO"] = cc;
+        } else if (isMobileISP) {
+            prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = ispRaw;
+            prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"260"; prof[@"CarrierISO"] = cc;
+        } else {
+            prof[@"CarrierMode"] = @"WIFI_ONLY"; prof[@"CarrierName"] = ispRaw;
+            prof[@"CarrierMCC"] = @""; prof[@"CarrierMNC"] = @""; prof[@"CarrierISO"] = cc;
+        }
 
-            if ([ispUp containsString:@"T-MOBILE"] || [ispUp containsString:@"METRO"] || [ispUp containsString:@"MINT"]) {
-                prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"T-Mobile";
-                prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"260"; prof[@"CarrierISO"] = cc;
-            } else if ([ispUp containsString:@"AT&T"] || [ispUp containsString:@"CRICKET"]) {
-                prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"AT&T";
-                prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"410"; prof[@"CarrierISO"] = cc;
-            } else if ([ispUp containsString:@"VERIZON"] || [ispUp containsString:@"VISIBLE"]) {
-                prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"Verizon";
-                prof[@"CarrierMCC"] = @"311"; prof[@"CarrierMNC"] = @"480"; prof[@"CarrierISO"] = cc;
-            } else if (isMobileISP) {
-                prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = ispRaw;
-                prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"260"; prof[@"CarrierISO"] = cc;
-            } else {
-                prof[@"CarrierMode"] = @"WIFI_ONLY"; prof[@"CarrierName"] = ispRaw;
-                prof[@"CarrierMCC"] = @""; prof[@"CarrierMNC"] = @""; prof[@"CarrierISO"] = cc;
-            }
-
-            if (isModuleActive(@"spoofLocation")) {
-                applyLowLevelCTimeZone(tz);
-            }
+        if (isModuleActive(@"spoofLocation")) {
+            applyLowLevelCTimeZone(tz);
         }
 
         [prof writeToFile:localPlist atomically:YES];
@@ -386,28 +387,28 @@ static void showStartupBanner() {
 
     BOOL active = isModuleActive(nil);
     NSString *cName = prof[@"containerName"] ?: @"Default";
-    NSString *craneID = prof[@"craneIdentifier"] ?: @"";
-    NSString *shortID = (craneID.length > 8) ? [craneID substringToIndex:8] : craneID;
+    NSString *localIP = prof[@"localIP"] ?: @"192.168.1.x";
+    int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
-    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(16, 44, keyWin.bounds.size.width - 32, 40)];
+    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(16, 44, keyWin.bounds.size.width - 32, 42)];
     toast.layer.cornerRadius = 10.0;
     toast.clipsToBounds = YES;
     toast.textAlignment = NSTextAlignmentCenter;
-    toast.font = [UIFont boldSystemFontOfSize:12.0];
+    toast.font = [UIFont boldSystemFontOfSize:11.5];
     toast.numberOfLines = 2;
     toast.textColor = [UIColor whiteColor];
 
     if (active) {
         toast.backgroundColor = [UIColor colorWithRed:0.06 green:0.48 blue:0.24 alpha:0.92];
-        toast.text = [NSString stringWithFormat:@"🛡️ %@ • Crane ID: %@...\n%@ • %@",
-                      cName, shortID, prof[@"lastSyncedIP"] ?: @"Sincronizando IP...", prof[@"timeZone"] ?: @""];
+        toast.text = [NSString stringWithFormat:@"🛡️ %@ • LAN: %@ • Bat: %d%%\n%@ • %@",
+                      cName, localIP, batPct, prof[@"ssid"] ?: @"Wi-Fi", prof[@"timeZone"] ?: @""];
     } else {
         toast.backgroundColor = [UIColor colorWithRed:0.75 green:0.15 blue:0.15 alpha:0.92];
-        toast.text = [NSString stringWithFormat:@"⚪ %@ • Escudo en Pausa", cName];
+        toast.text = [NSString stringWithFormat:@"⚪ %@ • Escudo en Pausa (Datos Reales)", cName];
     }
 
     [keyWin addSubview:toast];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [UIView animateWithDuration:0.35 animations:^{ toast.alpha = 0.0; } completion:^(BOOL f) { [toast removeFromSuperview]; }];
     });
 }
@@ -583,6 +584,24 @@ static CFDictionaryRef custom_CFNetworkCopySystemProxySettings(void) {
     return (__bridge_retained CFDictionaryRef)@{};
 }
 
+static CFArrayRef (*orig_CFNetworkCopyProxiesForURL)(CFURLRef, CFDictionaryRef);
+static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings) {
+    if (!isModuleActive(@"spoofNetwork")) return orig_CFNetworkCopyProxiesForURL(url, proxySettings);
+    NSArray *cleanProxies = @[@{(NSString *)kCFProxyTypeKey: (NSString *)kCFProxyTypeNone}];
+    return (__bridge_retained CFArrayRef)cleanProxies;
+}
+
+static Boolean (*orig_SCNetworkReachabilityGetFlags)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *);
+static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
+    Boolean ok = orig_SCNetworkReachabilityGetFlags(target, flags);
+    if (ok && flags && isModuleActive(@"spoofNetwork")) {
+        // Elimina las banderas de túnel VPN / conexión transitoria (utun/ppp/ipsec)
+        *flags &= ~kSCNetworkReachabilityFlagsTransientConnection;
+        *flags &= ~kSCNetworkReachabilityFlagsConnectionRequired;
+    }
+    return ok;
+}
+
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef);
 static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
     if (!isModuleActive(@"spoofNetwork")) return orig_CNCopyCurrentNetworkInfo(interfaceName);
@@ -613,10 +632,15 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
                 strncmp(curr->ifa_name, "tap", 3) == 0) {
                 strcpy(curr->ifa_name, "en0");
                 curr->ifa_flags &= ~IFF_POINTOPOINT;
+                curr->ifa_flags |= IFF_BROADCAST | IFF_MULTICAST;
             }
             if (strcmp(curr->ifa_name, "en0") == 0 && curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET && spoofedIP) {
                 struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
                 addr->sin_addr.s_addr = inet_addr(spoofedIP);
+                if (curr->ifa_netmask && curr->ifa_netmask->sa_family == AF_INET) {
+                    struct sockaddr_in *mask = (struct sockaddr_in *)curr->ifa_netmask;
+                    mask->sin_addr.s_addr = inet_addr("255.255.255.0");
+                }
             }
         }
         curr = curr->ifa_next;
@@ -645,7 +669,7 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     NSDictionary *prof = getContainerProfile();
     float baseBat = [prof[@"batteryLevel"] floatValue];
     NSTimeInterval elapsedMinutes = ([[NSDate date] timeIntervalSince1970] - sessionStartTimestamp) / 60.0;
-    float drop = (float)((int)(elapsedMinutes / 15.0)) * 0.01f;
+    float drop = (float)((int)(elapsedMinutes / 12.0)) * 0.01f;
     return MAX(0.15f, baseBat - drop);
 }
 - (UIDeviceBatteryState)batteryState {
@@ -767,16 +791,18 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 
 %ctor {
     %init;
-    getContainerProfile();
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
     MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
     MSHookFunction((void *)CFNetworkCopySystemProxySettings, (void *)custom_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
+    MSHookFunction((void *)CFNetworkCopyProxiesForURL, (void *)custom_CFNetworkCopyProxiesForURL, (void **)&orig_CFNetworkCopyProxiesForURL);
+    MSHookFunction((void *)SCNetworkReachabilityGetFlags, (void *)custom_SCNetworkReachabilityGetFlags, (void **)&orig_SCNetworkReachabilityGetFlags);
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        getContainerProfile();
         syncContainerWithLiveIP();
         showStartupBanner();
         [NSTimer scheduledTimerWithTimeInterval:900.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
