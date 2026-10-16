@@ -1,5 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <CFNetwork/CFNetwork.h>
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <CoreTelephony/CTCarrier.h>
@@ -7,9 +9,6 @@
 #import <DeviceCheck/DeviceCheck.h>
 #import <SystemConfiguration/CaptiveNetwork.h>
 #import <AVFoundation/AVFoundation.h>
-#import <ifaddrs.h>
-#import <arpa/inet.h>
-#import <net/if.h>
 #import <sys/sysctl.h>
 #import <sys/mount.h>
 #import <mach-o/dyld.h>
@@ -130,9 +129,29 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
     if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
 
     NSMutableArray *sources = [NSMutableArray array];
+    for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
+        CFPreferencesAppSynchronize((__bridge CFStringRef)domain);
+        CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, (__bridge CFStringRef)domain, CFSTR("mobile"), kCFPreferencesAnyHost);
+        if (cfDict) {
+            NSDictionary *d = CFBridgingRelease(cfDict);
+            if ([d count] > 0) [sources addObject:d];
+        }
+    }
     for (NSString *pPath in @[CRANE_MAIN_JB, CRANE_MAIN_VAR, CRANE_PREFS_JB, CRANE_PREFS_VAR]) {
         NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
         if ([cPrefs count] > 0) [sources addObject:cPrefs];
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *sDir in @[@"/var/mobile/Library/Application Support/Crane", @"/var/jb/var/mobile/Library/Application Support/Crane"]) {
+        if (![fm fileExistsAtPath:sDir]) continue;
+        NSArray *subFiles = [fm subpathsOfDirectoryAtPath:sDir error:nil];
+        for (NSString *sf in subFiles) {
+            if ([sf hasSuffix:@".plist"]) {
+                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:[sDir stringByAppendingPathComponent:sf]];
+                if ([d isKindOfClass:[NSDictionary class]] && [d count] > 0) [sources addObject:d];
+            }
+        }
     }
 
     for (NSDictionary *src in sources) {
@@ -191,10 +210,16 @@ static NSMutableDictionary *getContainerProfile() {
                    [byUUID[keyUUID][@"schemaVersion"] intValue] == CURRENT_SCHEMA_VERSION &&
                    byUUID[keyUUID][@"idfv"]) {
             profile = [byUUID[keyUUID] mutableCopy];
+        } else if (![craneID isEqualToString:keyUUID] &&
+                   [byUUID[craneID] isKindOfClass:[NSDictionary class]] &&
+                   byUUID[craneID][@"idfv"]) {
+            // Migrar perfil pre-creado en Crane cuando se abre la app por primera vez
+            profile = [byUUID[craneID] mutableCopy];
+            [byUUID removeObjectForKey:craneID];
         }
 
-        if (profile && [byUUID[keyUUID] isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *stCopy = byUUID[keyUUID];
+        NSDictionary *stCopy = [byUUID[keyUUID] isKindOfClass:[NSDictionary class]] ? byUUID[keyUUID] : byUUID[craneID];
+        if (profile && [stCopy isKindOfClass:[NSDictionary class]]) {
             for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"ssid", @"bssid", @"idfv", @"bootSessionUUID", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness"]) {
                 if (stCopy[k] != nil) profile[k] = stCopy[k];
             }
@@ -632,7 +657,6 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
     if (!origCraneIDFV && origUUID) {
         origCraneIDFV = [origUUID UUIDString];
     }
-    // Respetar el UUID aislado que Crane inyecta para no desincronizar el Keychain OAuth de la app
     if (origUUID) return origUUID;
     if (!isModuleActive(@"spoofIDs")) return origUUID;
     NSDictionary *prof = getContainerProfile();
@@ -680,7 +704,6 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 
 %hook NSFileManager
 - (id)ubiquityIdentityToken {
-    // Evita que Reddit/Instagram intenten usar iCloud Drive o muestren el prompt de sesión de iCloud
     if (isModuleActive(@"spoofIDs") || isModuleActive(@"spoofSecurity")) return nil;
     return %orig;
 }
