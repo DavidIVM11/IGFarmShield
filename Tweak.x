@@ -24,7 +24,7 @@
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
-#define CURRENT_SCHEMA_VERSION 13
+#define CURRENT_SCHEMA_VERSION 14
 
 static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
@@ -51,7 +51,7 @@ static uint64_t randomSeed64(NSString *salt) {
 }
 
 static void applyLowLevelCTimeZone(NSString *tzName) {
-    if (!tzName || [tzName hasPrefix:@"Sincronizando"] || tzName.length == 0) return;
+    if (!tzName || [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "] || tzName.length == 0) return;
     setenv("TZ", [tzName UTF8String], 1);
     tzset();
 }
@@ -185,6 +185,7 @@ static NSMutableDictionary *getContainerProfile() {
             profile = [byUUID[keyUUID] mutableCopy];
         }
 
+        // Sincronizar cambios realizados desde el panel para este UUID exclusivo
         if (profile && [byUUID[keyUUID] isKindOfClass:[NSDictionary class]]) {
             NSDictionary *stCopy = byUUID[keyUUID];
             for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"ssid", @"bssid", @"idfv", @"bootSessionUUID", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"uptimeOffset"]) {
@@ -196,7 +197,7 @@ static NSMutableDictionary *getContainerProfile() {
             uint64_t seed = randomSeed64(keyUUID);
             NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
             NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
-            NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0"];
+            NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0", @"192.168.10"];
 
             NSString *oui = ouis[seed % ouis.count];
             NSString *ssidPref = ssidPrefixes[(seed >> 3) % ssidPrefixes.count];
@@ -210,6 +211,7 @@ static NSMutableDictionary *getContainerProfile() {
 
             NSString *baseIDFV = ([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString];
 
+            // Inicialización 100% aislada (No hereda IPs ni zonas horarias globales de otros contenedores)
             profile = [@{
                 @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
                 @"containerUUID": keyUUID,
@@ -239,18 +241,28 @@ static NSMutableDictionary *getContainerProfile() {
                 @"brightness": @(0.30f + (((seed >> 4) % 60) / 100.0f)),
                 @"audioVolume": @(0.20f + (((seed >> 6) % 70) / 100.0f)),
                 @"pasteboardCount": @(5 + (seed % 90)),
-                @"lastSyncedIP": globalSt[@"last_ip"] ?: @"Sincronizando...",
-                @"ispName": globalSt[@"last_isp"] ?: @"ISP",
-                @"cityCountry": globalSt[@"last_city_country"] ?: @"Sincronizando con IP...",
-                @"timeZone": globalSt[@"defaultTimeZone"] ?: @"America/New_York",
-                @"localeID": globalSt[@"defaultLocale"] ?: @"en_US",
-                @"CarrierMode": globalSt[@"defaultCarrierMode"] ?: @"CELLULAR",
-                @"CarrierName": globalSt[@"defaultCarrierName"] ?: @"T-Mobile",
-                @"CarrierMCC": globalSt[@"defaultCarrierMCC"] ?: @"310",
-                @"CarrierMNC": globalSt[@"defaultCarrierMNC"] ?: @"260",
-                @"CarrierISO": globalSt[@"defaultCarrierISO"] ?: @"us"
+                @"lastSyncedIP": @"Sin sincronizar",
+                @"ispName": @"Pendiente",
+                @"cityCountry": @"Sincronizando...",
+                @"timeZone": @"America/New_York",
+                @"localeID": @"en_US",
+                @"CarrierMode": @"CELLULAR",
+                @"CarrierName": @"T-Mobile",
+                @"CarrierMCC": @"310",
+                @"CarrierMNC": @"260",
+                @"CarrierISO": @"us"
             } mutableCopy];
         } else {
+            // Variación ligera y natural de sensores puros al abrir la app para no reportar valores estáticos
+            uint32_t sessionJitter = arc4random_uniform(1000);
+            float prevBat = [profile[@"batteryLevel"] floatValue];
+            float newBat = prevBat + ((sessionJitter % 2 == 0) ? 0.02f : -0.03f);
+            if (newBat < 0.22f || newBat > 0.94f) newBat = 0.35f + (arc4random_uniform(55) / 100.0f);
+            profile[@"batteryLevel"] = @(newBat);
+            profile[@"audioVolume"] = @(0.20f + (arc4random_uniform(65) / 100.0f));
+            profile[@"brightness"] = @(0.28f + (arc4random_uniform(60) / 100.0f));
+            profile[@"pasteboardCount"] = @([profile[@"pasteboardCount"] integerValue] + 1 + arc4random_uniform(3));
+
             profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
             profile[@"containerUUID"] = keyUUID;
             profile[@"craneIdentifier"] = craneID;
@@ -297,7 +309,6 @@ static BOOL isModuleActive(NSString *moduleKey) {
     return YES;
 }
 
-// Clasificador automático de IP (Detecta automáticamente si tu proxy es Datos Móviles 4G o Wi-Fi Residencial)
 static void applyAutomaticNetworkCoherenceToProfile(NSMutableDictionary *prof, NSString *ip, NSString *ispRaw, NSString *cc, NSString *city, NSString *region, NSString *tz, BOOL isMobileFlag) {
     if (!prof) return;
     NSString *ispUp = [ispRaw ?: @"" uppercaseString];
@@ -345,13 +356,15 @@ static void applyAutomaticNetworkCoherenceToProfile(NSMutableDictionary *prof, N
     }
 }
 
-// Usa HTTPS (ipwho.is) para que Reddit e Instagram no bloqueen la consulta por App Transport Security
+// Sincronización efímera HTTPS exclusiva del contenedor actual (sin caché ni variables globales)
 static void syncContainerWithLiveIP() {
     if (!isModuleActive(@"spoofNetwork")) return;
 
     NSURL *httpsUrl = [NSURL URLWithString:@"https://ipwho.is/"];
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     cfg.timeoutIntervalForRequest = 6.0;
+    cfg.URLCache = nil;
+    cfg.HTTPCookieStorage = nil;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
 
     [[session dataTaskWithURL:httpsUrl completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
@@ -409,7 +422,7 @@ static void showStartupBanner() {
     NSString *cName = prof[@"containerName"] ?: @"Default";
     BOOL isCell = [prof[@"CarrierMode"] isEqualToString:@"CELLULAR"];
     NSString *netMode = isCell
-        ? [NSString stringWithFormat:@"📱 Datos Móviles 4G (%@)", prof[@"CarrierName"] ?: @"LTE"]
+        ? [NSString stringWithFormat:@"📱 4G (%@)", prof[@"CarrierName"] ?: @"LTE"]
         : [NSString stringWithFormat:@"🛜 Wi-Fi (%@)", prof[@"localIP"] ?: @"LAN"];
     int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
@@ -424,7 +437,7 @@ static void showStartupBanner() {
     if (active) {
         toast.backgroundColor = [UIColor colorWithRed:0.06 green:0.48 blue:0.24 alpha:0.92];
         toast.text = [NSString stringWithFormat:@"🛡️ %@ • %@ • Bat: %d%%\n%@ • %@",
-                      cName, netMode, batPct, prof[@"lastSyncedIP"] ?: @"IP Activa", prof[@"timeZone"] ?: @""];
+                      cName, netMode, batPct, prof[@"lastSyncedIP"] ?: @"IP Aislada", prof[@"timeZone"] ?: @""];
     } else {
         toast.backgroundColor = [UIColor colorWithRed:0.75 green:0.15 blue:0.15 alpha:0.92];
         toast.text = [NSString stringWithFormat:@"⚪ %@ • Escudo en Pausa (Datos Reales)", cName];
@@ -436,7 +449,7 @@ static void showStartupBanner() {
     });
 }
 
-// NUNCA bloquear rutas de "Crane" aquí: Crane necesita leer su propia carpeta para guardar el Keychain en el login de Reddit
+// Permite las rutas internas de Crane para no bloquear el guardado del Keychain OAuth en Reddit
 static BOOL isSuspiciousJailbreakPathC(const char *path) {
     if (!path) return NO;
     if (strstr(path, "igfarmshield") != NULL ||
@@ -470,6 +483,17 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
         }
     }
     return name;
+}
+
+static int (*orig_dladdr)(const void *, Dl_info *);
+static int custom_dladdr(const void *addr, Dl_info *info) {
+    int ret = orig_dladdr(addr, info);
+    if (ret != 0 && info && info->dli_fname && isModuleActive(@"spoofSecurity")) {
+        if (strstr(info->dli_fname, "IGFarmShield") != NULL || isSuspiciousJailbreakPathC(info->dli_fname)) {
+            info->dli_fname = "/System/Library/Frameworks/UIKitCore.framework/UIKitCore";
+        }
+    }
+    return ret;
 }
 
 %hook LAContext
@@ -509,7 +533,7 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
     if (!isModuleActive(@"spoofLocation")) return %orig;
     NSDictionary *prof = getContainerProfile();
     NSString *tzName = prof[@"timeZone"];
-    if (!tzName || [tzName hasPrefix:@"Sincronizando"]) return %orig;
+    if (!tzName || [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "]) return %orig;
     return [NSTimeZone timeZoneWithName:tzName] ?: %orig;
 }
 + (NSTimeZone *)localTimeZone {
@@ -584,7 +608,6 @@ static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef tar
     Boolean ok = orig_SCNetworkReachabilityGetFlags(target, flags);
     if (ok && flags && isModuleActive(@"spoofNetwork")) {
         NSDictionary *prof = getContainerProfile();
-        // Oculta la bandera de túnel VPN y reporta Datos Móviles (WWAN) si el proxy es móvil (GridPanel)
         *flags &= ~kSCNetworkReachabilityFlagsTransientConnection;
         if ([prof[@"CarrierMode"] isEqualToString:@"CELLULAR"]) {
             *flags |= kSCNetworkReachabilityFlagsIsWWAN;
@@ -599,7 +622,6 @@ static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef);
 static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
     if (!isModuleActive(@"spoofNetwork")) return orig_CNCopyCurrentNetworkInfo(interfaceName);
     NSDictionary *prof = getContainerProfile();
-    // Si estás usando un Proxy Móvil (GridPanel), la app ve que el Wi-Fi está apagado (usando 4G LTE)
     if ([prof[@"CarrierMode"] isEqualToString:@"CELLULAR"]) {
         return NULL;
     }
@@ -611,7 +633,6 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
     return (__bridge_retained CFDictionaryRef)fakeWifi;
 }
 
-// Oculta el nombre del túnel VPN (utun) sin alterar la IP de enlace del socket para no romper el login de Reddit
 static int (*orig_getifaddrs)(struct ifaddrs **);
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
@@ -625,7 +646,7 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
                 strncmp(curr->ifa_name, "ipsec", 5) == 0 ||
                 strncmp(curr->ifa_name, "tun", 3) == 0 ||
                 strncmp(curr->ifa_name, "tap", 3) == 0) {
-                strcpy(curr->ifa_name, "lo0");
+                strcpy(curr->ifa_name, "en0");
                 curr->ifa_flags &= ~IFF_POINTOPOINT;
             }
         }
@@ -644,7 +665,6 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     if (!origCraneIDFV && origUUID) {
         origCraneIDFV = [origUUID UUIDString];
     }
-    // En Reddit respetamos siempre el IDFV nativo que le asigna Crane al contenedor para no desincronizar su Keychain OAuth
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
     if ([bundleID isEqualToString:@"com.reddit.Reddit"] && origUUID) {
         return origUUID;
@@ -720,6 +740,15 @@ static int custom_statfs(const char *path, struct statfs *buf) {
     NSDictionary *prof = getContainerProfile();
     return orig + [prof[@"uptimeOffset"] doubleValue];
 }
+- (NSDictionary<NSString *, NSString *> *)environment {
+    NSDictionary *orig = %orig;
+    if (!isModuleActive(@"spoofSecurity") || !orig) return orig;
+    NSMutableDictionary *cleanEnv = [orig mutableCopy];
+    [cleanEnv removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
+    [cleanEnv removeObjectForKey:@"_MSSafeMode"];
+    [cleanEnv removeObjectForKey:@"_SafeMode"];
+    return cleanEnv;
+}
 %end
 
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
@@ -762,6 +791,7 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+    MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
     MSHookFunction((void *)SCNetworkReachabilityGetFlags, (void *)custom_SCNetworkReachabilityGetFlags, (void **)&orig_SCNetworkReachabilityGetFlags);
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
