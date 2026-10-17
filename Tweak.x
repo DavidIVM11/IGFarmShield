@@ -11,11 +11,6 @@
 #import <net/if.h>
 #import <sys/sysctl.h>
 #import <sys/mount.h>
-#import <sys/stat.h>
-#import <fcntl.h>
-#import <dirent.h>
-#import <unistd.h>
-#import <errno.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <string.h>
@@ -36,7 +31,7 @@ static NSMutableDictionary *liveContainerProfile = nil;
 static NSTimeInterval sessionStartTimestamp = 0;
 static BOOL bannerShownThisSession = NO;
 
-// Banderas en memoria RAM para respuesta instantánea y cero bloqueos
+// Banderas en memoria RAM para ejecución instantánea sin riesgo de bloqueo
 static BOOL s_profileInitialized = NO;
 static BOOL s_shieldActive = NO;
 static BOOL s_spoofIDs = NO;
@@ -52,16 +47,6 @@ static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_statfs)(const char *, struct statfs *) = NULL;
-static int (*orig_access)(const char *, int) = NULL;
-static int (*orig_faccessat)(int, const char *, int, int) = NULL;
-static int (*orig_stat)(const char *, struct stat *) = NULL;
-static int (*orig_lstat)(const char *, struct stat *) = NULL;
-static int (*orig_fstatat)(int, const char *, struct stat *, int) = NULL;
-static FILE *(*orig_fopen)(const char *, const char *) = NULL;
-static DIR *(*orig_opendir)(const char *) = NULL;
-static char *(*orig_realpath)(const char *, char *) = NULL;
-static ssize_t (*orig_readlink)(const char *, char *, size_t) = NULL;
-static char *(*orig_getenv)(const char *) = NULL;
 static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
 
@@ -79,8 +64,7 @@ static uint64_t randomSeed64(NSString *salt) {
     return hash ^ r;
 }
 
-// Detecta si la llamada proviene de la App (Instagram / Reddit) o de su runtime de Swift
-// Deja intactos a Crane, CFNetwork, libnetwork.dylib y Security.framework
+// Verifica si quien llama es el binario de la App o el puente de Swift (sin interferir con Crane ni CFNetwork)
 static BOOL isCallerFromTargetAppOrSwift(const void *retAddr) {
     if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
     Dl_info info;
@@ -182,9 +166,9 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bund
     NSString *craneID = nil;
     NSString *craneName = nil;
 
-    const char *envName = orig_getenv ? orig_getenv("CRANE_CONTAINER_NAME") : getenv("CRANE_CONTAINER_NAME");
-    const char *envID = orig_getenv ? orig_getenv("CRANE_CONTAINER_ID") : getenv("CRANE_CONTAINER_ID");
-    const char *envIdent = orig_getenv ? orig_getenv("CRANE_IDENTIFIER") : getenv("CRANE_IDENTIFIER");
+    const char *envName = getenv("CRANE_CONTAINER_NAME");
+    const char *envID = getenv("CRANE_CONTAINER_ID");
+    const char *envIdent = getenv("CRANE_IDENTIFIER");
 
     if (envName && strlen(envName) > 0) craneName = [NSString stringWithUTF8String:envName];
     if (envID && strlen(envID) > 0) craneID = [NSString stringWithUTF8String:envID];
@@ -406,11 +390,6 @@ static void ensureProfileLoaded() {
     NSString *lanIP = profile[@"localIP"] ?: @"192.168.1.45";
     s_spoofedLanAddr = inet_addr([lanIP UTF8String]);
 
-    // Si la protección de red está activa, limpiar cachés HTTP transitorias al arrancar para evitar leaks de QUIC/Alt-Svc entre proxies
-    if (s_spoofNetwork) {
-        [[NSURLCache sharedURLCache] removeAllCachedResponses];
-    }
-
     s_inInternalCall = NO;
 }
 
@@ -419,6 +398,10 @@ static void showStartupBanner() {
     ensureProfileLoaded();
     if (!liveContainerProfile) return;
     bannerShownThisSession = YES;
+
+    if (s_spoofNetwork) {
+        [[NSURLCache sharedURLCache] removeAllCachedResponses];
+    }
 
     UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
     if (!keyWin) {
@@ -459,7 +442,7 @@ static void showStartupBanner() {
 }
 
 // ============================================================================
-// PROTOCOLO DE SEGURIDAD NIVEL SHADOW (OCULTA JAILBREAK, CRANE Y TWEAK)
+// MODO INVISIBLE ESTABLE EN ELLEKIT (OCULTA JAILBREAK, CRANE Y TWEAK)
 // ============================================================================
 static BOOL isHiddenPathForTargetAppC(const char *path) {
     if (!path) return NO;
@@ -469,14 +452,14 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
         return NO;
     }
 
-    // 1. Ocultar el propio tweak IGFarmShield y sus archivos de estado
+    // 1. Ocultar el propio tweak IGFarmShield y sus plists
     if (strstr(path, "IGFarmShield") != NULL ||
         strstr(path, "igfarmshield") != NULL ||
         strstr(path, ".igshield_container") != NULL) {
         return YES;
     }
 
-    // 2. Ocultar todas las librerías, soporte y preferencias de Crane
+    // 2. Ocultar librerías, soporte y preferencias de Crane
     if (strstr(path, "Crane.dylib") != NULL ||
         strstr(path, "libcrane") != NULL ||
         strstr(path, "CraneGUI") != NULL ||
@@ -513,108 +496,6 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
         return YES;
     }
     return NO;
-}
-
-static int custom_access(const char *path, int amode) {
-    if (s_spoofSecurity && path && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (isHiddenPathForTargetAppC(path)) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    return orig_access(path, amode);
-}
-
-static int custom_faccessat(int dirfd, const char *path, int amode, int flag) {
-    if (s_spoofSecurity && path && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (isHiddenPathForTargetAppC(path)) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    return orig_faccessat(dirfd, path, amode, flag);
-}
-
-static int custom_stat(const char *path, struct stat *buf) {
-    if (s_spoofSecurity && path && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (isHiddenPathForTargetAppC(path)) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    return orig_stat(path, buf);
-}
-
-static int custom_lstat(const char *path, struct stat *buf) {
-    if (s_spoofSecurity && path && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (isHiddenPathForTargetAppC(path)) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    return orig_lstat(path, buf);
-}
-
-static int custom_fstatat(int dirfd, const char *path, struct stat *buf, int flag) {
-    if (s_spoofSecurity && path && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (isHiddenPathForTargetAppC(path)) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    return orig_fstatat(dirfd, path, buf, flag);
-}
-
-static FILE *custom_fopen(const char *path, const char *mode) {
-    if (s_spoofSecurity && path && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (isHiddenPathForTargetAppC(path)) {
-            errno = ENOENT;
-            return NULL;
-        }
-    }
-    return orig_fopen(path, mode);
-}
-
-static DIR *custom_opendir(const char *path) {
-    if (s_spoofSecurity && path && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (isHiddenPathForTargetAppC(path)) {
-            errno = ENOENT;
-            return NULL;
-        }
-    }
-    return orig_opendir(path);
-}
-
-static char *custom_realpath(const char *path, char *resolved_path) {
-    if (s_spoofSecurity && path && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (isHiddenPathForTargetAppC(path)) {
-            errno = ENOENT;
-            return NULL;
-        }
-    }
-    return orig_realpath(path, resolved_path);
-}
-
-static ssize_t custom_readlink(const char *path, char *buf, size_t bufsiz) {
-    if (s_spoofSecurity && path && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (isHiddenPathForTargetAppC(path)) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    return orig_readlink(path, buf, bufsiz);
-}
-
-static char *custom_getenv(const char *name) {
-    if (s_spoofSecurity && name && isCallerFromTargetAppOrSwift(__builtin_return_address(0))) {
-        if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
-            strcmp(name, "_MSSafeMode") == 0 ||
-            strcmp(name, "_SafeMode") == 0 ||
-            strncmp(name, "CRANE_", 6) == 0) {
-            return NULL;
-        }
-    }
-    return orig_getenv(name);
 }
 
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
@@ -712,7 +593,7 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 %end
 
 // ============================================================================
-// AISLAMIENTO DE RED ANTI-LEAKS ENTRE CONTENEDORES (100% COMPATIBLE CON SHADOWROCKET)
+// AISLAMIENTO DE RED ANTI-LEAKS ENTRE CONTENEDORES
 // ============================================================================
 %hook CTCarrier
 - (NSString *)carrierName {
@@ -751,8 +632,7 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 }
 %end
 
-// Aísla la IP LAN privada por contenedor y oculta la Fake-IP 198.18.0.x de Shadowrocket
-// SIN renombrar ni desconectar las interfaces para que el login con Shadowrocket nunca falle
+// Sustituye la IP LAN local y oculta el rango 198.18.0.x de Shadowrocket sin tocar el nombre de las interfaces
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || !s_spoofNetwork || s_spoofedLanAddr == 0) return res;
@@ -796,7 +676,6 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
     return @"iPhone";
 }
 - (NSUUID *)identifierForVendor {
-    // Deja pasar el IDFV nativo que Crane le asigna al contenedor al 100% sin sobrescribirlo
     NSUUID *origUUID = %orig;
     if (!origCraneIDFV && origUUID) {
         origCraneIDFV = [origUUID UUIDString];
@@ -950,20 +829,12 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 %end
 
 %ctor {
+    // 1. Cargar perfil solo con Foundation (sin tocar NSURLCache ni UIKit en %ctor)
     ensureProfileLoaded();
 
+    // 2. Activar únicamente los hooks C compatibles con ElleKit en iOS 16
     MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
-    MSHookFunction((void *)access, (void *)custom_access, (void **)&orig_access);
-    MSHookFunction((void *)faccessat, (void *)custom_faccessat, (void **)&orig_faccessat);
-    MSHookFunction((void *)stat, (void *)custom_stat, (void **)&orig_stat);
-    MSHookFunction((void *)lstat, (void *)custom_lstat, (void **)&orig_lstat);
-    MSHookFunction((void *)fstatat, (void *)custom_fstatat, (void **)&orig_fstatat);
-    MSHookFunction((void *)fopen, (void *)custom_fopen, (void **)&orig_fopen);
-    MSHookFunction((void *)opendir, (void *)custom_opendir, (void **)&orig_opendir);
-    MSHookFunction((void *)realpath, (void *)custom_realpath, (void **)&orig_realpath);
-    MSHookFunction((void *)readlink, (void *)custom_readlink, (void **)&orig_readlink);
-    MSHookFunction((void *)getenv, (void *)custom_getenv, (void **)&orig_getenv);
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
