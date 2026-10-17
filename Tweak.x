@@ -7,6 +7,7 @@
 #import <SystemConfiguration/CaptiveNetwork.h>
 #import <SystemConfiguration/SCNetworkReachability.h>
 #import <AVFoundation/AVFoundation.h>
+#import <StoreKit/StoreKit.h>
 #import <ifaddrs.h>
 #import <arpa/inet.h>
 #import <net/if.h>
@@ -28,10 +29,14 @@
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
-#define CURRENT_SCHEMA_VERSION 23
+#define CURRENT_SCHEMA_VERSION 24
 
 @interface ASAuthorizationController : NSObject
 - (void)performRequests;
+@end
+
+@interface ASAuthorizationAppleIDProvider : NSObject
+- (void)getCredentialStateForUserID:(NSString *)userID completion:(void (^)(NSInteger credentialState, NSError *error))completion;
 @end
 
 @interface CKContainer : NSObject
@@ -100,22 +105,24 @@ static void applyLowLevelCTimeZone(NSString *tzName) {
     tzset();
 }
 
-static BOOL isCallerFromCrane(const void *retAddr) {
+// Verifica si quien llama es el binario o un framework propio de la App (Instagram / Reddit)
+// Esto protege a Crane, Security.framework, Keychain y CFNetwork de recibir datos falsos
+static BOOL isCallerFromTargetApp(const void *retAddr) {
     if (!retAddr || !orig_dladdr) return NO;
     Dl_info info;
     if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
-        if (strstr(info.dli_fname, "Crane") != NULL || strstr(info.dli_fname, "crane") != NULL) {
+        if (strstr(info.dli_fname, "/Containers/Bundle/Application/") != NULL) {
             return YES;
         }
     }
     return NO;
 }
 
-static BOOL isCallerFromAppBundle(const void *retAddr) {
+static BOOL isCallerFromCrane(const void *retAddr) {
     if (!retAddr || !orig_dladdr) return NO;
     Dl_info info;
     if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
-        if (strstr(info.dli_fname, "/Containers/Bundle/Application/") != NULL) {
+        if (strstr(info.dli_fname, "Crane") != NULL || strstr(info.dli_fname, "crane") != NULL) {
             return YES;
         }
     }
@@ -267,7 +274,6 @@ static NSMutableDictionary *getContainerProfile() {
         NSDictionary *settingsEntry = nil;
         NSString *matchedSettingsKey = nil;
 
-        // 1. Buscar coincidencia exacta por UUID de carpeta, ruta física, Crane ID o contenedor activo de Crane
         for (NSString *existingKey in byUUID) {
             NSDictionary *cand = byUUID[existingKey];
             if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
@@ -285,7 +291,6 @@ static NSMutableDictionary *getContainerProfile() {
             }
         }
 
-        // 2. Si el contenedor se creó en Crane (ej. "testing profile" con path vacío) y es el activo o el único encendido, enlazarlo a esta carpeta
         if (!settingsEntry) {
             for (NSString *existingKey in byUUID) {
                 NSDictionary *cand = byUUID[existingKey];
@@ -320,6 +325,14 @@ static NSMutableDictionary *getContainerProfile() {
             }
         }
 
+        // Armonizar siempre el IDFV con el Container ID de Crane para que nunca exista discrepancia en el login de Reddit
+        NSString *craneHarmonizedIDFV = nil;
+        if (origCraneIDFV && origCraneIDFV.length >= 32) {
+            craneHarmonizedIDFV = [origCraneIDFV uppercaseString];
+        } else if ([craneID containsString:@"-"] && craneID.length >= 32) {
+            craneHarmonizedIDFV = [craneID uppercaseString];
+        }
+
         if (!profile || !profile[@"idfv"]) {
             uint64_t seed = randomSeed64(keyUUID);
             NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
@@ -337,6 +350,7 @@ static NSMutableDictionary *getContainerProfile() {
             unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
 
             BOOL manualEnabled = (settingsEntry && settingsEntry[@"enabled"] != nil) ? [settingsEntry[@"enabled"] boolValue] : NO;
+            NSString *finalIDFV = craneHarmonizedIDFV ?: [[NSUUID UUID] UUIDString];
 
             profile = [@{
                 @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
@@ -353,8 +367,8 @@ static NSMutableDictionary *getContainerProfile() {
                 @"spoofSecurity": @YES,
                 @"locationAnchored": @NO,
                 @"deviceModel": @"iPhone10,4",
-                @"craneOriginalIDFV": origCraneIDFV ?: craneID,
-                @"idfv": [[NSUUID UUID] UUIDString],
+                @"craneOriginalIDFV": finalIDFV,
+                @"idfv": finalIDFV,
                 @"shieldDeviceID": [[NSUUID UUID] UUIDString],
                 @"bootSessionUUID": [[NSUUID UUID] UUIDString],
                 @"cloudUUID": [[NSUUID UUID] UUIDString],
@@ -380,6 +394,10 @@ static NSMutableDictionary *getContainerProfile() {
             } mutableCopy];
         } else {
             if (!profile[@"uptimeOffset"]) profile[@"uptimeOffset"] = @(3600 + arc4random_uniform(50000));
+            if (craneHarmonizedIDFV && ![profile[@"customRotatedIDFV"] boolValue]) {
+                profile[@"idfv"] = craneHarmonizedIDFV;
+                profile[@"craneOriginalIDFV"] = craneHarmonizedIDFV;
+            }
             profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
             profile[@"bundleID"] = bundleID;
             profile[@"path"] = homePath;
@@ -387,15 +405,15 @@ static NSMutableDictionary *getContainerProfile() {
 
         [profile writeToFile:localPlist atomically:YES];
 
-        // Si el perfil ya existía en state.plist pero tenía path vacío, actualizar solo su path real
         if (matchedSettingsKey && byUUID[matchedSettingsKey]) {
             NSMutableDictionary *updatedEntry = [byUUID[matchedSettingsKey] mutableCopy];
-            if ([updatedEntry[@"path"] length] == 0) {
-                updatedEntry[@"path"] = homePath;
-                byUUID[matchedSettingsKey] = updatedEntry;
-                globalSt[@"containersByUUID"] = byUUID;
-                [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
+            updatedEntry[@"path"] = homePath;
+            if (craneHarmonizedIDFV && ![updatedEntry[@"customRotatedIDFV"] boolValue]) {
+                updatedEntry[@"idfv"] = craneHarmonizedIDFV;
             }
+            byUUID[matchedSettingsKey] = updatedEntry;
+            globalSt[@"containersByUUID"] = byUUID;
+            [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
         }
 
         if ([profile[@"enabled"] boolValue] && [profile[@"spoofLocation"] boolValue] && profile[@"timeZone"]) {
@@ -409,7 +427,11 @@ static NSMutableDictionary *getContainerProfile() {
 }
 
 static BOOL isModuleActive(NSString *moduleKey) {
-    if (isInitializingProfile || !liveContainerProfile) return NO;
+    if (isInitializingProfile) return NO;
+    if (!liveContainerProfile) {
+        getContainerProfile();
+        if (!liveContainerProfile) return NO;
+    }
 
     NSDictionary *state = getGlobalState();
     if (!state[@"masterEnabled"] || ![state[@"masterEnabled"] boolValue]) return NO;
@@ -498,7 +520,7 @@ static void showStartupBanner() {
 }
 
 // ============================================================================
-// ANTI-JAILBREAK EN C Y OBJECTIVE-C
+// ANTI-JAILBREAK EN C Y OBJECTIVE-C (SIN INTERFERIR CON FRAMEWORKS DE SISTEMA)
 // ============================================================================
 static BOOL isSuspiciousJailbreakPathC(const char *path) {
     if (!path) return NO;
@@ -569,9 +591,10 @@ static FILE *custom_fopen(const char *path, const char *mode) {
     return orig_fopen(path, mode);
 }
 
+// Solo falsifica nombres de imagen dyld/dladdr cuando pregunta el binario de la App (no Security.framework)
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
     const char *name = orig_dyld_get_image_name(image_index);
-    if (name && isModuleActive(@"spoofSecurity") && !isCallerFromCrane(__builtin_return_address(0))) {
+    if (name && isModuleActive(@"spoofSecurity") && isCallerFromTargetApp(__builtin_return_address(0))) {
         if (strstr(name, "IGFarmShield") != NULL || isSuspiciousJailbreakPathC(name)) {
             return "/System/Library/Frameworks/Foundation.framework/Foundation";
         }
@@ -581,7 +604,7 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
 
 static int custom_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
-    if (ret != 0 && info && info->dli_fname && isModuleActive(@"spoofSecurity") && !isCallerFromCrane(__builtin_return_address(0))) {
+    if (ret != 0 && info && info->dli_fname && isModuleActive(@"spoofSecurity") && isCallerFromTargetApp(__builtin_return_address(0))) {
         if (strstr(info->dli_fname, "IGFarmShield") != NULL || isSuspiciousJailbreakPathC(info->dli_fname)) {
             info->dli_fname = "/System/Library/Frameworks/UIKitCore.framework/UIKitCore";
         }
@@ -590,12 +613,56 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 }
 
 // ============================================================================
-// BLOQUEO TOTAL DE DEMONIOS DE ICLOUD / AUTHKIT / STORESERVICES ("SIGN IN WITH APPLE ID")
+// BLOQUEO TOTAL DE STOREKIT, APPLE ID Y DEMONIOS DE ICLOUD ("SIGN IN WITH APPLE ID")
 // ============================================================================
+%hook SKPaymentQueue
+- (void)addTransactionObserver:(id)observer {
+    // Evita que Reddit despierte al demonio itunesstored/storekitd pidiendo Apple ID al arrancar
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
+        return;
+    }
+    %orig;
+}
+- (void)restoreCompletedTransactions {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook SKReceiptRefreshRequest
+- (void)start {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook ASAuthorizationAppleIDProvider
+- (void)getCredentialStateForUserID:(NSString *)userID completion:(void (^)(NSInteger credentialState, NSError *error))completion {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
+        if (completion) completion(2, nil); // 2 = CredentialNotFound (sin abrir popup de Apple ID)
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook ASAuthorizationController
+- (void)performRequests {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
+        return;
+    }
+    %orig;
+}
+%end
+
 %hook CKContainer
 - (void)accountStatusWithCompletionHandler:(void (^)(NSInteger accountStatus, NSError *error))completionHandler {
     if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
-        if (completionHandler) completionHandler(3, nil); // 3 = CKAccountStatusNoAccount
+        if (completionHandler) completionHandler(3, nil);
         return;
     }
     %orig;
@@ -651,15 +718,6 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
         if (completion) {
             completion(nil, [NSError errorWithDomain:@"AKAuthenticationError" code:-7003 userInfo:nil]);
         }
-        return;
-    }
-    %orig;
-}
-%end
-
-%hook ASAuthorizationController
-- (void)performRequests {
-    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
         return;
     }
     %orig;
@@ -805,13 +863,10 @@ static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef tar
     return ok;
 }
 
+// Enmascara utun como lo0 (loopback normal) sin duplicar en0 ni alterar el enrutamiento de sockets de Reddit
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || !isModuleActive(@"spoofNetwork")) return res;
-
-    BOOL calledByAppBinary = isCallerFromAppBundle(__builtin_return_address(0));
-    NSDictionary *prof = getContainerProfile();
-    const char *spoofedIP = [prof[@"localIP"] ?: @"192.168.1.45" UTF8String];
 
     struct ifaddrs *curr = *ifap;
     while (curr) {
@@ -821,15 +876,8 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
                 strncmp(curr->ifa_name, "ipsec", 5) == 0 ||
                 strncmp(curr->ifa_name, "tun", 3) == 0 ||
                 strncmp(curr->ifa_name, "tap", 3) == 0) {
-                strcpy(curr->ifa_name, "en0");
+                strcpy(curr->ifa_name, "lo0");
                 curr->ifa_flags &= ~IFF_POINTOPOINT;
-                if (calledByAppBinary && curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET && spoofedIP) {
-                    struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
-                    addr->sin_addr.s_addr = inet_addr(spoofedIP);
-                }
-            } else if (calledByAppBinary && strcmp(curr->ifa_name, "en0") == 0 && curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET && spoofedIP) {
-                struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
-                addr->sin_addr.s_addr = inet_addr(spoofedIP);
             }
         }
         curr = curr->ifa_next;
@@ -893,7 +941,7 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
 
 static int custom_statfs(const char *path, struct statfs *buf) {
     int ret = orig_statfs(path, buf);
-    if (ret == 0 && buf && isModuleActive(@"spoofHardware") && !isCallerFromCrane(__builtin_return_address(0))) {
+    if (ret == 0 && buf && isModuleActive(@"spoofHardware") && isCallerFromTargetApp(__builtin_return_address(0))) {
         NSDictionary *prof = getContainerProfile();
         if (prof[@"freeBytes"] && buf->f_bsize > 0) {
             unsigned long long baseFree = [prof[@"freeBytes"] unsignedLongLongValue];
@@ -946,7 +994,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 }
 - (NSDictionary<NSString *, NSString *> *)environment {
     NSDictionary *orig = %orig;
-    if (!isModuleActive(@"spoofSecurity") || !orig || isCallerFromCrane(__builtin_return_address(0))) return orig;
+    if (!isModuleActive(@"spoofSecurity") || !orig || !isCallerFromTargetApp(__builtin_return_address(0))) return orig;
     NSMutableDictionary *cleanEnv = [orig mutableCopy];
     [cleanEnv removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
     [cleanEnv removeObjectForKey:@"_MSSafeMode"];
@@ -957,7 +1005,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 
 static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-    if (ret == 0 && name && oldlenp && !isInitializingProfile && !isCallerFromCrane(__builtin_return_address(0))) {
+    if (ret == 0 && name && oldlenp && !isInitializingProfile && isCallerFromTargetApp(__builtin_return_address(0))) {
         NSDictionary *prof = getContainerProfile();
         if (strcmp(name, "kern.boottime") == 0 && isModuleActive(@"spoofHardware") && oldp && *oldlenp >= sizeof(struct timeval)) {
             struct timeval *tv = (struct timeval *)oldp;
@@ -988,6 +1036,14 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 %end
 
 %ctor {
+    // 1. Capturar el IDFV de Crane e inicializar el perfil ANTES de %init para que nunca cambie a mitad de arranque
+    origCraneIDFV = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+    getContainerProfile();
+
+    // 2. Cargar StoreKit y AuthenticationServices antes de %init para que los hooks contra el popup de Apple ID siempre enganchen
+    dlopen("/System/Library/Frameworks/StoreKit.framework/StoreKit", RTLD_NOW);
+    dlopen("/System/Library/Frameworks/AuthenticationServices.framework/AuthenticationServices", RTLD_NOW);
+
     MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
     MSHookFunction((void *)access, (void *)custom_access, (void **)&orig_access);
@@ -1001,9 +1057,6 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
 
     %init;
-
-    origCraneIDFV = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
-    getContainerProfile();
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         showStartupBanner();
