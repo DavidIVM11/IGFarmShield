@@ -19,14 +19,9 @@ extern char **environ;
 #define CHOICY_PLIST_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define CHOICY_PLIST_VAR @"/var/mobile/Library/Preferences/com.opa334.choicyprefs.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 22
+#define CURRENT_SCHEMA_VERSION 23
 
 @interface PSViewController : UIViewController
-@end
-
-@interface LSApplicationProxy : NSObject
-+ (instancetype)applicationProxyForIdentifier:(NSString *)identifier;
-@property (nonatomic, readonly) NSURL *dataContainerURL;
 @end
 
 @class IGFarmRootListController;
@@ -102,7 +97,108 @@ static BOOL nodeMentionsString(id node, NSString *needle) {
     return NO;
 }
 
-// Extrae todos los contenedores y el contenedor activo de la estructura de Crane
+// Elimina recursivamente un contenedor de la estructura mutable de Crane
+static BOOL removeContainerFromCraneMutableNode(id node, NSString *targetUUID, NSString *targetCraneID, NSString *targetName) {
+    if (!node) return NO;
+    BOOL modified = NO;
+
+    if ([node isKindOfClass:[NSMutableDictionary class]]) {
+        NSMutableDictionary *dict = (NSMutableDictionary *)node;
+        NSArray *allKeys = [dict allKeys];
+
+        for (id k in allKeys) {
+            NSString *kStr = [k description];
+            id val = dict[k];
+
+            // Si la clave es el propio UUID o CraneID del contenedor
+            if ((targetUUID.length > 0 && [kStr caseInsensitiveCompare:targetUUID] == NSOrderedSame) ||
+                (targetCraneID.length > 0 && [kStr caseInsensitiveCompare:targetCraneID] == NSOrderedSame)) {
+                [dict removeObjectForKey:k];
+                modified = YES;
+                continue;
+            }
+
+            // Si es el puntero al contenedor activo y coincide con el borrado, devolverlo a "default"
+            for (NSString *ak in @[@"activeContainer", @"selectedContainer", @"currentContainer", @"activeContainerIdentifier", @"active", @"selected"]) {
+                if ([kStr isEqualToString:ak] && [val isKindOfClass:[NSString class]]) {
+                    NSString *vStr = (NSString *)val;
+                    if ((targetUUID.length > 0 && [vStr caseInsensitiveCompare:targetUUID] == NSOrderedSame) ||
+                        (targetCraneID.length > 0 && [vStr caseInsensitiveCompare:targetCraneID] == NSOrderedSame) ||
+                        (targetName.length > 0 && [vStr caseInsensitiveCompare:targetName] == NSOrderedSame)) {
+                        dict[k] = @"default";
+                        modified = YES;
+                    }
+                }
+            }
+
+            if ([val isKindOfClass:[NSMutableDictionary class]]) {
+                NSMutableDictionary *sub = (NSMutableDictionary *)val;
+                NSString *cID = nil;
+                NSString *cName = nil;
+                for (NSString *ik in @[@"identifier", @"id", @"UUID", @"uuid", @"containerIdentifier", @"craneIdentifier"]) {
+                    if ([sub[ik] isKindOfClass:[NSString class]]) { cID = sub[ik]; break; }
+                }
+                for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+                    if ([sub[nk] isKindOfClass:[NSString class]]) { cName = sub[nk]; break; }
+                }
+                BOOL matchID = (cID.length > 0 && ((targetUUID.length > 0 && [cID caseInsensitiveCompare:targetUUID] == NSOrderedSame) ||
+                                                   (targetCraneID.length > 0 && [cID caseInsensitiveCompare:targetCraneID] == NSOrderedSame)));
+                BOOL matchName = (cName.length > 0 && targetName.length > 0 && [cName caseInsensitiveCompare:targetName] == NSOrderedSame);
+                if (matchID || matchName) {
+                    [dict removeObjectForKey:k];
+                    modified = YES;
+                    continue;
+                }
+            }
+
+            if ([val isKindOfClass:[NSMutableDictionary class]] || [val isKindOfClass:[NSMutableArray class]]) {
+                if (removeContainerFromCraneMutableNode(val, targetUUID, targetCraneID, targetName)) {
+                    modified = YES;
+                }
+            }
+        }
+    } else if ([node isKindOfClass:[NSMutableArray class]]) {
+        NSMutableArray *arr = (NSMutableArray *)node;
+        for (NSInteger i = (NSInteger)arr.count - 1; i >= 0; i--) {
+            id item = arr[i];
+            if ([item isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *sub = (NSDictionary *)item;
+                NSString *cID = nil;
+                NSString *cName = nil;
+                for (NSString *ik in @[@"identifier", @"id", @"UUID", @"uuid", @"containerIdentifier", @"craneIdentifier"]) {
+                    if ([sub[ik] isKindOfClass:[NSString class]]) { cID = sub[ik]; break; }
+                }
+                for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+                    if ([sub[nk] isKindOfClass:[NSString class]]) { cName = sub[nk]; break; }
+                }
+                BOOL matchID = (cID.length > 0 && ((targetUUID.length > 0 && [cID caseInsensitiveCompare:targetUUID] == NSOrderedSame) ||
+                                                   (targetCraneID.length > 0 && [cID caseInsensitiveCompare:targetCraneID] == NSOrderedSame)));
+                BOOL matchName = (cName.length > 0 && targetName.length > 0 && [cName caseInsensitiveCompare:targetName] == NSOrderedSame);
+                if (matchID || matchName) {
+                    [arr removeObjectAtIndex:i];
+                    modified = YES;
+                    continue;
+                }
+            } else if ([item isKindOfClass:[NSString class]]) {
+                NSString *s = (NSString *)item;
+                if ((targetUUID.length > 0 && [s caseInsensitiveCompare:targetUUID] == NSOrderedSame) ||
+                    (targetCraneID.length > 0 && [s caseInsensitiveCompare:targetCraneID] == NSOrderedSame) ||
+                    (targetName.length > 0 && [s caseInsensitiveCompare:targetName] == NSOrderedSame)) {
+                    [arr removeObjectAtIndex:i];
+                    modified = YES;
+                    continue;
+                }
+            }
+            if ([item isKindOfClass:[NSMutableDictionary class]] || [item isKindOfClass:[NSMutableArray class]]) {
+                if (removeContainerFromCraneMutableNode(item, targetUUID, targetCraneID, targetName)) {
+                    modified = YES;
+                }
+            }
+        }
+    }
+    return modified;
+}
+
 static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
     if (!node || !outContainers) return;
     if ([node isKindOfClass:[NSDictionary class]]) {
@@ -445,7 +541,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path allowEnableDefault:(BOOL)allowEnable forceRotate:(BOOL)rotate;
 - (void)saveProfile:(NSMutableDictionary *)profile forUUID:(NSString *)uuid;
 - (void)setContainer:(NSString *)targetUUID enabled:(BOOL)enabled inBundle:(NSString *)bundleID;
-- (void)hideAndPurgeContainerProfile:(NSDictionary *)prof;
+- (void)deleteContainerFromTweakAndCrane:(NSDictionary *)prof;
 @end
 
 @interface IGFarmAppContainersController : PSViewController <UITableViewDelegate, UITableViewDataSource>
@@ -483,27 +579,12 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     NSDictionary *loaded = [NSDictionary dictionaryWithContentsOfFile:STATE_PLIST];
     self.state = loaded ? [loaded mutableCopy] : [NSMutableDictionary dictionary];
 
-    // Al actualizar al esquema 22, todo se reinicia a OFF (@NO) para garantizar control 100% manual
-    if ([self.state[@"schemaVersion"] intValue] < CURRENT_SCHEMA_VERSION) {
+    if (!self.state[@"schemaVersion"]) {
         self.state[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
         self.state[@"masterEnabled"] = @NO;
         self.state[@"exclusiveMode"] = @NO;
         self.state[@"enableIG"] = @NO;
         self.state[@"enableReddit"] = @NO;
-        self.state[@"hiddenContainerIDs"] = @[];
-
-        NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
-            ? [self.state[@"containersByUUID"] mutableCopy]
-            : [NSMutableDictionary dictionary];
-        for (NSString *k in [byUUID allKeys]) {
-            if ([byUUID[k] isKindOfClass:[NSDictionary class]]) {
-                NSMutableDictionary *mp = [byUUID[k] mutableCopy];
-                mp[@"enabled"] = @NO;
-                mp[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
-                byUUID[k] = mp;
-            }
-        }
-        self.state[@"containersByUUID"] = byUUID;
     }
 
     if (!self.state[@"masterEnabled"]) self.state[@"masterEnabled"] = @NO;
@@ -593,37 +674,100 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [self.state writeToFile:STATE_PLIST atomically:YES];
 }
 
-- (void)hideAndPurgeContainerProfile:(NSDictionary *)prof {
+// Elimina el contenedor del tweak, borra su carpeta en disco y lo elimina también de los plists de Crane
+- (void)deleteContainerFromTweakAndCrane:(NSDictionary *)prof {
     if (!prof) return;
-    NSString *uuid = prof[@"containerUUID"];
-    NSString *craneID = prof[@"craneIdentifier"];
-    NSString *cName = prof[@"containerName"];
-    NSString *cPath = prof[@"path"];
+    NSString *uuid = prof[@"containerUUID"] ?: @"";
+    NSString *craneID = prof[@"craneIdentifier"] ?: @"";
+    NSString *cName = prof[@"containerName"] ?: @"";
+    NSString *cPath = prof[@"path"] ?: @"";
+    NSString *bundleID = prof[@"bundleID"] ?: @"";
 
+    killAppProcess([bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 1. Borrar carpeta de datos física del contenedor (si no es Default)
+    if (cPath.length > 0 && [cName caseInsensitiveCompare:@"Default"] != NSOrderedSame && [fm fileExistsAtPath:cPath]) {
+        [fm removeItemAtPath:cPath error:nil];
+    }
+
+    // 2. Eliminar de todos los archivos plist de Crane en disco
+    NSMutableArray *cranePlistPaths = [NSMutableArray arrayWithArray:@[
+        CRANE_PREFS_JB, CRANE_MAIN_JB, CRANE_PREFS_VAR, CRANE_MAIN_VAR
+    ]];
+    for (NSString *cDir in @[@"/var/jb/var/mobile/Library/Application Support/Crane",
+                             @"/var/mobile/Library/Application Support/Crane",
+                             @"/var/jb/var/mobile/Library/Crane",
+                             @"/var/mobile/Library/Crane"]) {
+        if (![fm fileExistsAtPath:cDir]) continue;
+        NSArray *subFiles = [fm subpathsOfDirectoryAtPath:cDir error:nil];
+        for (NSString *sf in subFiles) {
+            if ([sf hasSuffix:@".plist"]) {
+                [cranePlistPaths addObject:[cDir stringByAppendingPathComponent:sf]];
+            }
+        }
+    }
+
+    for (NSString *plistPath in cranePlistPaths) {
+        if (![fm fileExistsAtPath:plistPath]) continue;
+        NSData *data = [NSData dataWithContentsOfFile:plistPath];
+        if (!data) continue;
+        id rootObj = [NSPropertyListSerialization propertyListWithData:data
+                                                               options:NSPropertyListMutableContainersAndLeaves
+                                                                format:nil
+                                                                 error:nil];
+        if (rootObj && removeContainerFromCraneMutableNode(rootObj, uuid, craneID, cName)) {
+            NSData *outData = [NSPropertyListSerialization dataWithPropertyList:rootObj
+                                                                         format:NSPropertyListBinaryFormat_v1_0
+                                                                        options:0
+                                                                          error:nil];
+            if (outData) {
+                [outData writeToFile:plistPath atomically:YES];
+            }
+        }
+    }
+
+    // 3. Actualizar CFPreferences en memoria para que Crane refleje el cambio sin necesidad de respring
+    for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
+        for (NSString *user in @[@"mobile", @"root"]) {
+            CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, (__bridge CFStringRef)domain, (__bridge CFStringRef)user, kCFPreferencesAnyHost);
+            if (cfDict) {
+                NSDictionary *d = CFBridgingRelease(cfDict);
+                NSData *tmpData = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+                if (tmpData) {
+                    NSMutableDictionary *mutD = [NSPropertyListSerialization propertyListWithData:tmpData
+                                                                                          options:NSPropertyListMutableContainersAndLeaves
+                                                                                           format:nil
+                                                                                            error:nil];
+                    if ([mutD isKindOfClass:[NSMutableDictionary class]] &&
+                        removeContainerFromCraneMutableNode(mutD, uuid, craneID, cName)) {
+                        for (NSString *k in mutD) {
+                            CFPreferencesSetValue((__bridge CFStringRef)k, (__bridge CFPropertyListRef)mutD[k], (__bridge CFStringRef)domain, (__bridge CFStringRef)user, kCFPreferencesAnyHost);
+                        }
+                        CFPreferencesSynchronize((__bridge CFStringRef)domain, (__bridge CFStringRef)user, kCFPreferencesAnyHost);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Registrar en hiddenContainerIDs y purgar de state.plist
     NSMutableArray *hidden = [self.state[@"hiddenContainerIDs"] isKindOfClass:[NSArray class]]
         ? [self.state[@"hiddenContainerIDs"] mutableCopy]
         : [NSMutableArray array];
-    if (uuid.length > 0 && ![hidden containsObject:[uuid lowercaseString]]) {
-        [hidden addObject:[uuid lowercaseString]];
-    }
-    if (craneID.length > 0 && ![hidden containsObject:[craneID lowercaseString]]) {
-        [hidden addObject:[craneID lowercaseString]];
-    }
+    if (uuid.length > 0 && ![hidden containsObject:[uuid lowercaseString]]) [hidden addObject:[uuid lowercaseString]];
+    if (craneID.length > 0 && ![hidden containsObject:[craneID lowercaseString]]) [hidden addObject:[craneID lowercaseString]];
     if (cName.length > 0 && [cName caseInsensitiveCompare:@"Default"] != NSOrderedSame && ![hidden containsObject:[cName lowercaseString]]) {
         [hidden addObject:[cName lowercaseString]];
     }
     self.state[@"hiddenContainerIDs"] = hidden;
 
-    if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0) {
-        NSString *localPlist = [cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
-        [[NSFileManager defaultManager] removeItemAtPath:localPlist error:nil];
-    }
-
     NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
         ? [self.state[@"containersByUUID"] mutableCopy]
         : [NSMutableDictionary dictionary];
-    if (uuid) [byUUID removeObjectForKey:uuid];
-    if (craneID) [byUUID removeObjectForKey:craneID];
+    if (uuid.length > 0) [byUUID removeObjectForKey:uuid];
+    if (craneID.length > 0) [byUUID removeObjectForKey:craneID];
     self.state[@"containersByUUID"] = byUUID;
     [self saveState];
 }
@@ -649,8 +793,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     self.choicyDetailReport = [NSString stringWithFormat:
         @"• Choicy en Instagram: %@\n"
         @"• Choicy en Reddit: %@\n"
-        @"• Modo 100%% Manual: Todo interruptor nace apagado hasta que tú lo enciendas.\n"
-        @"• Sincronización Crane: Refleja todos los contenedores creados en Crane y en disco.",
+        @"• Crane IDFV: Deja activado 'Use Container Identifier' en Crane para máxima compatibilidad.\n"
+        @"• Borrado Sincronizado: Al deslizar y borrar un contenedor aquí, también se elimina de Crane.",
         igOK ? @"✅ Activo" : @"⚠️ No configurado",
         rdOK ? @"✅ Activo" : @"⚠️ No configurado"];
 }
@@ -806,8 +950,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID] || !cand[@"idfv"]) continue;
             NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
             NSString *candName = cand[@"containerName"] ?: @"";
+            NSString *candPath = cand[@"path"] ?: @"";
             if ([existingKey caseInsensitiveCompare:uuid] == NSOrderedSame ||
                 [existingKey caseInsensitiveCompare:craneID] == NSOrderedSame ||
+                (path.length > 0 && [candPath isEqualToString:path]) ||
                 (candCraneID.length > 0 && [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame) ||
                 (dName.length > 0 && [candName caseInsensitiveCompare:dName] == NSOrderedSame)) {
                 profile = [cand mutableCopy];
@@ -823,16 +969,17 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSDictionary *disk = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Library/.igshield_container.plist"]];
         if ([disk isKindOfClass:[NSDictionary class]] && disk[@"idfv"]) {
             profile = [disk mutableCopy];
-            if ([disk[@"schemaVersion"] intValue] < CURRENT_SCHEMA_VERSION) {
-                profile[@"enabled"] = @NO;
-            }
         }
     }
 
     NSString *cleanCraneName = (dName && dName.length > 0) ? dName : @"Default";
 
+    // Si Crane asignó un UUID ("Use Container Identifier"), usarlo como IDFV base para 100% de armonía con Keychain
+    NSString *harmonizedIDFV = ([craneID containsString:@"-"] && craneID.length >= 32 && !rotate)
+        ? [craneID uppercaseString]
+        : [[NSUUID UUID] UUIDString];
+
     if (!profile || !profile[@"idfv"] || rotate) {
-        // Todo contenedor nuevo nace SIEMPRE en pausa (@NO)
         BOOL wasEnabled = (profile && profile[@"enabled"] != nil && !rotate) ? [profile[@"enabled"] boolValue] : NO;
 
         uint64_t seed = randomSeedPrefs64(uuid);
@@ -866,7 +1013,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             @"locationAnchored": profile[@"locationAnchored"] ?: @NO,
             @"deviceModel": @"iPhone10,4",
             @"craneOriginalIDFV": craneID,
-            @"idfv": [[NSUUID UUID] UUIDString],
+            @"idfv": harmonizedIDFV,
             @"shieldDeviceID": [[NSUUID UUID] UUIDString],
             @"bootSessionUUID": [[NSUUID UUID] UUIDString],
             @"cloudUUID": [[NSUUID UUID] UUIDString],
@@ -904,7 +1051,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     return profile;
 }
 
-// Sincronización completa con Crane y con las carpetas de /var/mobile/Containers/Data/Application
 - (void)scanAndSyncAllContainers {
     self.igContainersList = [NSMutableArray array];
     self.redditContainersList = [NSMutableArray array];
@@ -919,7 +1065,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }
     }
 
-    // 1. Leer todas las fuentes vivas de Crane (archivos plist + CFPreferences + NSUserDefaults)
     NSMutableArray *craneSources = [NSMutableArray array];
     for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_MAIN_JB, CRANE_PREFS_VAR, CRANE_MAIN_VAR]) {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:pPath];
@@ -971,19 +1116,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [igCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
     [rdCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
 
-    // Si un contenedor existe activamente en Crane, desbloquearlo de hiddenSet
-    for (NSString *k in [igCraneMap allKeys]) {
-        [hiddenSet removeObject:[k lowercaseString]];
-        NSDictionary *e = igCraneMap[k];
-        if ([e isKindOfClass:[NSDictionary class]] && e[@"name"]) [hiddenSet removeObject:[e[@"name"] lowercaseString]];
-    }
-    for (NSString *k in [rdCraneMap allKeys]) {
-        [hiddenSet removeObject:[k lowercaseString]];
-        NSDictionary *e = rdCraneMap[k];
-        if ([e isKindOfClass:[NSDictionary class]] && e[@"name"]) [hiddenSet removeObject:[e[@"name"] lowercaseString]];
-    }
+    // Saber si la aplicación tiene Crane realmente configurado
+    BOOL igHasCraneConfigured = (igCraneMap.count > 0 || (igActiveCraneID && igActiveCraneID.length > 0));
+    BOOL rdHasCraneConfigured = (rdCraneMap.count > 0 || (rdActiveCraneID && rdActiveCraneID.length > 0));
 
-    // 2. Escanear todas las carpetas físicas de /var/mobile/Containers/Data/Application (sin colapsarlas)
     NSString *appsDir = @"/var/mobile/Containers/Data/Application";
     NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
 
@@ -993,19 +1129,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *fullPath = [appsDir stringByAppendingPathComponent:folderUUID];
         NSString *metaPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
         NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
-        NSDictionary *localShield = [NSDictionary dictionaryWithContentsOfFile:[fullPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"]];
+        if (![meta isKindOfClass:[NSDictionary class]]) continue;
 
-        BOOL isIG = NO;
-        BOOL isRD = NO;
-        if ([meta isKindOfClass:[NSDictionary class]]) {
-            NSString *mcmID = meta[@"MCMMetadataIdentifier"] ?: @"";
-            isIG = ([mcmID caseInsensitiveCompare:@"com.burbn.instagram"] == NSOrderedSame) || nodeMentionsString(meta, @"com.burbn.instagram");
-            isRD = ([mcmID caseInsensitiveCompare:@"com.reddit.Reddit"] == NSOrderedSame) || nodeMentionsString(meta, @"com.reddit.Reddit");
-        }
-        if (!isIG && !isRD && [localShield isKindOfClass:[NSDictionary class]]) {
-            isIG = [localShield[@"bundleID"] isEqualToString:@"com.burbn.instagram"];
-            isRD = [localShield[@"bundleID"] isEqualToString:@"com.reddit.Reddit"];
-        }
+        NSString *mcmID = meta[@"MCMMetadataIdentifier"] ?: @"";
+        BOOL isIG = ([mcmID caseInsensitiveCompare:@"com.burbn.instagram"] == NSOrderedSame);
+        BOOL isRD = ([mcmID caseInsensitiveCompare:@"com.reddit.Reddit"] == NSOrderedSame);
         if (!isIG && !isRD) continue;
 
         NSString *bundleID = isIG ? @"com.burbn.instagram" : @"com.reddit.Reddit";
@@ -1015,38 +1143,34 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *craneID = nil;
         NSString *detectedName = nil;
 
-        if ([meta isKindOfClass:[NSDictionary class]]) {
-            for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
-                if ([meta[rk] isKindOfClass:[NSString class]] && [meta[rk] length] > 0) detectedName = meta[rk];
-            }
-            for (NSString *ik in @[@"com.opa334.crane.container.identifier", @"com.opa334.crane.container.id", @"craneContainerIdentifier"]) {
-                if ([meta[ik] isKindOfClass:[NSString class]] && [meta[ik] length] > 0) craneID = meta[ik];
-            }
-            NSDictionary *userInfo = meta[@"MCMMetadataUserInfo"];
-            if ([userInfo isKindOfClass:[NSDictionary class]] && [userInfo count] > 0) {
-                for (NSString *k in userInfo) {
-                    NSString *kl = [k lowercaseString];
-                    id val = userInfo[k];
-                    if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
-                        if ([kl containsString:@"name"] || [kl containsString:@"label"] || [kl containsString:@"title"]) {
-                            detectedName = val;
-                        } else if (([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"] || [kl containsString:@"uuid"]) && ![val isEqualToString:bundleID]) {
-                            craneID = val;
-                        }
+        for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
+            if ([meta[rk] isKindOfClass:[NSString class]] && [meta[rk] length] > 0) detectedName = meta[rk];
+        }
+        for (NSString *ik in @[@"com.opa334.crane.container.identifier", @"com.opa334.crane.container.id", @"craneContainerIdentifier"]) {
+            if ([meta[ik] isKindOfClass:[NSString class]] && [meta[ik] length] > 0) craneID = meta[ik];
+        }
+        NSDictionary *userInfo = meta[@"MCMMetadataUserInfo"];
+        if ([userInfo isKindOfClass:[NSDictionary class]] && [userInfo count] > 0) {
+            for (NSString *k in userInfo) {
+                NSString *kl = [k lowercaseString];
+                id val = userInfo[k];
+                if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
+                    if ([kl containsString:@"name"] || [kl containsString:@"label"] || [kl containsString:@"title"]) {
+                        detectedName = val;
+                    } else if (([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"] || [kl containsString:@"uuid"]) && ![val isEqualToString:bundleID]) {
+                        craneID = val;
                     }
                 }
             }
         }
 
-        if (!detectedName && [localShield isKindOfClass:[NSDictionary class]] && [localShield[@"containerName"] length] > 0) {
-            NSString *lsName = localShield[@"containerName"];
-            if ([lsName caseInsensitiveCompare:@"Default"] != NSOrderedSame) detectedName = lsName;
-        }
-        if (!craneID && [localShield isKindOfClass:[NSDictionary class]] && [localShield[@"craneIdentifier"] length] > 0) {
-            craneID = localShield[@"craneIdentifier"];
-        }
-        if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
+        BOOL folderHasCraneMeta = (craneID != nil || detectedName != nil || ([userInfo isKindOfClass:[NSDictionary class]] && [userInfo count] > 0));
+        BOOL appUsesCrane = isIG ? (igHasCraneConfigured || folderHasCraneMeta) : (rdHasCraneConfigured || folderHasCraneMeta);
 
+        // Si la app NO tiene Crane activado (como tu Instagram), no mostrar un contenedor Default fantasma
+        if (!appUsesCrane) continue;
+
+        if (!craneID) craneID = @"Default";
         if ([hiddenSet containsObject:[craneID lowercaseString]]) continue;
 
         NSDictionary *cEntry = craneMap[[craneID lowercaseString]] ?: craneMap[[folderUUID lowercaseString]];
@@ -1068,23 +1192,15 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }
 
         if (!detectedName || detectedName.length == 0) {
-            NSDictionary *userInfo = [meta isKindOfClass:[NSDictionary class]] ? meta[@"MCMMetadataUserInfo"] : nil;
-            BOOL alreadyHasDefault = NO;
-            for (NSDictionary *p in targetList) {
-                if ([p[@"containerName"] caseInsensitiveCompare:@"Default"] == NSOrderedSame) {
-                    alreadyHasDefault = YES;
-                    break;
-                }
-            }
-            if ((!userInfo || [userInfo count] == 0 || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) && !alreadyHasDefault) {
+            if ([craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
                 detectedName = @"Default";
-                craneID = @"Default";
             } else {
                 detectedName = craneID;
             }
         }
 
         if ([hiddenSet containsObject:[detectedName lowercaseString]]) continue;
+        if ([seenKeys containsObject:[craneID lowercaseString]] || [seenKeys containsObject:[detectedName lowercaseString]]) continue;
 
         NSMutableDictionary *prof = [self ensureProfileForBundle:bundleID
                                                             uuid:folderUUID
@@ -1097,46 +1213,14 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         [seenKeys addObject:[craneID lowercaseString]];
         [seenKeys addObject:[detectedName lowercaseString]];
         [targetList addObject:prof];
-
-        // Escanear subcarpetas ___Crane_Containers si existen dentro de la carpeta
-        NSString *subCraneDir = [fullPath stringByAppendingPathComponent:@"___Crane_Containers"];
-        if ([fm fileExistsAtPath:subCraneDir]) {
-            NSArray *subUUIDs = [fm contentsOfDirectoryAtPath:subCraneDir error:nil];
-            for (NSString *subID in subUUIDs) {
-                NSString *subLow = [subID lowercaseString];
-                if ([seenKeys containsObject:subLow] || [hiddenSet containsObject:subLow]) continue;
-                NSString *subPath = [subCraneDir stringByAppendingPathComponent:subID];
-                BOOL isDir = NO;
-                if (![fm fileExistsAtPath:subPath isDirectory:&isDir] || !isDir) continue;
-
-                NSDictionary *subEntry = craneMap[subLow];
-                NSString *subName = ([subEntry isKindOfClass:[NSDictionary class]] && [subEntry[@"name"] length] > 0) ? subEntry[@"name"] : nil;
-                if (!subName) {
-                    for (NSDictionary *src in craneSources) {
-                        subName = findCraneNameByID(src, subID);
-                        if (subName) break;
-                    }
-                }
-                if (!subName || subName.length == 0) subName = subID;
-                if ([hiddenSet containsObject:[subName lowercaseString]]) continue;
-
-                NSMutableDictionary *subProf = [self ensureProfileForBundle:bundleID
-                                                                       uuid:subID
-                                                                    craneID:subID
-                                                                defaultName:subName
-                                                                       path:subPath
-                                                         allowEnableDefault:NO
-                                                                forceRotate:NO];
-                [seenKeys addObject:subLow];
-                [seenKeys addObject:[subName lowercaseString]];
-                [targetList addObject:subProf];
-            }
-        }
     }
 
-    // 3. Añadir todos los contenedores registrados en Crane (ej. "testing") aunque aún no tengan carpeta separada en disco
+    // Añadir los contenedores configurados en Crane que aún no tengan carpeta separada
     for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
         BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
+        BOOL appUsesCrane = isIG ? igHasCraneConfigured : rdHasCraneConfigured;
+        if (!appUsesCrane) continue;
+
         NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
         NSMutableArray *targetList = isIG ? self.igContainersList : self.redditContainersList;
 
@@ -1164,46 +1248,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             [seenKeys addObject:[cName lowercaseString]];
             [targetList addObject:prof];
         }
-
-        // Si el contenedor activo en Crane (ej. "testing") aún no estaba en el mapa, incluirlo también
-        NSString *activeID = isIG ? igActiveCraneID : rdActiveCraneID;
-        if (activeID && activeID.length > 0 &&
-            ![seenKeys containsObject:[activeID lowercaseString]] &&
-            ![hiddenSet containsObject:[activeID lowercaseString]]) {
-            NSString *actName = ([activeID caseInsensitiveCompare:@"default"] == NSOrderedSame) ? @"Default" : activeID;
-            if (![seenKeys containsObject:[actName lowercaseString]]) {
-                NSMutableDictionary *prof = [self ensureProfileForBundle:bID
-                                                                    uuid:activeID
-                                                                 craneID:activeID
-                                                             defaultName:actName
-                                                                    path:@""
-                                                      allowEnableDefault:NO
-                                                             forceRotate:NO];
-                [seenKeys addObject:[activeID lowercaseString]];
-                [seenKeys addObject:[actName lowercaseString]];
-                [targetList addObject:prof];
-            }
-        }
-
-        // Garantizar siempre que Default exista al menos como contenedor base de la aplicación
-        BOOL hasDefault = NO;
-        for (NSDictionary *p in targetList) {
-            if ([p[@"containerName"] caseInsensitiveCompare:@"Default"] == NSOrderedSame) {
-                hasDefault = YES;
-                break;
-            }
-        }
-        if (!hasDefault) {
-            NSString *defUUID = [NSString stringWithFormat:@"Default_%@", isIG ? @"IG" : @"RD"];
-            NSMutableDictionary *defProf = [self ensureProfileForBundle:bID
-                                                                   uuid:defUUID
-                                                                craneID:@"Default"
-                                                            defaultName:@"Default"
-                                                                   path:@""
-                                                     allowEnableDefault:NO
-                                                            forceRotate:NO];
-            [targetList addObject:defProf];
-        }
     }
 
     NSComparator sortBlock = ^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
@@ -1216,7 +1260,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [self.igContainersList sortUsingComparator:sortBlock];
     [self.redditContainersList sortUsingComparator:sortBlock];
 
-    // 4. Purgar de state.plist cualquier contenedor viejo que ya no esté en la lista activa
     NSMutableSet *activeProfileKeys = [NSMutableSet set];
     for (NSDictionary *p in self.igContainersList) { if (p[@"containerUUID"]) [activeProfileKeys addObject:p[@"containerUUID"]]; }
     for (NSDictionary *p in self.redditContainersList) { if (p[@"containerUUID"]) [activeProfileKeys addObject:p[@"containerUUID"]]; }
@@ -1409,9 +1452,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = [NSString stringWithFormat:@"Instagram (%lu)", (unsigned long)self.igContainersList.count];
             cell.detailTextLabel.textColor = (masterOn && igOn && onCount > 0) ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-            cell.detailTextLabel.text = (!masterOn || !igOn || onCount == 0)
-                ? @"Todos en pausa manual"
-                : (onCount == 1 ? [NSString stringWithFormat:@"Protegido: %@", activeName] : [NSString stringWithFormat:@"%lu contenedores protegidos", (unsigned long)onCount]);
+            cell.detailTextLabel.text = (self.igContainersList.count == 0)
+                ? @"Sin contenedores de Crane activos"
+                : ((!masterOn || !igOn || onCount == 0)
+                    ? @"Todos en pausa manual"
+                    : (onCount == 1 ? [NSString stringWithFormat:@"Protegido: %@", activeName] : [NSString stringWithFormat:@"%lu contenedores protegidos", (unsigned long)onCount]));
         } else {
             BOOL rdOn = [self.state[@"enableReddit"] boolValue];
             cell.imageView.image = settingsBadgeIcon(@"bubble.left.and.bubble.right.fill", [UIColor systemOrangeColor]);
@@ -1426,9 +1471,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = [NSString stringWithFormat:@"Reddit (%lu)", (unsigned long)self.redditContainersList.count];
             cell.detailTextLabel.textColor = (masterOn && rdOn && onCount > 0) ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-            cell.detailTextLabel.text = (!masterOn || !rdOn || onCount == 0)
-                ? @"Todos en pausa manual"
-                : (onCount == 1 ? [NSString stringWithFormat:@"Protegido: %@", activeName] : [NSString stringWithFormat:@"%lu contenedores protegidos", (unsigned long)onCount]);
+            cell.detailTextLabel.text = (self.redditContainersList.count == 0)
+                ? @"Sin contenedores de Crane activos"
+                : ((!masterOn || !rdOn || onCount == 0)
+                    ? @"Todos en pausa manual"
+                    : (onCount == 1 ? [NSString stringWithFormat:@"Protegido: %@", activeName] : [NSString stringWithFormat:@"%lu contenedores protegidos", (unsigned long)onCount]));
         }
         return cell;
     }
@@ -1557,7 +1604,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
 - (void)refreshFromCrane:(UIRefreshControl *)rc {
     triggerHaptic();
-    // Al deslizar hacia abajo para refrescar, limpia cualquier exclusión y re-escanea Crane al 100%
     self.parentRoot.state[@"hiddenContainerIDs"] = @[];
     [self.parentRoot saveState];
     [self.parentRoot scanAndSyncAllContainers];
@@ -1583,7 +1629,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     if (section == 0) return @"CONTROL DE LA APLICACIÓN";
-    return [NSString stringWithFormat:@"CONTENEDORES EN CRANE (%lu) — DESLIZA ABAJO PARA REFRESCAR", (unsigned long)self.containers.count];
+    return [NSString stringWithFormat:@"CONTENEDORES EN CRANE (%lu) — DESLIZA IZQ. PARA ELIMINAR EN CRANE", (unsigned long)self.containers.count];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -1601,9 +1647,16 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     if (editingStyle == UITableViewCellEditingStyleDelete && indexPath.section == 1 && indexPath.row < self.containers.count) {
         triggerHaptic();
         NSDictionary *prof = self.containers[indexPath.row];
-        [self.parentRoot hideAndPurgeContainerProfile:prof];
+        NSString *cName = prof[@"containerName"] ?: @"Contenedor";
+        [self.parentRoot deleteContainerFromTweakAndCrane:prof];
         [self.containers removeObjectAtIndex:indexPath.row];
         [self.tableView reloadData];
+
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🗑️ Contenedor Eliminado"
+                                                                    message:[NSString stringWithFormat:@"Se eliminó \"%@\" del tweak, de los registros de Crane y su carpeta de datos.", cName]
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
     }
 }
 
@@ -1628,8 +1681,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     if (self.containers.count == 0) {
         UITableViewCell *empty = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        empty.textLabel.text = @"No hay contenedores registrados";
-        empty.detailTextLabel.text = @"Desliza hacia abajo para refrescar desde Crane";
+        empty.textLabel.text = @"Crane no tiene contenedores en esta app";
+        empty.detailTextLabel.text = @"Activa Crane para esta aplicación y crea un contenedor para verlo aquí";
         return empty;
     }
 
@@ -1845,11 +1898,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             @"Ocultación C/Kernel y Anti-Popup iCloud"
         ];
         NSArray *subtitles = @[
-            @"Inyecta IDFV único, BootSessionUUID y bloquea iCloud por contenedor",
+            @"Sincroniza IDFV con Crane, aísla BootSessionUUID y bloquea CloudKit",
             @"Oculta el túnel utun en getifaddrs() y reporta Datos Móviles 4G LTE",
             @"Ancla el huso horario e idioma (NSLocale) de esta cuenta al país de su IP",
             @"Aísla batería, volumen, brillo, espacio libre y tiempo de arranque (uptime)",
-            @"Oculta /var/jb en access()/stat()/fopen()/dyld y bloquea alerta Apple ID"
+            @"Oculta /var/jb en access()/stat()/fopen()/dyld y bloquea demonios Apple ID"
         ];
         NSArray *keys = @[@"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity"];
 
@@ -1947,7 +2000,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"🛡️ Blindaje Anti-Jailbreak y Anti-iCloud";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? @"● ACTIVO: access/stat/fopen/dyld ocultos • Alerta Apple ID bloqueada"
+                    ? @"● ACTIVO: access/stat/fopen/dyld + CloudKit/AuthKit bloqueados"
                     : @"○ DESACTIVADO (Rutas de Jailbreak visibles)";
                 break;
             }
@@ -2036,7 +2089,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         } else if (idx == 4) {
             popupTitle = sender.isOn ? @"🛡️ Escudo Anti-Jailbreak Aplicado" : @"⚪ Escudo Anti-Jailbreak Desactivado";
             popupMsg = sender.isOn
-                ? @"Funciones C (access, stat, lstat, fopen, dyld) protegidas y cartel de Apple ID bloqueado."
+                ? @"Funciones C (access, stat, lstat, fopen, dyld) protegidas y demonios de Apple ID/iCloud bloqueados."
                 : @"Filtro de rutas de Jailbreak desactivado.";
         }
 
