@@ -17,7 +17,7 @@ extern char **environ;
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 25
+#define CURRENT_SCHEMA_VERSION 27
 
 @interface PSViewController : UIViewController
 @end
@@ -75,24 +75,6 @@ static void killAppProcess(NSString *procName) {
     pid_t pid;
     const char *args[] = {"/var/jb/usr/bin/killall", "-9", [procName UTF8String], NULL};
     posix_spawn(&pid, args[0], NULL, NULL, (char *const *)args, environ);
-}
-
-static BOOL nodeMentionsString(id node, NSString *needle) {
-    if (!node || !needle) return NO;
-    if ([node isKindOfClass:[NSString class]]) {
-        return [(NSString *)node rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
-    }
-    if ([node isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *d = (NSDictionary *)node;
-        for (id k in d) {
-            if (nodeMentionsString(k, needle) || nodeMentionsString(d[k], needle)) return YES;
-        }
-    } else if ([node isKindOfClass:[NSArray class]]) {
-        for (id item in (NSArray *)node) {
-            if (nodeMentionsString(item, needle)) return YES;
-        }
-    }
-    return NO;
 }
 
 static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
@@ -420,6 +402,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 @property (nonatomic, strong) NSString *realFreeDisk;
 @property (nonatomic, assign) int realBatteryPct;
 @property (nonatomic, assign) int realVolumePct;
+@property (nonatomic, assign) BOOL stealthCurrentlyActive;
 @property (nonatomic, strong) NSString *stealthSummary;
 @property (nonatomic, strong) NSString *stealthDetailReport;
 @property (nonatomic, strong) NSString *residualSummary;
@@ -532,7 +515,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
 
     UIImageView *shieldView = [[UIImageView alloc] initWithFrame:CGRectMake(16, 18, 50, 50)];
-    shieldView.backgroundColor = masterOn ? [UIColor systemBlueColor] : [UIColor systemGrayColor];
+    shieldView.backgroundColor = (masterOn && self.stealthCurrentlyActive) ? [UIColor systemBlueColor] : [UIColor systemGrayColor];
     shieldView.layer.cornerRadius = 12.0;
     shieldView.contentMode = UIViewContentModeCenter;
     UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:26 weight:UIImageSymbolWeightBold];
@@ -549,15 +532,15 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     subLbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     subLbl.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
     subLbl.textColor = [UIColor secondaryLabelColor];
-    subLbl.text = @"Auto-Ocultación C/Kernel • Sin Choicy";
+    subLbl.text = @"Control 100% manual • Modo Invisible";
     [card addSubview:subLbl];
 
     UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 240, 18)];
     pill.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
-    pill.textColor = masterOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-    pill.text = masterOn
+    pill.textColor = (masterOn && self.stealthCurrentlyActive) ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+    pill.text = (masterOn && self.stealthCurrentlyActive)
         ? [NSString stringWithFormat:@"● ESCUDO ACTIVO • TÚNEL: %@", self.vpnActive ? [self.vpnInterfaceName uppercaseString] : @"DIRECTO"]
-        : @"○ ESCUDO GLOBAL EN PAUSA MANUAL";
+        : @"○ EN PAUSA (ENCIENDE UN CONTENEDOR)";
     [card addSubview:pill];
 
     [header addSubview:card];
@@ -607,14 +590,39 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [self saveState];
 }
 
-// Diagnóstico del Motor de Auto-Ocultación Interno (Sin Choicy)
 - (void)auditStealthEngineStatus {
-    self.stealthSummary = @"Auto-ocultación de JB, Crane y Tweak por contenedor";
+    BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
+    BOOL igOn = [self.state[@"enableIG"] boolValue];
+    BOOL rdOn = [self.state[@"enableReddit"] boolValue];
+
+    NSUInteger activeContainers = 0;
+    if (masterOn && igOn) {
+        for (NSDictionary *p in self.igContainersList) {
+            if ([p[@"enabled"] boolValue]) activeContainers++;
+        }
+    }
+    if (masterOn && rdOn) {
+        for (NSDictionary *p in self.redditContainersList) {
+            if ([p[@"enabled"] boolValue]) activeContainers++;
+        }
+    }
+
+    self.stealthCurrentlyActive = (activeContainers > 0);
+
+    if (self.stealthCurrentlyActive) {
+        self.stealthSummary = [NSString stringWithFormat:@"🟢 Activo en %lu contenedor(es) — Ocultando JB, Crane y Tweak", (unsigned long)activeContainers];
+    } else {
+        self.stealthSummary = @"⚪ En pausa — Enciende un contenedor para activarlo";
+    }
+
     self.stealthDetailReport =
-        @"• Ocultación de IGFarmShield: Bloquea la lectura de IGFarmShield.dylib y .igshield_container.plist ante la app.\n\n"
-        @"• Ocultación de Crane: Oculta Crane.dylib, libcrane, com.opa334.crane y las variables de entorno CRANE_* ante la app, permitiendo que Crane opere libremente por debajo.\n\n"
-        @"• Ocultación de Jailbreak: Bloquea /var/jb, /private/preboot, ellekit, palera1n, Sileo y Filza en access(), stat(), lstat(), fopen(), getenv(), dyld y dladdr.\n\n"
-        @"• Bloqueo Apple ID / StoreKit: Intercepta SKPaymentQueue, ASAuthorizationAppleIDProvider y CloudKit.";
+        @"¿Qué hace el Modo Invisible?\n"
+        @"Cuando enciendes un contenedor, hace que Reddit e Instagram vean tu teléfono como un iPhone normal de fábrica:\n\n"
+        @"1. Oculta el Jailbreak (carpetas como /var/jb y Sileo).\n"
+        @"2. Oculta que usas Crane.\n"
+        @"3. Oculta este mismo tweak (IGFarmShield).\n\n"
+        @"¿Puede causar fugas (leaks) entre contenedores?\n"
+        @"No. Ocultar el Jailbreak no comparte ningún dato entre tus cuentas; simplemente evita que la aplicación detecte que tienes herramientas instaladas.";
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -746,6 +754,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }
     }
 
+    [self auditStealthEngineStatus];
     killAppProcess([bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
 }
 
@@ -1204,7 +1213,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     if (section == 0) return @"CONTROL PRINCIPAL (100% MANUAL)";
     if (section == 1) return @"CONTENEDORES POR APLICACIÓN (CRANE)";
-    if (section == 2) return @"MOTOR DE AUTO-OCULTACIÓN INTERNO";
+    if (section == 2) return @"ESTADO DE RED Y MODO INVISIBLE";
     return @"ROTACIÓN SEGURA DE CUENTAS";
 }
 
@@ -1228,7 +1237,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"shield.fill", masterOn ? [UIColor systemBlueColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Escudo Maestro IGFarmShield";
-            cell.detailTextLabel.text = masterOn ? @"Habilitado (Activa manualmente cada contenedor)" : @"En pausa manual (Todo desactivado)";
+            cell.detailTextLabel.text = masterOn ? @"Habilitado (Ahora enciende el contenedor que vayas a usar)" : @"En pausa manual (Todo desactivado)";
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = masterOn;
             sw.tag = 10;
@@ -1306,16 +1315,16 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             cell.imageView.image = settingsBadgeIcon(@"network", self.vpnActive ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-            cell.textLabel.text = @"Interfaz de Túnel Local (Shadowrocket)";
+            cell.textLabel.text = @"Túnel de Proxy (Shadowrocket)";
             cell.detailTextLabel.text = self.vpnActive
-                ? [NSString stringWithFormat:@"Túnel %@ activo • Enmascarado ante las apps", self.vpnInterfaceName]
-                : @"Sin túnel VPN activo (La IP se verifica dentro de cada contenedor)";
+                ? [NSString stringWithFormat:@"Conectado (%@) • Oculto en los contenedores activos", self.vpnInterfaceName]
+                : @"Apagado en este momento";
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.imageView.image = settingsBadgeIcon(@"eye.slash.fill", [UIColor systemGreenColor]);
+            cell.imageView.image = settingsBadgeIcon(@"eye.slash.fill", self.stealthCurrentlyActive ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-            cell.textLabel.text = @"Motor Anti-Detección (JB / Crane / Tweak)";
-            cell.detailTextLabel.textColor = [UIColor systemGreenColor];
+            cell.textLabel.text = @"Modo Invisible (Ocultar JB, Crane y Tweak)";
+            cell.detailTextLabel.textColor = self.stealthCurrentlyActive ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             cell.detailTextLabel.text = self.stealthSummary;
         }
         return cell;
@@ -1338,6 +1347,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     if (sender.tag == 10) {
         self.state[@"masterEnabled"] = @(sender.isOn);
         [self saveState];
+        [self auditStealthEngineStatus];
         killAppProcess(@"Instagram");
         killAppProcess(@"Reddit");
         self.tableView.tableHeaderView = [self buildHeaderBannerView];
@@ -1347,8 +1357,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         [self saveState];
         if (sender.isOn) {
             NSString *keptSummary = [self enforceExclusiveModeWhenToggledOn];
+            [self auditStealthEngineStatus];
             killAppProcess(@"Instagram");
             killAppProcess(@"Reddit");
+            self.tableView.tableHeaderView = [self buildHeaderBannerView];
             [self.tableView reloadData];
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔒 Modo Exclusivo Aplicado"
                                                                         message:[NSString stringWithFormat:@"Estado actual por aplicación:\n• %@", keptSummary ?: @"Ninguno"]
@@ -1385,7 +1397,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     if (indexPath.section == 2 && indexPath.row == 1) {
         triggerHaptic();
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Motor de Auto-Ocultación"
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ ¿Cómo funciona el Modo Invisible?"
                                                                     message:self.stealthDetailReport
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDefault handler:nil]];
@@ -1422,6 +1434,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)refreshFromCrane:(UIRefreshControl *)rc {
     triggerHaptic();
     [self.parentRoot scanAndSyncAllContainers];
+    [self.parentRoot auditStealthEngineStatus];
     self.containers = [self.bundleID isEqualToString:@"com.burbn.instagram"]
         ? self.parentRoot.igContainersList
         : self.parentRoot.redditContainersList;
@@ -1432,6 +1445,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self.parentRoot scanAndSyncAllContainers];
+    [self.parentRoot auditStealthEngineStatus];
     self.containers = [self.bundleID isEqualToString:@"com.burbn.instagram"]
         ? self.parentRoot.igContainersList
         : self.parentRoot.redditContainersList;
@@ -1469,6 +1483,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *cName = prof[@"containerName"] ?: @"Contenedor";
         [self.parentRoot purgeGhostContainerFromTweak:prof];
         [self.containers removeObjectAtIndex:indexPath.row];
+        [self.parentRoot auditStealthEngineStatus];
         [self.tableView reloadData];
 
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Rastro Fantasma Purgado"
@@ -1558,6 +1573,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     triggerHaptic();
     self.parentRoot.state[self.appStateKey] = @(sender.isOn);
     [self.parentRoot saveState];
+    [self.parentRoot auditStealthEngineStatus];
     killAppProcess([self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
     [self.tableView reloadData];
 }
@@ -1622,6 +1638,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)saveCurrentProfile {
     if (self.parentRoot && self.profile && self.containerUUID) {
         [self.parentRoot saveProfile:self.profile forUUID:self.containerUUID];
+        [self.parentRoot auditStealthEngineStatus];
         killAppProcess([self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
     }
 }
@@ -1639,8 +1656,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     switch (section) {
         case 0: return @"1. CONTROL MANUAL Y RED DE ESTE CONTENEDOR";
-        case 1: return @"2. PROTOCOLOS DE SPOOFING INDEPENDIENTES";
-        case 2: return @"3. FINGERPRINT AISLADO (TOCA UNA FILA PARA COPIAR)";
+        case 1: return @"2. FUNCIONES DE PROTECCIÓN INDEPENDIENTES";
+        case 2: return @"3. DATOS QUE VE LA APP (TOCA PARA COPIAR)";
         case 3: return @"4. SENSORES PUROS DEL TELÉFONO Y ROTACIÓN";
         default: return nil;
     }
@@ -1669,7 +1686,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"shield.lefthalf.filled", contOn ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Activar Escudo en este Contenedor";
-            cell.detailTextLabel.text = contOn ? @"Activo • Inyectando Fingerprint y Auto-Ocultación" : @"En pausa manual (Usando datos nativos del iPhone)";
+            cell.detailTextLabel.text = contOn ? @"Activo • Protegiendo esta cuenta y ocultando el Jailbreak" : @"En pausa manual (Usando datos reales del iPhone)";
             cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = contOn;
@@ -1682,7 +1699,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
             cell.textLabel.textColor = [UIColor systemBlueColor];
             cell.textLabel.text = @"Sincronizar IP y Antena en este Contenedor";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"Cascada HTTPS vía Shadowrocket • IP guardada: %@",
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"Lee la IP actual de Shadowrocket • Guardada: %@",
                                          self.profile[@"lastSyncedIP"] ?: @"Sin sincronizar"];
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -1711,17 +1728,17 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         ];
         NSArray *titles = @[
             @"Identificadores del Sistema",
-            @"Coherencia Automática 4G / Wi-Fi y Anti-VPN",
-            @"Ubicación de Red (Hora e Idioma)",
-            @"Datos Puros del Teléfono",
-            @"Auto-Ocultación (JB, Crane y Tweak)"
+            @"Simulación 4G / Wi-Fi y Ocultar VPN",
+            @"Hora e Idioma según la IP",
+            @"Sensores Físicos del Teléfono",
+            @"Modo Invisible (Ocultar JB, Crane y Tweak)"
         ];
         NSArray *subtitles = @[
-            @"Armoniza IDFV con Crane desde el arranque y aísla BootSessionUUID",
-            @"Oculta el túnel utun en getifaddrs() y reporta Datos Móviles 4G LTE",
-            @"Ancla el huso horario e idioma (NSLocale) de esta cuenta al país de su IP",
-            @"Aísla batería, volumen, brillo, espacio libre y tiempo de arranque (uptime)",
-            @"Oculta /var/jb, rutas/variables de Crane, IGFarmShield.dylib y alertas Apple ID"
+            @"Sincroniza el IDFV con Crane y asigna un código de arranque único",
+            @"Oculta el VPN de Shadowrocket y simula conexión de Datos Móviles 4G LTE",
+            @"Ajusta automáticamente la zona horaria e idioma al país de tu proxy",
+            @"Simula batería, volumen, brillo, memoria libre y tiempo de encendido",
+            @"Hace invisible el Jailbreak, Crane, este tweak y bloquea el aviso de Apple ID"
         ];
         NSArray *keys = @[@"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity"];
 
@@ -1769,9 +1786,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"🔑 Identificadores del Sistema";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"● SPOOF ACTIVO (Sincronizado con Crane):\nIDFV:     %@\nBootUUID: %@",
+                    ? [NSString stringWithFormat:@"● PROTEGIDO (Sincronizado con Crane):\nIDFV:     %@\nBootUUID: %@",
                        self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
-                    : @"○ NATIVO (Exponiendo UUIDs reales del sistema)";
+                    : @"○ EN PAUSA (Mostrando UUIDs reales del iPhone)";
                 break;
             }
             case 2: {
@@ -1780,14 +1797,14 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"📡 Conexión Que Ve la Aplicación";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 if (!on) {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"○ NATIVO (Exponiendo tu Wi-Fi real %@)", self.parentRoot.realLocalIP ?: @"LAN"];
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"○ EN PAUSA (Mostrando tu Wi-Fi real %@)", self.parentRoot.realLocalIP ?: @"LAN"];
                 } else if (isCell) {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● DATOS MÓVILES 4G LTE (Wi-Fi y VPN utun Ocultos):\nOperadora: %@ (MCC %@ / MNC %@)",
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● DATOS MÓVILES 4G LTE (Wi-Fi y VPN Ocultos):\nOperadora: %@ (MCC %@ / MNC %@)",
                                                  self.profile[@"CarrierName"] ?: @"T-Mobile",
                                                  self.profile[@"CarrierMCC"] ?: @"310",
                                                  self.profile[@"CarrierMNC"] ?: @"260"];
                 } else {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● WI-FI RESIDENCIAL (VPN utun Oculto):\nIP Local:    %@\nRouter Wi-Fi: %@ (%@)",
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● WI-FI RESIDENCIAL (VPN Oculto):\nIP Local:    %@\nRouter Wi-Fi: %@ (%@)",
                                                  self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]];
                 }
                 break;
@@ -1797,30 +1814,30 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"🌎 Ubicación de Red y Zona Horaria";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"● AISLADO POR CONTENEDOR:\nIP / ISP:      %@ (%@)\nUbicación:     %@\nZona / Idioma: %@ (%@)",
+                    ? [NSString stringWithFormat:@"● PROTEGIDO:\nIP / ISP:      %@ (%@)\nUbicación:     %@\nZona / Idioma: %@ (%@)",
                        self.profile[@"lastSyncedIP"] ?: @"Sin sincronizar", self.profile[@"ispName"] ?: @"ISP",
                        self.profile[@"cityCountry"] ?: @"Sincroniza arriba", self.profile[@"timeZone"], self.profile[@"localeID"]]
-                    : [NSString stringWithFormat:@"○ NATIVO (Hora local %@)", [[NSTimeZone localTimeZone] name]];
+                    : [NSString stringWithFormat:@"○ EN PAUSA (Hora local %@)", [[NSTimeZone localTimeZone] name]];
                 break;
             }
             case 4: {
                 BOOL on = [self isModOn:@"spoofHardware"];
-                cell.textLabel.text = @"🔋 Datos Puros del Teléfono (iPhone 8)";
+                cell.textLabel.text = @"🔋 Sensores del Teléfono (iPhone 8)";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"● AISLADO (iPhone10,4 • Build Nativo):\nBatería: %d%% • Volumen: %d%% • Brillo: %d%%\nDisco Libre: %.2f GB • Uptime: +%lu min",
+                    ? [NSString stringWithFormat:@"● PROTEGIDO (iPhone10,4):\nBatería: %d%% • Volumen: %d%% • Brillo: %d%%\nDisco Libre: %.2f GB • Encendido: +%lu min",
                        batPct, volPct, briPct, freeGB, (unsigned long)upMin]
-                    : [NSString stringWithFormat:@"○ NATIVO (Bat %d%% • Vol %d%% • %@)",
+                    : [NSString stringWithFormat:@"○ EN PAUSA (Bat %d%% • Vol %d%% • %@)",
                        self.parentRoot.realBatteryPct, self.parentRoot.realVolumePct, self.parentRoot.realFreeDisk ?: @"64GB"];
                 break;
             }
             case 5: {
                 BOOL on = [self isModOn:@"spoofSecurity"];
-                cell.textLabel.text = @"🛡️ Auto-Ocultación (JB, Crane y Tweak)";
+                cell.textLabel.text = @"🛡️ Modo Invisible (JB, Crane y Tweak)";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? @"● ACTIVO EN ESTE CONTENEDOR:\nOcultos: /var/jb, Crane.dylib, CRANE_*, IGFarmShield.dylib\nBloqueados: StoreKit, CloudKit y alertas Apple ID"
-                    : @"○ DESACTIVADO (Rutas de Jailbreak, Crane y Tweak visibles)";
+                    ? @"● ACTIVO EN ESTA CUENTA:\nJailbreak, Crane e IGFarmShield son invisibles para la app.\nAvisos de Apple ID / StoreKit bloqueados."
+                    : @"○ EN PAUSA (Enciende el contenedor arriba para ocultarlo)";
                 break;
             }
         }
@@ -1834,15 +1851,15 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         cell.imageView.image = settingsBadgeIcon(@"bolt.batteryblock.fill", [UIColor systemBlueColor]);
         cell.textLabel.textColor = [UIColor systemBlueColor];
         cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-        cell.textLabel.text = @"Actualizar Datos Puros del Teléfono";
-        cell.detailTextLabel.text = @"Varía batería, volumen, brillo, espacio libre y uptime sin tocar el IDFV";
+        cell.textLabel.text = @"Renovar Batería, Volumen y Memoria Libre";
+        cell.detailTextLabel.text = @"Cambia los sensores físicos sin alterar el identificador IDFV de la cuenta";
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     } else {
         cell.imageView.image = settingsBadgeIcon(@"arrow.triangle.2.circlepath", [UIColor systemRedColor]);
         cell.textLabel.textColor = [UIColor systemRedColor];
         cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
         cell.textLabel.text = @"Regenerar Huella Completa del Contenedor";
-        cell.detailTextLabel.text = @"Genera un nuevo IDFV, BootUUID, red local y parámetros físicos desde cero";
+        cell.detailTextLabel.text = @"Genera un nuevo IDFV, BootUUID, red local y sensores desde cero";
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     }
     return cell;
@@ -1855,10 +1872,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         self.profile[@"enabled"] = @(sender.isOn);
         [self.tableView reloadData];
 
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:sender.isOn ? @"🟢 Contenedor Activado Manualmente" : @"⚪ Contenedor en Pausa Manual"
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:sender.isOn ? @"🟢 Contenedor Protegido" : @"⚪ Contenedor en Pausa"
                                                                     message:sender.isOn
-                                                                        ? [NSString stringWithFormat:@"Escudo y Auto-Ocultación activos para \"%@\".\n• IDFV inyectado: %@\n• BootUUID: %@", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
-                                                                        : @"Escudo en pausa. Este contenedor permanecerá desactivado hasta que lo enciendas manualmente."
+                                                                        ? [NSString stringWithFormat:@"Escudo y Modo Invisible activados en \"%@\".\n• IDFV: %@", self.profile[@"containerName"], self.profile[@"idfv"]]
+                                                                        : @"Este contenedor está en pausa manual y no modificará nada hasta que lo vuelvas a encender."
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:ac animated:YES completion:nil];
@@ -1875,22 +1892,22 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *popupMsg = @"";
 
         if (idx == 0) {
-            popupTitle = sender.isOn ? @"🔑 Identificadores Aplicados" : @"⚪ Identificadores Desactivados";
+            popupTitle = sender.isOn ? @"🔑 Identificadores Activados" : @"⚪ Identificadores en Pausa";
             popupMsg = sender.isOn
                 ? [NSString stringWithFormat:@"• IDFV: %@\n• BootUUID: %@", self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
-                : @"Usando UUIDs nativos del sistema.";
+                : @"Usando UUIDs reales del sistema.";
         } else if (idx == 1) {
             BOOL isCell = [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"];
-            popupTitle = sender.isOn ? (isCell ? @"📱 Datos Móviles 4G Activos" : @"🛜 Wi-Fi Residencial Activo") : @"⚪ Spoof de Red Desactivado";
+            popupTitle = sender.isOn ? (isCell ? @"📱 Datos Móviles 4G Activos" : @"🛜 Wi-Fi Residencial Activo") : @"⚪ Simulación de Red en Pausa";
             popupMsg = sender.isOn
                 ? (isCell
-                   ? [NSString stringWithFormat:@"Operadora inyectada: %@ (%@/%@) • Wi-Fi físico y túnel utun ocultos.", self.profile[@"CarrierName"], self.profile[@"CarrierMCC"], self.profile[@"CarrierMNC"]]
-                   : [NSString stringWithFormat:@"Wi-Fi inyectado: %@ (%@) • Túnel utun oculto.", self.profile[@"ssid"], self.profile[@"bssid"]])
+                   ? [NSString stringWithFormat:@"Operadora simulada: %@ • Wi-Fi y VPN ocultos.", self.profile[@"CarrierName"]]
+                   : [NSString stringWithFormat:@"Wi-Fi simulado: %@ • VPN oculto.", self.profile[@"ssid"]])
                 : @"Mostrando conexión física real del teléfono.";
         } else if (idx == 2) {
-            popupTitle = sender.isOn ? @"🌎 Ubicación de Red Aplicada" : @"⚪ Ubicación de Red Desactivada";
+            popupTitle = sender.isOn ? @"🌎 Hora e Idioma Aplicados" : @"⚪ Hora e Idioma en Pausa";
             popupMsg = sender.isOn
-                ? [NSString stringWithFormat:@"• Región: %@\n• Zona Horaria: %@\n• Idioma: %@", self.profile[@"cityCountry"], self.profile[@"timeZone"], self.profile[@"localeID"]]
+                ? [NSString stringWithFormat:@"• Ubicación: %@\n• Zona Horaria: %@\n• Idioma: %@", self.profile[@"cityCountry"], self.profile[@"timeZone"], self.profile[@"localeID"]]
                 : @"Usando reloj e idioma reales del iPhone.";
         } else if (idx == 3) {
             if (sender.isOn) {
@@ -1899,17 +1916,17 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 int batPct = (int)([self.profile[@"batteryLevel"] floatValue] * 100.0f);
                 int volPct = (int)([self.profile[@"audioVolume"] floatValue] * 100.0f);
                 int briPct = (int)([self.profile[@"brightness"] floatValue] * 100.0f);
-                popupTitle = @"🔋 Datos Puros del Teléfono Aplicados";
+                popupTitle = @"🔋 Sensores Aplicados";
                 popupMsg = [NSString stringWithFormat:@"• Batería: %d%%\n• Volumen: %d%%\n• Brillo: %d%%\n• Espacio Libre: %.2f GB", batPct, volPct, briPct, freeGB];
             } else {
-                popupTitle = @"⚪ Datos de Hardware Desactivados";
-                popupMsg = @"Reportando batería, volumen y disco reales.";
+                popupTitle = @"⚪ Sensores en Pausa";
+                popupMsg = @"Reportando batería, volumen y memoria reales.";
             }
         } else if (idx == 4) {
-            popupTitle = sender.isOn ? @"🛡️ Auto-Ocultación Activada" : @"⚪ Auto-Ocultación Desactivada";
+            popupTitle = sender.isOn ? @"🛡️ Modo Invisible Activado" : @"⚪ Modo Invisible en Pausa";
             popupMsg = sender.isOn
-                ? @"Ocultando /var/jb, Crane.dylib, variables CRANE_*, IGFarmShield.dylib y alertas de Apple ID exclusivamente ante la aplicación."
-                : @"Filtro de auto-ocultación desactivado en este contenedor.";
+                ? @"Ocultando el Jailbreak, Crane y este tweak ante la aplicación, y bloqueando el cartel de Apple ID."
+                : @"Modo invisible desactivado en este contenedor.";
         }
 
         [self saveCurrentProfile];
@@ -1947,8 +1964,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     int briPct = (int)([self.profile[@"brightness"] floatValue] * 100.0f);
     NSUInteger upMin = [self.profile[@"uptimeOffset"] unsignedIntegerValue] / 60;
 
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔋 Datos Puros del Teléfono Renovados"
-                                                                message:[NSString stringWithFormat:@"Sensores actualizados en \"%@\":\n\n• Batería Simulada: %d%%\n• Volumen de Audio: %d%%\n• Brillo de Pantalla: %d%%\n• Espacio Libre: %.2f GB\n• Uptime: +%lu min",
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔋 Sensores Renovados"
+                                                                message:[NSString stringWithFormat:@"Nuevos valores en \"%@\":\n\n• Batería: %d%%\n• Volumen: %d%%\n• Brillo: %d%%\n• Espacio Libre: %.2f GB\n• Encendido: +%lu min",
                                                                          self.profile[@"containerName"], batPct, volPct, briPct, freeGB, (unsigned long)upMin]
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"Perfecto" style:UIAlertActionStyleDefault handler:nil]];
@@ -1993,7 +2010,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             killAppProcess([self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
             [self.tableView reloadData];
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔄 Huella Completa Regenerada"
-                                                                        message:[NSString stringWithFormat:@"Nuevos datos asignados exclusivamente a \"%@\":\n\n• Nuevo IDFV: %@\n• Nuevo BootUUID: %@\n• LAN: %@",
+                                                                        message:[NSString stringWithFormat:@"Nuevos datos asignados a \"%@\":\n\n• Nuevo IDFV: %@\n• Nuevo BootUUID: %@\n• LAN: %@",
                                                                                  self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"], self.profile[@"localIP"]]
                                                                  preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -2038,7 +2055,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 [self.tableView reloadData];
                 BOOL isCell = [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"];
                 UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"✅ IP Sincronizada con Shadowrocket"
-                                                                            message:[NSString stringWithFormat:@"• Contenedor Exclusivo: %@\n• IP Asignada: %@\n• Antena/ISP: %@\n• Modo Automático: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
+                                                                            message:[NSString stringWithFormat:@"• Contenedor: %@\n• IP Asignada: %@\n• Antena/ISP: %@\n• Modo Automático: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
                                                                                      self.profile[@"containerName"], ip, ispRaw, isCell ? @"📱 Datos Móviles 4G LTE" : @"🛜 Wi-Fi Residencial", city, region, [cc uppercaseString], tz]
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
