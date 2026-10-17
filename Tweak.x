@@ -19,11 +19,16 @@
 #import <dlfcn.h>
 #import <string.h>
 #import <stdlib.h>
+#import <stdio.h>
 #import <time.h>
 #import <substrate.h>
 
 #define GLOBAL_STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
-#define CURRENT_SCHEMA_VERSION 21
+#define CRANE_PREFS_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
+#define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
+#define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
+#define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
+#define CURRENT_SCHEMA_VERSION 22
 
 @interface ASAuthorizationController : NSObject
 - (void)performRequests;
@@ -42,6 +47,7 @@ static int (*orig_statfs)(const char *, struct statfs *) = NULL;
 static int (*orig_access)(const char *, int) = NULL;
 static int (*orig_stat)(const char *, struct stat *) = NULL;
 static int (*orig_lstat)(const char *, struct stat *) = NULL;
+static FILE *(*orig_fopen)(const char *, const char *) = NULL;
 static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 static Boolean (*orig_SCNetworkReachabilityGetFlags)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *) = NULL;
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
@@ -70,17 +76,64 @@ static void applyLowLevelCTimeZone(NSString *tzName) {
     tzset();
 }
 
-// Filtra para que los hooks de bajo nivel solo engañen al binario de la App y nunca rompan librerías del sistema ni Crane
-static BOOL isCallerFromTargetApp(const void *retAddr) {
-    if (!retAddr || !orig_dladdr) return YES;
+// Permite que Crane opere libremente sin ser bloqueado por los hooks de seguridad
+static BOOL isCallerFromCrane(const void *retAddr) {
+    if (!retAddr || !orig_dladdr) return NO;
+    Dl_info info;
+    if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
+        if (strstr(info.dli_fname, "Crane") != NULL || strstr(info.dli_fname, "crane") != NULL) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Verifica si quien llama es directamente el ejecutable/framework de la App (y no libnetwork.dylib del sistema)
+static BOOL isCallerFromAppBundle(const void *retAddr) {
+    if (!retAddr || !orig_dladdr) return NO;
     Dl_info info;
     if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
         if (strstr(info.dli_fname, "/Containers/Bundle/Application/") != NULL) {
             return YES;
         }
-        return NO;
     }
-    return YES;
+    return NO;
+}
+
+static NSString *findCraneNameInNode(id node, NSString *targetID) {
+    if (!node || !targetID || targetID.length == 0) return nil;
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)node;
+        for (id k in dict) {
+            NSString *kStr = [k description];
+            id val = dict[k];
+            if ([kStr caseInsensitiveCompare:targetID] == NSOrderedSame) {
+                if ([val isKindOfClass:[NSString class]] && [val length] > 0) return val;
+                if ([val isKindOfClass:[NSDictionary class]]) {
+                    for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+                        if ([val[nk] isKindOfClass:[NSString class]] && [val[nk] length] > 0) return val[nk];
+                    }
+                }
+            }
+            if ([val isKindOfClass:[NSString class]] && [val caseInsensitiveCompare:targetID] == NSOrderedSame) {
+                for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
+                    if ([dict[nk] isKindOfClass:[NSString class]] && [dict[nk] length] > 0 && ![dict[nk] isEqualToString:targetID]) {
+                        return dict[nk];
+                    }
+                }
+            }
+            if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
+                NSString *found = findCraneNameInNode(val, targetID);
+                if (found) return found;
+            }
+        }
+    } else if ([node isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)node) {
+            NSString *found = findCraneNameInNode(item, targetID);
+            if (found) return found;
+        }
+    }
+    return nil;
 }
 
 static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
@@ -119,6 +172,16 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
     }
 
     if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
+
+    for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_MAIN_JB, CRANE_PREFS_VAR, CRANE_MAIN_VAR]) {
+        NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
+        if ([cPrefs isKindOfClass:[NSDictionary class]] && [cPrefs count] > 0) {
+            if (!craneName && craneID) craneName = findCraneNameInNode(cPrefs, craneID);
+            if (!craneName && origCraneIDFV) craneName = findCraneNameInNode(cPrefs, origCraneIDFV);
+            if (!craneName) craneName = findCraneNameInNode(cPrefs, folderUUID);
+        }
+    }
+
     if (!craneName || craneName.length == 0) {
         NSDictionary *userInfo = [meta isKindOfClass:[NSDictionary class]] ? meta[@"MCMMetadataUserInfo"] : nil;
         if ((!userInfo || [userInfo count] == 0) || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
@@ -162,9 +225,11 @@ static NSMutableDictionary *getContainerProfile() {
                 if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
                 NSString *candPath = cand[@"path"] ?: @"";
                 NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
+                NSString *candName = cand[@"containerName"] ?: @"";
                 if ([candPath isEqualToString:homePath] ||
                     [existingKey caseInsensitiveCompare:keyUUID] == NSOrderedSame ||
-                    (candCraneID.length > 0 && [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame)) {
+                    (candCraneID.length > 0 && [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame) ||
+                    (craneName.length > 0 && [candName caseInsensitiveCompare:craneName] == NSOrderedSame)) {
                     settingsEntry = cand;
                     break;
                 }
@@ -186,6 +251,11 @@ static NSMutableDictionary *getContainerProfile() {
             }
         }
 
+        // Conserva como base el UUID aislado de Crane si ya es válido, o genera uno único constante para el contenedor
+        NSString *defaultIDFV = (origCraneIDFV && origCraneIDFV.length >= 32)
+            ? [origCraneIDFV uppercaseString]
+            : [[NSUUID UUID] UUIDString];
+
         if (!profile || !profile[@"idfv"]) {
             uint64_t seed = randomSeed64(keyUUID);
             NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
@@ -202,8 +272,11 @@ static NSMutableDictionary *getContainerProfile() {
             NSString *localIP = [NSString stringWithFormat:@"%@.%d", subnet, 15 + (int)(seed % 220)];
             unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
 
-            // Desactivado por defecto (@NO): solo se activa cuando el usuario lo enciende manualmente en Settings
-            BOOL manualEnabled = (settingsEntry && settingsEntry[@"enabled"] != nil) ? [settingsEntry[@"enabled"] boolValue] : NO;
+            // Nace SIEMPRE EN PAUSA (@NO) a menos que el usuario ya lo haya encendido en Settings (schema >= 22)
+            BOOL manualEnabled = NO;
+            if ([globalSt[@"schemaVersion"] intValue] >= CURRENT_SCHEMA_VERSION && settingsEntry && settingsEntry[@"enabled"] != nil) {
+                manualEnabled = [settingsEntry[@"enabled"] boolValue];
+            }
 
             profile = [@{
                 @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
@@ -220,8 +293,8 @@ static NSMutableDictionary *getContainerProfile() {
                 @"spoofSecurity": @YES,
                 @"locationAnchored": @NO,
                 @"deviceModel": @"iPhone10,4",
-                @"craneOriginalIDFV": origCraneIDFV ?: craneID,
-                @"idfv": [[NSUUID UUID] UUIDString],
+                @"craneOriginalIDFV": defaultIDFV,
+                @"idfv": defaultIDFV,
                 @"shieldDeviceID": [[NSUUID UUID] UUIDString],
                 @"bootSessionUUID": [[NSUUID UUID] UUIDString],
                 @"cloudUUID": [[NSUUID UUID] UUIDString],
@@ -247,10 +320,16 @@ static NSMutableDictionary *getContainerProfile() {
             } mutableCopy];
         } else {
             if (!profile[@"uptimeOffset"]) profile[@"uptimeOffset"] = @(3600 + arc4random_uniform(50000));
+            if ([globalSt[@"schemaVersion"] intValue] < CURRENT_SCHEMA_VERSION) {
+                profile[@"enabled"] = @NO;
+            }
             profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
             profile[@"containerUUID"] = keyUUID;
             profile[@"bundleID"] = bundleID;
             profile[@"path"] = homePath;
+            if (craneName && ![craneName isEqualToString:keyUUID]) {
+                profile[@"containerName"] = craneName;
+            }
         }
 
         [profile writeToFile:localPlist atomically:YES];
@@ -269,6 +348,8 @@ static BOOL isModuleActive(NSString *moduleKey) {
     if (isInitializingProfile || !liveContainerProfile) return NO;
 
     NSDictionary *state = getGlobalState();
+    // Si el archivo de preferencias aún no está en el esquema 22 o el usuario no ha encendido los switches, TODO está en OFF
+    if ([state[@"schemaVersion"] intValue] < CURRENT_SCHEMA_VERSION) return NO;
     if (!state[@"masterEnabled"] || ![state[@"masterEnabled"] boolValue]) return NO;
 
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
@@ -276,12 +357,30 @@ static BOOL isModuleActive(NSString *moduleKey) {
     if ([bundleID isEqualToString:@"com.reddit.Reddit"] && (!state[@"enableReddit"] || ![state[@"enableReddit"] boolValue])) return NO;
 
     NSString *keyUUID = liveContainerProfile[@"containerUUID"];
+    NSString *craneID = liveContainerProfile[@"craneIdentifier"];
+    NSString *cName = liveContainerProfile[@"containerName"];
     NSDictionary *byUUID = state[@"containersByUUID"];
-    if (keyUUID && [byUUID isKindOfClass:[NSDictionary class]] && [byUUID[keyUUID] isKindOfClass:[NSDictionary class]]) {
+
+    if ([byUUID isKindOfClass:[NSDictionary class]]) {
         NSDictionary *savedProf = byUUID[keyUUID];
-        if (!savedProf[@"enabled"] || ![savedProf[@"enabled"] boolValue]) return NO;
-        if (moduleKey && savedProf[moduleKey] != nil) return [savedProf[moduleKey] boolValue];
-        return YES;
+        if (!savedProf && craneID) savedProf = byUUID[craneID];
+        if (!savedProf) {
+            for (NSString *k in byUUID) {
+                NSDictionary *cand = byUUID[k];
+                if ([cand isKindOfClass:[NSDictionary class]] && [cand[@"bundleID"] isEqualToString:bundleID]) {
+                    if ((craneID && [cand[@"craneIdentifier"] caseInsensitiveCompare:craneID] == NSOrderedSame) ||
+                        (cName && [cand[@"containerName"] caseInsensitiveCompare:cName] == NSOrderedSame)) {
+                        savedProf = cand;
+                        break;
+                    }
+                }
+            }
+        }
+        if ([savedProf isKindOfClass:[NSDictionary class]]) {
+            if (!savedProf[@"enabled"] || ![savedProf[@"enabled"] boolValue]) return NO;
+            if (moduleKey && savedProf[moduleKey] != nil) return [savedProf[moduleKey] boolValue];
+            return YES;
+        }
     }
 
     if (!liveContainerProfile[@"enabled"] || ![liveContainerProfile[@"enabled"] boolValue]) return NO;
@@ -334,6 +433,9 @@ static void showStartupBanner() {
     });
 }
 
+// ============================================================================
+// ANTI-JAILBREAK EN C Y OBJECTIVE-C (PROTEGE APP Y FOUNDATION SIN TOCAR CRANE)
+// ============================================================================
 static BOOL isSuspiciousJailbreakPathC(const char *path) {
     if (!path) return NO;
     if (strstr(path, "igfarmshield") != NULL ||
@@ -344,6 +446,8 @@ static BOOL isSuspiciousJailbreakPathC(const char *path) {
     }
     if (strncmp(path, "/var/jb", 7) == 0 ||
         strncmp(path, "/private/preboot", 16) == 0 ||
+        strncmp(path, "/Applications/Sileo.app", 23) == 0 ||
+        strncmp(path, "/Applications/Filza.app", 23) == 0 ||
         strstr(path, "ellekit") != NULL ||
         strstr(path, "Choicy") != NULL ||
         strstr(path, "choicy") != NULL ||
@@ -351,15 +455,18 @@ static BOOL isSuspiciousJailbreakPathC(const char *path) {
         strstr(path, "sileo") != NULL ||
         strstr(path, "Filza") != NULL ||
         strstr(path, "palera1n") != NULL ||
+        strstr(path, "Dopamine") != NULL ||
         strstr(path, "MobileSubstrate") != NULL ||
-        strstr(path, "substrate") != NULL) {
+        strstr(path, "substrate") != NULL ||
+        strstr(path, "Substitute") != NULL ||
+        strstr(path, "TweakInject") != NULL) {
         return YES;
     }
     return NO;
 }
 
 static int custom_access(const char *path, int amode) {
-    if (path && isModuleActive(@"spoofSecurity") && isCallerFromTargetApp(__builtin_return_address(0))) {
+    if (path && isModuleActive(@"spoofSecurity") && !isCallerFromCrane(__builtin_return_address(0))) {
         if (isSuspiciousJailbreakPathC(path)) {
             errno = ENOENT;
             return -1;
@@ -369,7 +476,7 @@ static int custom_access(const char *path, int amode) {
 }
 
 static int custom_stat(const char *path, struct stat *buf) {
-    if (path && isModuleActive(@"spoofSecurity") && isCallerFromTargetApp(__builtin_return_address(0))) {
+    if (path && isModuleActive(@"spoofSecurity") && !isCallerFromCrane(__builtin_return_address(0))) {
         if (isSuspiciousJailbreakPathC(path)) {
             errno = ENOENT;
             return -1;
@@ -379,7 +486,7 @@ static int custom_stat(const char *path, struct stat *buf) {
 }
 
 static int custom_lstat(const char *path, struct stat *buf) {
-    if (path && isModuleActive(@"spoofSecurity") && isCallerFromTargetApp(__builtin_return_address(0))) {
+    if (path && isModuleActive(@"spoofSecurity") && !isCallerFromCrane(__builtin_return_address(0))) {
         if (isSuspiciousJailbreakPathC(path)) {
             errno = ENOENT;
             return -1;
@@ -388,9 +495,19 @@ static int custom_lstat(const char *path, struct stat *buf) {
     return orig_lstat(path, buf);
 }
 
+static FILE *custom_fopen(const char *path, const char *mode) {
+    if (path && isModuleActive(@"spoofSecurity") && !isCallerFromCrane(__builtin_return_address(0))) {
+        if (isSuspiciousJailbreakPathC(path)) {
+            errno = ENOENT;
+            return NULL;
+        }
+    }
+    return orig_fopen(path, mode);
+}
+
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
     const char *name = orig_dyld_get_image_name(image_index);
-    if (name && isModuleActive(@"spoofSecurity") && isCallerFromTargetApp(__builtin_return_address(0))) {
+    if (name && isModuleActive(@"spoofSecurity") && !isCallerFromCrane(__builtin_return_address(0))) {
         if (strstr(name, "IGFarmShield") != NULL || isSuspiciousJailbreakPathC(name)) {
             return "/System/Library/Frameworks/Foundation.framework/Foundation";
         }
@@ -400,7 +517,7 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
 
 static int custom_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
-    if (ret != 0 && info && info->dli_fname && isModuleActive(@"spoofSecurity") && isCallerFromTargetApp(__builtin_return_address(0))) {
+    if (ret != 0 && info && info->dli_fname && isModuleActive(@"spoofSecurity") && !isCallerFromCrane(__builtin_return_address(0))) {
         if (strstr(info->dli_fname, "IGFarmShield") != NULL || isSuspiciousJailbreakPathC(info->dli_fname)) {
             info->dli_fname = "/System/Library/Frameworks/UIKitCore.framework/UIKitCore";
         }
@@ -544,7 +661,7 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 
 static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
     Boolean ok = orig_SCNetworkReachabilityGetFlags(target, flags);
-    if (ok && flags && isModuleActive(@"spoofNetwork") && isCallerFromTargetApp(__builtin_return_address(0))) {
+    if (ok && flags && isModuleActive(@"spoofNetwork")) {
         NSDictionary *prof = getContainerProfile();
         *flags &= ~kSCNetworkReachabilityFlagsTransientConnection;
         if ([prof[@"CarrierMode"] isEqualToString:@"CELLULAR"]) {
@@ -556,14 +673,12 @@ static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef tar
     return ok;
 }
 
-// Oculta utun y la Fake-IP 198.18.0.x de Shadowrocket ante la app sin tocar CFNetwork
+// Oculta el túnel VPN utun sin corromper el enlace de socket de libnetwork.dylib en el login de Reddit
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
-    if (res != 0 || !ifap || !*ifap) return res;
-    if (!isModuleActive(@"spoofNetwork") || !isCallerFromTargetApp(__builtin_return_address(0))) {
-        return res;
-    }
+    if (res != 0 || !ifap || !*ifap || !isModuleActive(@"spoofNetwork")) return res;
 
+    BOOL calledByAppBinary = isCallerFromAppBundle(__builtin_return_address(0));
     NSDictionary *prof = getContainerProfile();
     const char *spoofedIP = [prof[@"localIP"] ?: @"192.168.1.45" UTF8String];
 
@@ -575,13 +690,13 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
                 strncmp(curr->ifa_name, "ipsec", 5) == 0 ||
                 strncmp(curr->ifa_name, "tun", 3) == 0 ||
                 strncmp(curr->ifa_name, "tap", 3) == 0) {
-                strcpy(curr->ifa_name, "lo0");
+                strcpy(curr->ifa_name, "en0");
                 curr->ifa_flags &= ~IFF_POINTOPOINT;
-                if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
+                if (calledByAppBinary && curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET && spoofedIP) {
                     struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
-                    addr->sin_addr.s_addr = inet_addr("127.0.0.1");
+                    addr->sin_addr.s_addr = inet_addr(spoofedIP);
                 }
-            } else if (strcmp(curr->ifa_name, "en0") == 0 && curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET && spoofedIP) {
+            } else if (calledByAppBinary && strcmp(curr->ifa_name, "en0") == 0 && curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET && spoofedIP) {
                 struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
                 addr->sin_addr.s_addr = inet_addr(spoofedIP);
             }
@@ -647,7 +762,7 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
 
 static int custom_statfs(const char *path, struct statfs *buf) {
     int ret = orig_statfs(path, buf);
-    if (ret == 0 && buf && isModuleActive(@"spoofHardware") && isCallerFromTargetApp(__builtin_return_address(0))) {
+    if (ret == 0 && buf && isModuleActive(@"spoofHardware") && !isCallerFromCrane(__builtin_return_address(0))) {
         NSDictionary *prof = getContainerProfile();
         if (prof[@"freeBytes"] && buf->f_bsize > 0) {
             unsigned long long baseFree = [prof[@"freeBytes"] unsignedLongLongValue];
@@ -684,7 +799,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 }
 - (BOOL)fileExistsAtPath:(NSString *)path {
     if (!path || !isModuleActive(@"spoofSecurity")) return %orig;
-    if (isCallerFromTargetApp(__builtin_return_address(0)) && isSuspiciousJailbreakPathC([path UTF8String])) {
+    if (!isCallerFromCrane(__builtin_return_address(0)) && isSuspiciousJailbreakPathC([path UTF8String])) {
         return NO;
     }
     return %orig;
@@ -700,7 +815,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 }
 - (NSDictionary<NSString *, NSString *> *)environment {
     NSDictionary *orig = %orig;
-    if (!isModuleActive(@"spoofSecurity") || !orig || !isCallerFromTargetApp(__builtin_return_address(0))) return orig;
+    if (!isModuleActive(@"spoofSecurity") || !orig || isCallerFromCrane(__builtin_return_address(0))) return orig;
     NSMutableDictionary *cleanEnv = [orig mutableCopy];
     [cleanEnv removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
     [cleanEnv removeObjectForKey:@"_MSSafeMode"];
@@ -711,7 +826,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 
 static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-    if (ret == 0 && name && oldlenp && !isInitializingProfile && isCallerFromTargetApp(__builtin_return_address(0))) {
+    if (ret == 0 && name && oldlenp && !isInitializingProfile && !isCallerFromCrane(__builtin_return_address(0))) {
         NSDictionary *prof = getContainerProfile();
         if (strcmp(name, "kern.boottime") == 0 && isModuleActive(@"spoofHardware") && oldp && *oldlenp >= sizeof(struct timeval)) {
             struct timeval *tv = (struct timeval *)oldp;
@@ -747,6 +862,7 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     MSHookFunction((void *)access, (void *)custom_access, (void **)&orig_access);
     MSHookFunction((void *)stat, (void *)custom_stat, (void **)&orig_stat);
     MSHookFunction((void *)lstat, (void *)custom_lstat, (void **)&orig_lstat);
+    MSHookFunction((void *)fopen, (void *)custom_fopen, (void **)&orig_fopen);
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
