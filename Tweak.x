@@ -28,10 +28,34 @@
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
-#define CURRENT_SCHEMA_VERSION 22
+#define CURRENT_SCHEMA_VERSION 23
 
 @interface ASAuthorizationController : NSObject
 - (void)performRequests;
+@end
+
+@interface CKContainer : NSObject
+- (void)accountStatusWithCompletionHandler:(void (^)(NSInteger accountStatus, NSError *error))completionHandler;
+@end
+
+@interface ACAccountStore : NSObject
+- (NSArray *)accounts;
+- (NSArray *)accountsWithAccountType:(id)accountType;
+- (void)accountTypeWithAccountTypeIdentifier:(NSString *)identifier completion:(void (^)(id accountType, NSError *error))completion;
+@end
+
+@interface SSAccountStore : NSObject
+- (id)activeAccount;
+- (id)activeLockerAccount;
+@end
+
+@interface SSAuthenticateRequest : NSObject
+- (void)start;
+- (void)startWithAuthenticateResponseBlock:(void (^)(id response, NSError *error))block;
+@end
+
+@interface AKAppleIDAuthenticationController : NSObject
+- (void)authenticateWithContext:(id)context completion:(void (^)(NSDictionary *results, NSError *error))completion;
 @end
 
 static NSString *origCraneIDFV = nil;
@@ -76,7 +100,6 @@ static void applyLowLevelCTimeZone(NSString *tzName) {
     tzset();
 }
 
-// Permite que Crane opere libremente sin ser bloqueado por los hooks de seguridad
 static BOOL isCallerFromCrane(const void *retAddr) {
     if (!retAddr || !orig_dladdr) return NO;
     Dl_info info;
@@ -88,7 +111,6 @@ static BOOL isCallerFromCrane(const void *retAddr) {
     return NO;
 }
 
-// Verifica si quien llama es directamente el ejecutable/framework de la App (y no libnetwork.dylib del sistema)
 static BOOL isCallerFromAppBundle(const void *retAddr) {
     if (!retAddr || !orig_dladdr) return NO;
     Dl_info info;
@@ -98,6 +120,32 @@ static BOOL isCallerFromAppBundle(const void *retAddr) {
         }
     }
     return NO;
+}
+
+static void searchNestedMetadata(id node, NSString **outID, NSString **outName, NSString *bundleID) {
+    if (!node) return;
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)node;
+        for (id k in dict) {
+            NSString *kl = [[k description] lowercaseString];
+            id val = dict[k];
+            if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
+                NSString *vStr = (NSString *)val;
+                if ([kl containsString:@"name"] || [kl containsString:@"label"] || [kl containsString:@"title"]) {
+                    if (!*outName) *outName = vStr;
+                } else if (([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"] || [kl containsString:@"uuid"]) &&
+                           ![vStr isEqualToString:bundleID] && ![vStr hasPrefix:@"com."]) {
+                    if (!*outID) *outID = vStr;
+                }
+            } else if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
+                searchNestedMetadata(val, outID, outName, bundleID);
+            }
+        }
+    } else if ([node isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)node) {
+            searchNestedMetadata(item, outID, outName, bundleID);
+        }
+    }
 }
 
 static NSString *findCraneNameInNode(id node, NSString *targetID) {
@@ -136,7 +184,7 @@ static NSString *findCraneNameInNode(id node, NSString *targetID) {
     return nil;
 }
 
-static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
+static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bundleID) {
     NSString *folderUUID = [homePath lastPathComponent] ?: @"Default";
     NSString *metaPath = [homePath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
     NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
@@ -147,6 +195,7 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
     NSDictionary *env = [[NSProcessInfo processInfo] environment];
     if ([env[@"CRANE_CONTAINER_NAME"] length] > 0) craneName = env[@"CRANE_CONTAINER_NAME"];
     if ([env[@"CRANE_CONTAINER_ID"] length] > 0) craneID = env[@"CRANE_CONTAINER_ID"];
+    if ([env[@"CRANE_IDENTIFIER"] length] > 0 && !craneID) craneID = env[@"CRANE_IDENTIFIER"];
 
     if ([meta isKindOfClass:[NSDictionary class]]) {
         for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
@@ -156,22 +205,10 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
             if ([meta[ik] isKindOfClass:[NSString class]] && [meta[ik] length] > 0) craneID = meta[ik];
         }
         NSDictionary *userInfo = meta[@"MCMMetadataUserInfo"];
-        if ([userInfo isKindOfClass:[NSDictionary class]]) {
-            for (NSString *k in userInfo) {
-                NSString *kl = [k lowercaseString];
-                id val = userInfo[k];
-                if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
-                    if ([kl containsString:@"name"] || [kl containsString:@"label"] || [kl containsString:@"title"]) {
-                        craneName = val;
-                    } else if (([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"] || [kl containsString:@"uuid"]) && ![val hasPrefix:@"com."]) {
-                        craneID = val;
-                    }
-                }
-            }
+        if (userInfo) {
+            searchNestedMetadata(userInfo, &craneID, &craneName, bundleID);
         }
     }
-
-    if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
 
     for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_MAIN_JB, CRANE_PREFS_VAR, CRANE_MAIN_VAR]) {
         NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
@@ -182,6 +219,7 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath) {
         }
     }
 
+    if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
     if (!craneName || craneName.length == 0) {
         NSDictionary *userInfo = [meta isKindOfClass:[NSDictionary class]] ? meta[@"MCMMetadataUserInfo"] : nil;
         if ((!userInfo || [userInfo count] == 0) || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
@@ -209,16 +247,45 @@ static NSMutableDictionary *getContainerProfile() {
         NSString *homePath = NSHomeDirectory();
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.burbn.instagram";
 
-        NSDictionary *ident = resolveCraneIdentityDict(homePath);
+        NSDictionary *ident = resolveCraneIdentityDict(homePath, bundleID);
         NSString *keyUUID = ident[@"keyUUID"];
         NSString *craneID = ident[@"craneID"];
         NSString *craneName = ident[@"craneName"];
 
         NSString *localPlist = [homePath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
-        NSDictionary *globalSt = getGlobalState();
-        NSDictionary *byUUID = [globalSt[@"containersByUUID"] isKindOfClass:[NSDictionary class]] ? globalSt[@"containersByUUID"] : @{};
+        NSDictionary *diskLoaded = [NSDictionary dictionaryWithContentsOfFile:localPlist];
 
-        NSDictionary *settingsEntry = [byUUID[keyUUID] isKindOfClass:[NSDictionary class]] ? byUUID[keyUUID] : nil;
+        NSDictionary *loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST];
+        NSMutableDictionary *globalSt = loadedGlobal ? [loadedGlobal mutableCopy] : [NSMutableDictionary dictionary];
+        NSMutableDictionary *byUUID = [globalSt[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
+            ? [globalSt[@"containersByUUID"] mutableCopy]
+            : [NSMutableDictionary dictionary];
+
+        NSDictionary *activeMap = [globalSt[@"activeInCrane"] isKindOfClass:[NSDictionary class]] ? globalSt[@"activeInCrane"] : @{};
+        NSString *craneActiveIDForApp = activeMap[bundleID];
+
+        NSDictionary *settingsEntry = nil;
+        NSString *matchedSettingsKey = nil;
+
+        // 1. Buscar coincidencia exacta por UUID de carpeta, ruta física, Crane ID o contenedor activo de Crane
+        for (NSString *existingKey in byUUID) {
+            NSDictionary *cand = byUUID[existingKey];
+            if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
+            NSString *candPath = cand[@"path"] ?: @"";
+            NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
+            NSString *candName = cand[@"containerName"] ?: @"";
+
+            if ([candPath isEqualToString:homePath] ||
+                [existingKey caseInsensitiveCompare:keyUUID] == NSOrderedSame ||
+                (candCraneID.length > 0 && ![candCraneID isEqualToString:@"Default"] && [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame) ||
+                (craneName.length > 0 && ![craneName isEqualToString:@"Default"] && [candName caseInsensitiveCompare:craneName] == NSOrderedSame)) {
+                settingsEntry = cand;
+                matchedSettingsKey = existingKey;
+                break;
+            }
+        }
+
+        // 2. Si el contenedor se creó en Crane (ej. "testing profile" con path vacío) y es el activo o el único encendido, enlazarlo a esta carpeta
         if (!settingsEntry) {
             for (NSString *existingKey in byUUID) {
                 NSDictionary *cand = byUUID[existingKey];
@@ -226,19 +293,21 @@ static NSMutableDictionary *getContainerProfile() {
                 NSString *candPath = cand[@"path"] ?: @"";
                 NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
                 NSString *candName = cand[@"containerName"] ?: @"";
-                if ([candPath isEqualToString:homePath] ||
-                    [existingKey caseInsensitiveCompare:keyUUID] == NSOrderedSame ||
-                    (candCraneID.length > 0 && [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame) ||
-                    (craneName.length > 0 && [candName caseInsensitiveCompare:craneName] == NSOrderedSame)) {
+
+                BOOL matchesActiveInCrane = (craneActiveIDForApp &&
+                    ([existingKey caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame ||
+                     [candCraneID caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame ||
+                     [candName caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame));
+
+                if (matchesActiveInCrane || ([cand[@"enabled"] boolValue] && candPath.length == 0)) {
                     settingsEntry = cand;
+                    matchedSettingsKey = existingKey;
                     break;
                 }
             }
         }
 
-        NSDictionary *diskLoaded = [NSDictionary dictionaryWithContentsOfFile:localPlist];
         NSMutableDictionary *profile = nil;
-
         if (settingsEntry && settingsEntry[@"idfv"]) {
             profile = [settingsEntry mutableCopy];
         } else if ([diskLoaded isKindOfClass:[NSDictionary class]] && diskLoaded[@"idfv"]) {
@@ -246,15 +315,10 @@ static NSMutableDictionary *getContainerProfile() {
         }
 
         if (profile && settingsEntry) {
-            for (NSString *k in @[@"enabled", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"ssid", @"bssid", @"idfv", @"bootSessionUUID", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"uptimeOffset"]) {
+            for (NSString *k in @[@"enabled", @"containerName", @"craneIdentifier", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"ssid", @"bssid", @"idfv", @"bootSessionUUID", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"uptimeOffset"]) {
                 if (settingsEntry[k] != nil) profile[k] = settingsEntry[k];
             }
         }
-
-        // Conserva como base el UUID aislado de Crane si ya es válido, o genera uno único constante para el contenedor
-        NSString *defaultIDFV = (origCraneIDFV && origCraneIDFV.length >= 32)
-            ? [origCraneIDFV uppercaseString]
-            : [[NSUUID UUID] UUIDString];
 
         if (!profile || !profile[@"idfv"]) {
             uint64_t seed = randomSeed64(keyUUID);
@@ -272,15 +336,11 @@ static NSMutableDictionary *getContainerProfile() {
             NSString *localIP = [NSString stringWithFormat:@"%@.%d", subnet, 15 + (int)(seed % 220)];
             unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
 
-            // Nace SIEMPRE EN PAUSA (@NO) a menos que el usuario ya lo haya encendido en Settings (schema >= 22)
-            BOOL manualEnabled = NO;
-            if ([globalSt[@"schemaVersion"] intValue] >= CURRENT_SCHEMA_VERSION && settingsEntry && settingsEntry[@"enabled"] != nil) {
-                manualEnabled = [settingsEntry[@"enabled"] boolValue];
-            }
+            BOOL manualEnabled = (settingsEntry && settingsEntry[@"enabled"] != nil) ? [settingsEntry[@"enabled"] boolValue] : NO;
 
             profile = [@{
                 @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
-                @"containerUUID": keyUUID,
+                @"containerUUID": matchedSettingsKey ?: keyUUID,
                 @"craneIdentifier": craneID,
                 @"containerName": craneName,
                 @"bundleID": bundleID,
@@ -293,8 +353,8 @@ static NSMutableDictionary *getContainerProfile() {
                 @"spoofSecurity": @YES,
                 @"locationAnchored": @NO,
                 @"deviceModel": @"iPhone10,4",
-                @"craneOriginalIDFV": defaultIDFV,
-                @"idfv": defaultIDFV,
+                @"craneOriginalIDFV": origCraneIDFV ?: craneID,
+                @"idfv": [[NSUUID UUID] UUIDString],
                 @"shieldDeviceID": [[NSUUID UUID] UUIDString],
                 @"bootSessionUUID": [[NSUUID UUID] UUIDString],
                 @"cloudUUID": [[NSUUID UUID] UUIDString],
@@ -320,19 +380,23 @@ static NSMutableDictionary *getContainerProfile() {
             } mutableCopy];
         } else {
             if (!profile[@"uptimeOffset"]) profile[@"uptimeOffset"] = @(3600 + arc4random_uniform(50000));
-            if ([globalSt[@"schemaVersion"] intValue] < CURRENT_SCHEMA_VERSION) {
-                profile[@"enabled"] = @NO;
-            }
             profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
-            profile[@"containerUUID"] = keyUUID;
             profile[@"bundleID"] = bundleID;
             profile[@"path"] = homePath;
-            if (craneName && ![craneName isEqualToString:keyUUID]) {
-                profile[@"containerName"] = craneName;
-            }
         }
 
         [profile writeToFile:localPlist atomically:YES];
+
+        // Si el perfil ya existía en state.plist pero tenía path vacío, actualizar solo su path real
+        if (matchedSettingsKey && byUUID[matchedSettingsKey]) {
+            NSMutableDictionary *updatedEntry = [byUUID[matchedSettingsKey] mutableCopy];
+            if ([updatedEntry[@"path"] length] == 0) {
+                updatedEntry[@"path"] = homePath;
+                byUUID[matchedSettingsKey] = updatedEntry;
+                globalSt[@"containersByUUID"] = byUUID;
+                [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
+            }
+        }
 
         if ([profile[@"enabled"] boolValue] && [profile[@"spoofLocation"] boolValue] && profile[@"timeZone"]) {
             applyLowLevelCTimeZone(profile[@"timeZone"]);
@@ -348,14 +412,13 @@ static BOOL isModuleActive(NSString *moduleKey) {
     if (isInitializingProfile || !liveContainerProfile) return NO;
 
     NSDictionary *state = getGlobalState();
-    // Si el archivo de preferencias aún no está en el esquema 22 o el usuario no ha encendido los switches, TODO está en OFF
-    if ([state[@"schemaVersion"] intValue] < CURRENT_SCHEMA_VERSION) return NO;
     if (!state[@"masterEnabled"] || ![state[@"masterEnabled"] boolValue]) return NO;
 
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
     if ([bundleID isEqualToString:@"com.burbn.instagram"] && (!state[@"enableIG"] || ![state[@"enableIG"] boolValue])) return NO;
     if ([bundleID isEqualToString:@"com.reddit.Reddit"] && (!state[@"enableReddit"] || ![state[@"enableReddit"] boolValue])) return NO;
 
+    NSString *homePath = NSHomeDirectory();
     NSString *keyUUID = liveContainerProfile[@"containerUUID"];
     NSString *craneID = liveContainerProfile[@"craneIdentifier"];
     NSString *cName = liveContainerProfile[@"containerName"];
@@ -368,7 +431,8 @@ static BOOL isModuleActive(NSString *moduleKey) {
             for (NSString *k in byUUID) {
                 NSDictionary *cand = byUUID[k];
                 if ([cand isKindOfClass:[NSDictionary class]] && [cand[@"bundleID"] isEqualToString:bundleID]) {
-                    if ((craneID && [cand[@"craneIdentifier"] caseInsensitiveCompare:craneID] == NSOrderedSame) ||
+                    if ([cand[@"path"] isEqualToString:homePath] ||
+                        (craneID && [cand[@"craneIdentifier"] caseInsensitiveCompare:craneID] == NSOrderedSame) ||
                         (cName && [cand[@"containerName"] caseInsensitiveCompare:cName] == NSOrderedSame)) {
                         savedProf = cand;
                         break;
@@ -434,7 +498,7 @@ static void showStartupBanner() {
 }
 
 // ============================================================================
-// ANTI-JAILBREAK EN C Y OBJECTIVE-C (PROTEGE APP Y FOUNDATION SIN TOCAR CRANE)
+// ANTI-JAILBREAK EN C Y OBJECTIVE-C
 // ============================================================================
 static BOOL isSuspiciousJailbreakPathC(const char *path) {
     if (!path) return NO;
@@ -525,9 +589,77 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
     return ret;
 }
 
+// ============================================================================
+// BLOQUEO TOTAL DE DEMONIOS DE ICLOUD / AUTHKIT / STORESERVICES ("SIGN IN WITH APPLE ID")
+// ============================================================================
+%hook CKContainer
+- (void)accountStatusWithCompletionHandler:(void (^)(NSInteger accountStatus, NSError *error))completionHandler {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
+        if (completionHandler) completionHandler(3, nil); // 3 = CKAccountStatusNoAccount
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook ACAccountStore
+- (NSArray *)accounts {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) return @[];
+    return %orig;
+}
+- (NSArray *)accountsWithAccountType:(id)accountType {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) return @[];
+    return %orig;
+}
+- (void)accountTypeWithAccountTypeIdentifier:(NSString *)identifier completion:(void (^)(id accountType, NSError *error))completion {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
+        if (completion) completion(nil, nil);
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook SSAccountStore
+- (id)activeAccount {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) return nil;
+    return %orig;
+}
+- (id)activeLockerAccount {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) return nil;
+    return %orig;
+}
+%end
+
+%hook SSAuthenticateRequest
+- (void)start {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) return;
+    %orig;
+}
+- (void)startWithAuthenticateResponseBlock:(void (^)(id response, NSError *error))block {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
+        if (block) block(nil, nil);
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook AKAppleIDAuthenticationController
+- (void)authenticateWithContext:(id)context completion:(void (^)(NSDictionary *results, NSError *error))completion {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
+        if (completion) {
+            completion(nil, [NSError errorWithDomain:@"AKAuthenticationError" code:-7003 userInfo:nil]);
+        }
+        return;
+    }
+    %orig;
+}
+%end
+
 %hook ASAuthorizationController
 - (void)performRequests {
-    if (isModuleActive(@"spoofSecurity")) {
+    if (isModuleActive(@"spoofSecurity") || isModuleActive(@"spoofIDs")) {
         return;
     }
     %orig;
@@ -673,7 +805,6 @@ static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef tar
     return ok;
 }
 
-// Oculta el túnel VPN utun sin corromper el enlace de socket de libnetwork.dylib en el login de Reddit
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || !isModuleActive(@"spoofNetwork")) return res;
