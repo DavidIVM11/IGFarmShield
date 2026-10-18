@@ -51,6 +51,7 @@ static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
 static NSTimeInterval sessionStartTimestamp = 0;
 static BOOL bannerShownThisSession = NO;
+static BOOL lifecycleObserversRegistered = NO;
 static IGFarmPassthroughWindow *persistentBadgeWindow = nil;
 
 // Banderas en memoria RAM para ejecución instantánea
@@ -121,6 +122,71 @@ static BOOL isCallerFromCraneOrSelf(const void *retAddr) {
         }
     }
     return NO;
+}
+
+// ============================================================================
+// AUTO-LIMPIEZA DE RASTRO RESIDUAL Y CACHÉ DEL CONTENEDOR (SIN CERRAR SESIÓN)
+// ============================================================================
+static void purgeContainerResidualDirs(BOOL includeHeavyCaches) {
+    s_inInternalCall = YES;
+    NSString *homePath = NSHomeDirectory();
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    [[NSURLCache sharedURLCache] removeAllCachedResponses];
+
+    NSArray *targetSubdirs = includeHeavyCaches
+        ? @[@"tmp", @"Library/Caches", @"Library/WebKit/WebsiteData", @"Library/Saved Application State"]
+        : @[@"tmp", @"Library/Saved Application State"];
+
+    for (NSString *sub in targetSubdirs) {
+        NSString *dirPath = [homePath stringByAppendingPathComponent:sub];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:dirPath isDirectory:&isDir] && isDir) {
+            NSArray *items = [fm contentsOfDirectoryAtPath:dirPath error:nil];
+            for (NSString *item in items) {
+                NSString *fullPath = [dirPath stringByAppendingPathComponent:item];
+                [fm removeItemAtPath:fullPath error:nil];
+            }
+        }
+    }
+    s_inInternalCall = NO;
+}
+
+static void registerAutoCleanLifecycleObservers() {
+    if (lifecycleObserversRegistered) return;
+    lifecycleObserversRegistered = YES;
+
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+
+    // Cuando el usuario sale de la app o la desliza para cerrarla de segundo plano, limpia toda la caché residual
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification * _Nonnull note) {
+        if (!s_shieldActive) return;
+        UIApplication *app = [UIApplication sharedApplication];
+        __block UIBackgroundTaskIdentifier bgTask = [app beginBackgroundTaskWithExpirationHandler:^{
+            if (bgTask != UIBackgroundTaskInvalid) {
+                [app endBackgroundTask:bgTask];
+                bgTask = UIBackgroundTaskInvalid;
+            }
+        }];
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            purgeContainerResidualDirs(YES);
+            if (bgTask != UIBackgroundTaskInvalid) {
+                [app endBackgroundTask:bgTask];
+                bgTask = UIBackgroundTaskInvalid;
+            }
+        });
+    }];
+
+    [nc addObserverForName:UIApplicationWillTerminateNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification * _Nonnull note) {
+        if (!s_shieldActive) return;
+        purgeContainerResidualDirs(YES);
+    }];
 }
 
 static void searchNestedMetadata(id node, NSString **outID, NSString **outName, NSString *bundleID) {
@@ -429,7 +495,6 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     ensureProfileLoaded();
     if (!liveContainerProfile) return;
 
-    // Buscar la escena (UIWindowScene) y la ventana principal activa en iOS 16
     UIWindowScene *activeScene = nil;
     UIWindow *targetWin = nil;
 
@@ -459,7 +524,6 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
         }
     }
 
-    // Si la app aún está en el splash screen y no tiene ventana lista, reintentar cada 0.5s (hasta 10 intentos)
     if (!targetWin) {
         if (attempt < 10) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -470,16 +534,19 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     }
 
     bannerShownThisSession = YES;
+    registerAutoCleanLifecycleObservers();
 
-    if (s_spoofNetwork) {
-        [[NSURLCache sharedURLCache] removeAllCachedResponses];
+    // Limpiar restos temporales al arrancar y programar limpieza completa al cerrar la app
+    if (s_shieldActive) {
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+            purgeContainerResidualDirs(NO);
+        });
     }
 
     NSDictionary *prof = liveContainerProfile;
     NSString *cName = prof[@"containerName"] ?: @"Default";
     CGRect screenBounds = [UIScreen mainScreen].bounds;
 
-    // 1. Crear el Icono/Cápsula Fija enlazada al UIWindowScene de iOS 16 para que SIEMPRE sea visible
     if (!persistentBadgeWindow) {
         if (activeScene) {
             persistentBadgeWindow = [[IGFarmPassthroughWindow alloc] initWithWindowScene:activeScene];
@@ -515,14 +582,12 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
 
         [badgePill sizeToFit];
         CGFloat pillW = MIN(MAX(badgePill.bounds.size.width + 12.0, 62.0), 160.0);
-        // Centrado justo debajo del reloj (Y = 18.0 en iPhone 8) para que nunca choque con los iconos de batería o Wi-Fi
         badgePill.frame = CGRectMake((screenBounds.size.width - pillW) / 2.0, 18.0, pillW, 16.0);
 
         [rootVC.view addSubview:badgePill];
         persistentBadgeWindow.hidden = NO;
     }
 
-    // 2. Mostrar el banner informativo detallado durante 2.8 segundos
     NSString *netMode = s_isCellularMode
         ? [NSString stringWithFormat:@"Red: %@", prof[@"CarrierName"] ?: @"Móvil"]
         : [NSString stringWithFormat:@"Wi-Fi (%@)", prof[@"localIP"] ?: @"LAN"];
@@ -709,7 +774,7 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 %end
 
 // ============================================================================
-// OCULTACIÓN DE TÚNEL/PROXY (__SCOPED__) Y DESACTIVACIÓN DE HTTP/3 (QUIC)
+// OCULTACIÓN DE TÚNEL/PROXY (__SCOPED__ + GETIFADDRS) Y BLOQUEO DE HTTP/3
 // ============================================================================
 static CFDictionaryRef custom_CFNetworkCopySystemProxySettings(void) {
     CFDictionaryRef origRef = orig_CFNetworkCopySystemProxySettings ? orig_CFNetworkCopySystemProxySettings() : NULL;
@@ -815,6 +880,7 @@ static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRe
 }
 %end
 
+// Camufla utun/ppp/ipsec como lo0 ante el binario de la App y aísla la IP privada de en0
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || !s_spoofNetwork || s_spoofedLanAddr == 0) return res;
@@ -822,10 +888,19 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
 
     struct ifaddrs *curr = *ifap;
     while (curr) {
-        if (curr->ifa_name && strcmp(curr->ifa_name, "en0") == 0 &&
-            curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
-            struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
-            addr->sin_addr.s_addr = s_spoofedLanAddr;
+        if (curr->ifa_name) {
+            if (strncmp(curr->ifa_name, "utun", 4) == 0 ||
+                strncmp(curr->ifa_name, "ppp", 3) == 0 ||
+                strncmp(curr->ifa_name, "ipsec", 5) == 0 ||
+                strncmp(curr->ifa_name, "tun", 3) == 0 ||
+                strncmp(curr->ifa_name, "tap", 3) == 0) {
+                strcpy(curr->ifa_name, "lo0");
+                curr->ifa_flags &= ~IFF_POINTOPOINT;
+            } else if (strcmp(curr->ifa_name, "en0") == 0 &&
+                       curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
+                struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
+                addr->sin_addr.s_addr = s_spoofedLanAddr;
+            }
         }
         curr = curr->ifa_next;
     }
