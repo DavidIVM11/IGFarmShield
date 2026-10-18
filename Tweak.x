@@ -6,7 +6,6 @@
 #import <CoreTelephony/CTTelephonyNetworkInfo.h>
 #import <SystemConfiguration/CaptiveNetwork.h>
 #import <AVFoundation/AVFoundation.h>
-#import <StoreKit/StoreKit.h>
 #import <ifaddrs.h>
 #import <arpa/inet.h>
 #import <net/if.h>
@@ -30,13 +29,21 @@
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CURRENT_SCHEMA_VERSION 31
 
-// Ventana transparente que no bloquea toques para el icono fijo superior
+@interface NSMutableURLRequest (HTTP3Disable)
+- (void)setAssumesHTTP3Capable:(BOOL)capable;
+- (BOOL)assumesHTTP3Capable;
+@end
+
+// Ventana transparente compatible con UIWindowScene de iOS 16 que deja pasar todos los toques
 @interface IGFarmPassthroughWindow : UIWindow
 @end
 
 @implementation IGFarmPassthroughWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     return nil;
+}
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    return NO;
 }
 @end
 
@@ -46,7 +53,7 @@ static NSTimeInterval sessionStartTimestamp = 0;
 static BOOL bannerShownThisSession = NO;
 static IGFarmPassthroughWindow *persistentBadgeWindow = nil;
 
-// Banderas en memoria RAM para ejecución instantánea sin lecturas repetidas en disco
+// Banderas en memoria RAM para ejecución instantánea
 static BOOL s_profileInitialized = NO;
 static BOOL s_shieldActive = NO;
 static BOOL s_spoofIDs = NO;
@@ -65,6 +72,8 @@ static int (*orig_statfs)(const char *, struct statfs *) = NULL;
 static FILE *(*orig_fopen)(const char *, const char *) = NULL;
 static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
+static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
+static CFArrayRef (*orig_CFNetworkCopyProxiesForURL)(CFURLRef, CFDictionaryRef) = NULL;
 
 static uint64_t randomSeed64(NSString *salt) {
     uint64_t hash = 14695981039346656037ULL;
@@ -80,18 +89,20 @@ static uint64_t randomSeed64(NSString *salt) {
     return hash ^ r;
 }
 
-// Filtra estrictamente llamadas originadas por el binario/frameworks de la App
-// Deja intactas las librerías del sistema (libswiftNetwork, CFNetwork, libnetwork) y Crane
+// Detecta llamadas del ejecutable de la App y de sus librerías Swift, dejando libre a CFNetwork y Crane
 static BOOL isCallerFromTargetApp(const void *retAddr) {
     if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
     Dl_info info;
     if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
         if (strstr(info.dli_fname, "IGFarmShield") != NULL ||
             strstr(info.dli_fname, "Crane") != NULL ||
-            strstr(info.dli_fname, "crane") != NULL) {
+            strstr(info.dli_fname, "crane") != NULL ||
+            strstr(info.dli_fname, "CFNetwork") != NULL ||
+            strstr(info.dli_fname, "libnetwork") != NULL) {
             return NO;
         }
-        if (strstr(info.dli_fname, "/Containers/Bundle/Application/") != NULL) {
+        if (strstr(info.dli_fname, "/Containers/Bundle/Application/") != NULL ||
+            strstr(info.dli_fname, "libswift") != NULL) {
             return YES;
         }
     }
@@ -411,12 +422,53 @@ static void ensureProfileLoaded() {
 }
 
 // ============================================================================
-// ICONO FIJO EN LA BARRA SUPERIOR (ZONA DE NOTIFICACIONES) + BANNER DE INICIO
+// ICONO FIJO EN BARRA SUPERIOR (COMPATIBLE CON UIWINDOWSCENE DE iOS 16)
 // ============================================================================
-static void showStartupBannerAndPersistentIcon() {
+static void showStartupBannerAndPersistentIcon(int attempt) {
     if (bannerShownThisSession) return;
     ensureProfileLoaded();
     if (!liveContainerProfile) return;
+
+    // Buscar la escena (UIWindowScene) y la ventana principal activa en iOS 16
+    UIWindowScene *activeScene = nil;
+    UIWindow *targetWin = nil;
+
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            if (!activeScene || ws.activationState == UISceneActivationStateForegroundActive) {
+                activeScene = ws;
+            }
+            for (UIWindow *w in ws.windows) {
+                if (w != persistentBadgeWindow && !w.hidden && w.alpha > 0.01 && w.bounds.size.width > 100) {
+                    if (w.isKeyWindow || !targetWin) {
+                        targetWin = w;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!targetWin) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w != persistentBadgeWindow && !w.hidden && w.bounds.size.width > 100) {
+                targetWin = w;
+                if (!activeScene) activeScene = w.windowScene;
+                break;
+            }
+        }
+    }
+
+    // Si la app aún está en el splash screen y no tiene ventana lista, reintentar cada 0.5s (hasta 10 intentos)
+    if (!targetWin) {
+        if (attempt < 10) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                showStartupBannerAndPersistentIcon(attempt + 1);
+            });
+        }
+        return;
+    }
+
     bannerShownThisSession = YES;
 
     if (s_spoofNetwork) {
@@ -425,13 +477,18 @@ static void showStartupBannerAndPersistentIcon() {
 
     NSDictionary *prof = liveContainerProfile;
     NSString *cName = prof[@"containerName"] ?: @"Default";
+    CGRect screenBounds = [UIScreen mainScreen].bounds;
 
-    // 1. Crear el Icono/Cápsula Fija en la zona superior de notificaciones (Status Bar)
+    // 1. Crear el Icono/Cápsula Fija enlazada al UIWindowScene de iOS 16 para que SIEMPRE sea visible
     if (!persistentBadgeWindow) {
-        CGRect screenBounds = [UIScreen mainScreen].bounds;
-        persistentBadgeWindow = [[IGFarmPassthroughWindow alloc] initWithFrame:CGRectMake(0, 0, screenBounds.size.width, 40)];
+        if (activeScene) {
+            persistentBadgeWindow = [[IGFarmPassthroughWindow alloc] initWithWindowScene:activeScene];
+        } else {
+            persistentBadgeWindow = [[IGFarmPassthroughWindow alloc] initWithFrame:screenBounds];
+        }
+        persistentBadgeWindow.frame = CGRectMake(0, 0, screenBounds.size.width, 44);
         persistentBadgeWindow.backgroundColor = [UIColor clearColor];
-        persistentBadgeWindow.windowLevel = UIWindowLevelStatusBar + 50.0;
+        persistentBadgeWindow.windowLevel = UIWindowLevelStatusBar + 100.0;
         persistentBadgeWindow.userInteractionEnabled = NO;
 
         UIViewController *rootVC = [[UIViewController alloc] init];
@@ -443,41 +500,35 @@ static void showStartupBannerAndPersistentIcon() {
         badgePill.font = [UIFont systemFontOfSize:10.0 weight:UIFontWeightBold];
         badgePill.textColor = [UIColor whiteColor];
         badgePill.textAlignment = NSTextAlignmentCenter;
-        badgePill.layer.cornerRadius = 7.5;
+        badgePill.layer.cornerRadius = 8.0;
+        badgePill.layer.borderWidth = 0.8;
+        badgePill.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
         badgePill.clipsToBounds = YES;
 
         if (s_shieldActive) {
-            badgePill.backgroundColor = [UIColor colorWithRed:0.05 green:0.52 blue:0.25 alpha:0.92];
+            badgePill.backgroundColor = [UIColor colorWithRed:0.04 green:0.52 blue:0.24 alpha:0.94];
             badgePill.text = [NSString stringWithFormat:@" 🛡️ %@ ", cName];
         } else {
-            badgePill.backgroundColor = [UIColor colorWithRed:0.40 green:0.40 blue:0.44 alpha:0.85];
+            badgePill.backgroundColor = [UIColor colorWithRed:0.38 green:0.38 blue:0.42 alpha:0.90];
             badgePill.text = [NSString stringWithFormat:@" ⚪ %@ ", cName];
         }
 
         [badgePill sizeToFit];
-        CGFloat pillW = MIN(MAX(badgePill.bounds.size.width + 10.0, 58.0), 150.0);
-        // Ubicado arriba a la derecha junto a los iconos de estado sin tapar botones de la app
-        badgePill.frame = CGRectMake(screenBounds.size.width - pillW - 68.0, 3.0, pillW, 15.0);
+        CGFloat pillW = MIN(MAX(badgePill.bounds.size.width + 12.0, 62.0), 160.0);
+        // Centrado justo debajo del reloj (Y = 18.0 en iPhone 8) para que nunca choque con los iconos de batería o Wi-Fi
+        badgePill.frame = CGRectMake((screenBounds.size.width - pillW) / 2.0, 18.0, pillW, 16.0);
 
         [rootVC.view addSubview:badgePill];
         persistentBadgeWindow.hidden = NO;
     }
 
-    // 2. Mostrar el banner detallado de 2.8 segundos al abrir la app
-    UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
-    if (!keyWin) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w != persistentBadgeWindow && w.isKeyWindow) { keyWin = w; break; }
-        }
-    }
-    if (!keyWin) return;
-
+    // 2. Mostrar el banner informativo detallado durante 2.8 segundos
     NSString *netMode = s_isCellularMode
         ? [NSString stringWithFormat:@"Red: %@", prof[@"CarrierName"] ?: @"Móvil"]
         : [NSString stringWithFormat:@"Wi-Fi (%@)", prof[@"localIP"] ?: @"LAN"];
     int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
-    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(16, 44, keyWin.bounds.size.width - 32, 42)];
+    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(16, 40, screenBounds.size.width - 32, 42)];
     toast.layer.cornerRadius = 10.0;
     toast.clipsToBounds = YES;
     toast.textAlignment = NSTextAlignmentCenter;
@@ -486,15 +537,15 @@ static void showStartupBannerAndPersistentIcon() {
     toast.textColor = [UIColor whiteColor];
 
     if (s_shieldActive) {
-        toast.backgroundColor = [UIColor colorWithRed:0.06 green:0.48 blue:0.24 alpha:0.92];
+        toast.backgroundColor = [UIColor colorWithRed:0.06 green:0.48 blue:0.24 alpha:0.94];
         toast.text = [NSString stringWithFormat:@"🛡️ %@ • %@ • Bat: %d%%\n%@ • %@",
                       cName, netMode, batPct, prof[@"lastSyncedIP"] ?: @"IP Aislada", prof[@"timeZone"] ?: @""];
     } else {
-        toast.backgroundColor = [UIColor colorWithRed:0.45 green:0.45 blue:0.48 alpha:0.90];
+        toast.backgroundColor = [UIColor colorWithRed:0.45 green:0.45 blue:0.48 alpha:0.92];
         toast.text = [NSString stringWithFormat:@"⚪ %@ • En Pausa Manual (Datos Nativos)", cName];
     }
 
-    [keyWin addSubview:toast];
+    [targetWin addSubview:toast];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [UIView animateWithDuration:0.35 animations:^{ toast.alpha = 0.0; } completion:^(BOOL f) { [toast removeFromSuperview]; }];
     });
@@ -506,19 +557,16 @@ static void showStartupBannerAndPersistentIcon() {
 static BOOL isHiddenPathForTargetAppC(const char *path) {
     if (!path) return NO;
 
-    // Permitir siempre los Cryptexes nativos de iOS 16 (WebKit / OAuth)
     if (strstr(path, "Cryptex") != NULL || strstr(path, "cryptex") != NULL) {
         return NO;
     }
 
-    // 1. Ocultar el propio tweak IGFarmShield y sus plists
     if (strstr(path, "IGFarmShield") != NULL ||
         strstr(path, "igfarmshield") != NULL ||
         strstr(path, ".igshield_container") != NULL) {
         return YES;
     }
 
-    // 2. Ocultar librerías, soporte y preferencias de Crane
     if (strstr(path, "Crane.dylib") != NULL ||
         strstr(path, "libcrane") != NULL ||
         strstr(path, "CraneGUI") != NULL ||
@@ -529,7 +577,6 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
         return YES;
     }
 
-    // 3. Ocultar Jailbreak rootless / rootful, gestores de paquetes y hooks
     if (strncmp(path, "/var/jb", 7) == 0 ||
         strncmp(path, "/private/var/jb", 15) == 0 ||
         strncmp(path, "/private/preboot", 16) == 0 ||
@@ -662,8 +709,75 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 %end
 
 // ============================================================================
-// AISLAMIENTO DE RED (SIN ROMPER EL TÚNEL UTUN DE SHADOWROCKET)
+// OCULTACIÓN DE TÚNEL/PROXY (__SCOPED__) Y DESACTIVACIÓN DE HTTP/3 (QUIC)
 // ============================================================================
+static CFDictionaryRef custom_CFNetworkCopySystemProxySettings(void) {
+    CFDictionaryRef origRef = orig_CFNetworkCopySystemProxySettings ? orig_CFNetworkCopySystemProxySettings() : NULL;
+    if (!origRef || !s_spoofNetwork) return origRef;
+    if (!isCallerFromTargetApp(__builtin_return_address(0))) return origRef;
+
+    NSDictionary *origDict = (__bridge NSDictionary *)origRef;
+    NSMutableDictionary *cleanDict = [NSMutableDictionary dictionary];
+
+    NSDictionary *scoped = origDict[@"__SCOPED__"];
+    if ([scoped isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *cleanScoped = [NSMutableDictionary dictionary];
+        for (NSString *ifKey in scoped) {
+            NSString *low = [ifKey lowercaseString];
+            if ([low containsString:@"utun"] ||
+                [low containsString:@"tun"] ||
+                [low containsString:@"tap"] ||
+                [low containsString:@"ppp"] ||
+                [low containsString:@"ipsec"] ||
+                [low containsString:@"wg"]) {
+                continue;
+            }
+            cleanScoped[ifKey] = scoped[ifKey];
+        }
+        if (cleanScoped.count == 0) {
+            cleanScoped[@"en0"] = @{};
+        }
+        cleanDict[@"__SCOPED__"] = cleanScoped;
+    } else {
+        cleanDict[@"__SCOPED__"] = @{@"en0": @{}};
+    }
+
+    CFRelease(origRef);
+    return (__bridge_retained CFDictionaryRef)cleanDict;
+}
+
+static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings) {
+    if (s_spoofNetwork && isCallerFromTargetApp(__builtin_return_address(0))) {
+        NSDictionary *directProxy = @{ @"kCFProxyTypeKey" : @"kCFProxyTypeNone" };
+        NSArray *arr = @[ directProxy ];
+        return (__bridge_retained CFArrayRef)arr;
+    }
+    return orig_CFNetworkCopyProxiesForURL ? orig_CFNetworkCopyProxiesForURL(url, proxySettings) : NULL;
+}
+
+%hook NSMutableURLRequest
+- (void)setAssumesHTTP3Capable:(BOOL)capable {
+    if (s_spoofNetwork) {
+        %orig(NO);
+        return;
+    }
+    %orig(capable);
+}
+- (BOOL)assumesHTTP3Capable {
+    if (s_spoofNetwork) return NO;
+    return %orig;
+}
+%end
+
+%hook NSURLSessionConfiguration
+- (NSDictionary *)connectionProxyDictionary {
+    if (s_spoofNetwork && isCallerFromTargetApp(__builtin_return_address(0))) {
+        return @{};
+    }
+    return %orig;
+}
+%end
+
 %hook CTCarrier
 - (NSString *)carrierName {
     if (!s_spoofNetwork || !liveContainerProfile) return %orig;
@@ -701,7 +815,6 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 }
 %end
 
-// Aísla la IP privada de en0 por contenedor sin tocar ni renombrar el túnel utun de Shadowrocket
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || !s_spoofNetwork || s_spoofedLanAddr == 0) return res;
@@ -894,10 +1007,8 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 %end
 
 %ctor {
-    // 1. Cargar perfil solo con Foundation (sin tocar UIKit en %ctor para evitar cierres en iOS 16)
     ensureProfileLoaded();
 
-    // 2. Activar hooks C seguros en ElleKit
     MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
     MSHookFunction((void *)fopen, (void *)custom_fopen, (void **)&orig_fopen);
@@ -906,9 +1017,18 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
 
+    void *symProxySettings = dlsym(RTLD_DEFAULT, "CFNetworkCopySystemProxySettings");
+    if (symProxySettings) {
+        MSHookFunction(symProxySettings, (void *)custom_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
+    }
+    void *symProxiesForURL = dlsym(RTLD_DEFAULT, "CFNetworkCopyProxiesForURL");
+    if (symProxiesForURL) {
+        MSHookFunction(symProxiesForURL, (void *)custom_CFNetworkCopyProxiesForURL, (void **)&orig_CFNetworkCopyProxiesForURL);
+    }
+
     %init;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        showStartupBannerAndPersistentIcon();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        showStartupBannerAndPersistentIcon(0);
     });
 }
