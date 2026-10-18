@@ -478,6 +478,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     }
     [self saveState];
 
+    self.residualSummary = @"Calculando caché en segundo plano... (Auto-limpieza al cerrar activa)";
     [self scanAndSyncAllContainers];
     [self auditStealthEngineStatus];
     [self calculateResidualTraces];
@@ -533,7 +534,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     subLbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     subLbl.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
     subLbl.textColor = [UIColor secondaryLabelColor];
-    subLbl.text = @"Cápsula UIWindowScene • Anti-Leaks TCP";
+    subLbl.text = @"Auto-Purga al Cerrar • Hasta 30 Contenedores";
     [card addSubview:subLbl];
 
     UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 240, 18)];
@@ -621,10 +622,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     }
 
     self.stealthDetailReport =
-        @"¿Cómo funciona el Modo Invisible y el Icono Fijo?\n"
-        @"1. Cápsula Fija en Barra Superior (UIWindowScene): Mientras usas Reddit o Instagram, verás centrada arriba una cápsula verde (🛡️ Nombre) si el escudo está activo, o gris (⚪ Nombre) si está en pausa.\n\n"
-        @"2. Ocultación de Jailbreak, Crane y Tweak: Bloquea la detección de /var/jb, Sileo, Filza, ElleKit, Crane.dylib e IGFarmShield en fopen, dyld, dladdr, NSFileManager y NSURL.\n\n"
-        @"3. Ocultación de Túnel (__SCOPED__) y Bloqueo QUIC: Oculta utun ante la app en CFNetworkCopySystemProxySettings sin afectar el enrutamiento real de Shadowrocket.";
+        @"¿Cómo funciona el Modo Invisible y la Auto-Limpieza?\n"
+        @"1. Auto-Limpieza al Cerrar de Segundo Plano: Cada vez que sales o deslizas para cerrar Instagram o Reddit, el tweak borra automáticamente tmp, Library/Caches, WebKit y Saved Application State de ese contenedor sin cerrar tu sesión.\n\n"
+        @"2. Cápsula Fija Superior (UIWindowScene): Muestra arriba una cápsula verde (🛡️ Nombre) cuando el contenedor está protegido.\n\n"
+        @"3. Ocultación de Túnel (__SCOPED__ + getifaddrs): Camufla utun como lo0 ante la app y aísla la IP LAN en0 sin afectar a Shadowrocket.";
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -1109,6 +1110,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [self saveState];
 }
 
+// Escaneo asíncrono en segundo plano para soportar 30+ contenedores sin congelar la UI
 - (void)calculateResidualTraces {
     self.vpnActive = NO;
     self.vpnInterfaceName = @"Inactivo";
@@ -1144,24 +1146,39 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         freeifaddrs(interfaces);
     }
 
-    unsigned long long residualBytes = 0;
-    NSUInteger residualFiles = 0;
-    NSMutableSet *scannedPaths = [NSMutableSet set];
-
-    for (NSArray *list in @[self.igContainersList, self.redditContainersList]) {
+    NSMutableArray *pathsToScan = [NSMutableArray array];
+    for (NSArray *list in @[self.igContainersList ?: @[], self.redditContainersList ?: @[]]) {
         for (NSDictionary *prof in list) {
             NSString *cPath = prof[@"path"];
-            if (![cPath isKindOfClass:[NSString class]] || cPath.length == 0 || [scannedPaths containsObject:cPath]) continue;
-            [scannedPaths addObject:cPath];
-
-            for (NSString *sub in @[@"tmp", @"Library/Caches", @"Library/WebKit/WebsiteData", @"Library/Saved Application State"]) {
-                accumulateDirectoryCacheUsage([cPath stringByAppendingPathComponent:sub], &residualBytes, &residualFiles);
+            if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && ![pathsToScan containsObject:cPath]) {
+                [pathsToScan addObject:cPath];
             }
         }
     }
 
-    double mb = (double)residualBytes / (1024.0 * 1024.0);
-    self.residualSummary = [NSString stringWithFormat:@"%lu archivos en caché (%.2f MB) + Portapapeles", (unsigned long)residualFiles, mb];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        unsigned long long residualBytes = 0;
+        NSUInteger residualFiles = 0;
+
+        for (NSString *cPath in pathsToScan) {
+            for (NSString *sub in @[@"tmp", @"Library/Caches", @"Library/WebKit/WebsiteData", @"Library/Saved Application State"]) {
+                accumulateDirectoryCacheUsage([cPath stringByAppendingPathComponent:sub], &residualBytes, &residualFiles);
+            }
+        }
+
+        double mb = (double)residualBytes / (1024.0 * 1024.0);
+        NSString *summary = [NSString stringWithFormat:@"%lu archivos (%.2f MB) • Auto-limpieza activa al cerrar app", (unsigned long)residualFiles, mb];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf.residualSummary = summary;
+            if (strongSelf.tableView) {
+                [strongSelf.tableView reloadData];
+            }
+        });
+    });
 }
 
 - (void)cleanResidualTracesAndKillApps:(BOOL)showPopup {
@@ -1209,7 +1226,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     if (section == 0) return @"CONTROL PRINCIPAL (100% MANUAL)";
     if (section == 1) return @"CONTENEDORES POR APLICACIÓN (CRANE)";
     if (section == 2) return @"ESTADO DE RED Y MODO INVISIBLE";
-    return @"ROTACIÓN SEGURA DE CUENTAS";
+    return @"LIMPIEZA GLOBAL Y AUTO-PURGA";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -1312,7 +1329,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Túnel de Proxy Activo";
             cell.detailTextLabel.text = self.vpnActive
-                ? [NSString stringWithFormat:@"Conectado (%@) • Oculto en __SCOPED__ y LAN en0 aislada", self.vpnInterfaceName]
+                ? [NSString stringWithFormat:@"Conectado (%@) • Oculto en __SCOPED__/getifaddrs y LAN aislada", self.vpnInterfaceName]
                 : @"Apagado en este momento";
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -1331,7 +1348,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     cell.detailTextLabel.numberOfLines = 0;
     cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     cell.textLabel.textColor = [UIColor systemRedColor];
-    cell.textLabel.text = @"Cerrar Apps y Limpiar Rastro Residual";
+    cell.textLabel.text = @"Cerrar Apps y Limpiar Rastro Residual Ahora";
     cell.detailTextLabel.text = self.residualSummary;
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     return cell;
@@ -1392,7 +1409,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     if (indexPath.section == 2 && indexPath.row == 1) {
         triggerHaptic();
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Modo Invisible e Icono Superior"
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Modo Invisible y Auto-Limpieza"
                                                                     message:self.stealthDetailReport
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDefault handler:nil]];
@@ -1681,7 +1698,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"shield.lefthalf.filled", contOn ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Activar Escudo en este Contenedor";
-            cell.detailTextLabel.text = contOn ? @"Activo • Cápsula verde en barra superior y Modo Invisible" : @"En pausa manual (Cápsula gris en barra superior)";
+            cell.detailTextLabel.text = contOn ? @"Activo • Cápsula verde en barra y Auto-Limpieza al cerrar" : @"En pausa manual (Cápsula gris en barra superior)";
             cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = contOn;
@@ -1730,7 +1747,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         ];
         NSArray *subtitles = @[
             @"Mantiene el IDFV aislado de Crane y fija un BootSessionUUID constante",
-            @"Aísla la IP LAN en en0, oculta __SCOPED__ (utun) y desactiva HTTP/3 (QUIC)",
+            @"Aísla la IP LAN en en0, oculta utun (__SCOPED__/getifaddrs) y desactiva QUIC",
             @"Ajusta la zona horaria e idioma (NSLocale) al país de tu proxy",
             @"Simula batería, volumen, brillo y espacio libre sin alterar el BootUUID",
             @"Oculta /var/jb, Crane y este tweak en C, Swift y Objective-C"
@@ -1793,13 +1810,13 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 if (!on) {
                     cell.detailTextLabel.text = [NSString stringWithFormat:@"○ EN PAUSA (Mostrando tu LAN real %@)", self.parentRoot.realLocalIP ?: @"LAN"];
                 } else if (isCell) {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL AISLADO (TCP Puro):\nOperadora: %@ (MCC %@ / MNC %@)\nIP Local Aislada: %@ • __SCOPED__ y Wi-Fi Ocultos",
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL AISLADO (TCP Puro):\nOperadora: %@ (MCC %@ / MNC %@)\nIP Local Aislada: %@ • utun y Wi-Fi Ocultos",
                                                  self.profile[@"CarrierName"] ?: @"T-Mobile",
                                                  self.profile[@"CarrierMCC"] ?: @"310",
                                                  self.profile[@"CarrierMNC"] ?: @"260",
                                                  self.profile[@"localIP"] ?: @"192.168.1.45"];
                 } else {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL WI-FI RESIDENCIAL AISLADO (TCP Puro):\nIP Local Aislada: %@ • __SCOPED__ Limpio\nRouter Simulado:  %@ (%@)",
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL WI-FI RESIDENCIAL AISLADO (TCP Puro):\nIP Local Aislada: %@ • utun Oculto\nRouter Simulado:  %@ (%@)",
                                                  self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]];
                 }
                 break;
@@ -1870,7 +1887,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:sender.isOn ? @"🟢 Contenedor Protegido" : @"⚪ Contenedor en Pausa"
                                                                     message:sender.isOn
-                                                                        ? [NSString stringWithFormat:@"Escudo activado para \"%@\".\n• IDFV (Crane): %@\n• BootUUID Fijo: %@", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
+                                                                        ? [NSString stringWithFormat:@"Escudo activado para \"%@\".\n• IDFV (Crane): %@\n• BootUUID Fijo: %@\n• Auto-limpieza al cerrar app: Activa", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
                                                                         : @"Este contenedor está en pausa manual y no modificará nada hasta que lo vuelvas a encender."
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -1897,8 +1914,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             popupTitle = sender.isOn ? @"📡 Configuración de Red Activa" : @"⚪ Configuración de Red en Pausa";
             popupMsg = sender.isOn
                 ? (isCell
-                   ? [NSString stringWithFormat:@"Perfil móvil activo (%@) • IP LAN en0 aislada: %@ • __SCOPED__ limpio", self.profile[@"CarrierName"], self.profile[@"localIP"]]
-                   : [NSString stringWithFormat:@"Perfil Wi-Fi residencial activo (%@) • IP LAN en0 aislada: %@ • __SCOPED__ limpio", self.profile[@"ssid"], self.profile[@"localIP"]])
+                   ? [NSString stringWithFormat:@"Perfil móvil activo (%@) • IP LAN en0 aislada: %@ • utun oculto", self.profile[@"CarrierName"], self.profile[@"localIP"]]
+                   : [NSString stringWithFormat:@"Perfil Wi-Fi residencial activo (%@) • IP LAN en0 aislada: %@ • utun oculto", self.profile[@"ssid"], self.profile[@"localIP"]])
                 : @"Mostrando configuración de red física del teléfono.";
         } else if (idx == 2) {
             popupTitle = sender.isOn ? @"🌎 Hora e Idioma Aplicados" : @"⚪ Hora e Idioma en Pausa";
