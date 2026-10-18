@@ -533,7 +533,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     subLbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     subLbl.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
     subLbl.textColor = [UIColor secondaryLabelColor];
-    subLbl.text = @"Indicador Fijo en Barra • Anti-Leaks";
+    subLbl.text = @"Cápsula UIWindowScene • Anti-Leaks TCP";
     [card addSubview:subLbl];
 
     UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 240, 18)];
@@ -622,9 +622,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     self.stealthDetailReport =
         @"¿Cómo funciona el Modo Invisible y el Icono Fijo?\n"
-        @"1. Cápsula Fija en Barra Superior: Mientras usas Reddit o Instagram, verás arriba a la derecha una cápsula verde (🛡️ Nombre) si el escudo está activo, o gris (⚪ Nombre) si está en pausa.\n\n"
+        @"1. Cápsula Fija en Barra Superior (UIWindowScene): Mientras usas Reddit o Instagram, verás centrada arriba una cápsula verde (🛡️ Nombre) si el escudo está activo, o gris (⚪ Nombre) si está en pausa.\n\n"
         @"2. Ocultación de Jailbreak, Crane y Tweak: Bloquea la detección de /var/jb, Sileo, Filza, ElleKit, Crane.dylib e IGFarmShield en fopen, dyld, dladdr, NSFileManager y NSURL.\n\n"
-        @"3. Compatibilidad con Shadowrocket: Aísla la IP LAN en en0 sin alterar el adaptador utun.";
+        @"3. Ocultación de Túnel (__SCOPED__) y Bloqueo QUIC: Oculta utun ante la app en CFNetworkCopySystemProxySettings sin afectar el enrutamiento real de Shadowrocket.";
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -1312,7 +1312,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Túnel de Proxy Activo";
             cell.detailTextLabel.text = self.vpnActive
-                ? [NSString stringWithFormat:@"Conectado (%@) • IP LAN en0 aislada por contenedor", self.vpnInterfaceName]
+                ? [NSString stringWithFormat:@"Conectado (%@) • Oculto en __SCOPED__ y LAN en0 aislada", self.vpnInterfaceName]
                 : @"Apagado en este momento";
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -1681,7 +1681,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"shield.lefthalf.filled", contOn ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Activar Escudo en este Contenedor";
-            cell.detailTextLabel.text = contOn ? @"Activo • Icono verde en barra superior y Modo Invisible" : @"En pausa manual (Icono gris en barra superior)";
+            cell.detailTextLabel.text = contOn ? @"Activo • Cápsula verde en barra superior y Modo Invisible" : @"En pausa manual (Cápsula gris en barra superior)";
             cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = contOn;
@@ -1730,10 +1730,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         ];
         NSArray *subtitles = @[
             @"Mantiene el IDFV aislado de Crane y fija un BootSessionUUID constante",
-            @"Aísla la IP LAN en en0 y adapta la operadora móvil sin tocar utun",
+            @"Aísla la IP LAN en en0, oculta __SCOPED__ (utun) y desactiva HTTP/3 (QUIC)",
             @"Ajusta la zona horaria e idioma (NSLocale) al país de tu proxy",
             @"Simula batería, volumen, brillo y espacio libre sin alterar el BootUUID",
-            @"Oculta /var/jb, Crane y este tweak en C y Objective-C"
+            @"Oculta /var/jb, Crane y este tweak en C, Swift y Objective-C"
         ];
         NSArray *keys = @[@"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity"];
 
@@ -1793,13 +1793,13 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 if (!on) {
                     cell.detailTextLabel.text = [NSString stringWithFormat:@"○ EN PAUSA (Mostrando tu LAN real %@)", self.parentRoot.realLocalIP ?: @"LAN"];
                 } else if (isCell) {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL AISLADO:\nOperadora: %@ (MCC %@ / MNC %@)\nIP Local Aislada: %@ • Wi-Fi Físico Oculto",
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL AISLADO (TCP Puro):\nOperadora: %@ (MCC %@ / MNC %@)\nIP Local Aislada: %@ • __SCOPED__ y Wi-Fi Ocultos",
                                                  self.profile[@"CarrierName"] ?: @"T-Mobile",
                                                  self.profile[@"CarrierMCC"] ?: @"310",
                                                  self.profile[@"CarrierMNC"] ?: @"260",
                                                  self.profile[@"localIP"] ?: @"192.168.1.45"];
                 } else {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL WI-FI RESIDENCIAL AISLADO:\nIP Local Aislada: %@\nRouter Simulado:  %@ (%@)",
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL WI-FI RESIDENCIAL AISLADO (TCP Puro):\nIP Local Aislada: %@ • __SCOPED__ Limpio\nRouter Simulado:  %@ (%@)",
                                                  self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]];
                 }
                 break;
@@ -1831,7 +1831,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"🛡️ Modo Invisible";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? @"● ACTIVO EN ESTE CONTENEDOR:\nOcultos: /var/jb, Crane.dylib, libcrane, CRANE_*, IGFarmShield\nProtegidos: fopen/dyld/dladdr/NSFileManager/NSURL"
+                    ? @"● ACTIVO EN ESTE CONTENEDOR:\nOcultos: /var/jb, Crane.dylib, libcrane, CRANE_*, IGFarmShield\nProtegidos: fopen/dyld/dladdr/NSFileManager/NSURL/Swift"
                     : @"○ DESACTIVADO EN ESTE CONTENEDOR";
                 break;
             }
@@ -1897,8 +1897,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             popupTitle = sender.isOn ? @"📡 Configuración de Red Activa" : @"⚪ Configuración de Red en Pausa";
             popupMsg = sender.isOn
                 ? (isCell
-                   ? [NSString stringWithFormat:@"Perfil móvil activo (%@) • IP LAN aislada: %@", self.profile[@"CarrierName"], self.profile[@"localIP"]]
-                   : [NSString stringWithFormat:@"Perfil Wi-Fi residencial activo (%@) • IP LAN aislada: %@", self.profile[@"ssid"], self.profile[@"localIP"]])
+                   ? [NSString stringWithFormat:@"Perfil móvil activo (%@) • IP LAN en0 aislada: %@ • __SCOPED__ limpio", self.profile[@"CarrierName"], self.profile[@"localIP"]]
+                   : [NSString stringWithFormat:@"Perfil Wi-Fi residencial activo (%@) • IP LAN en0 aislada: %@ • __SCOPED__ limpio", self.profile[@"ssid"], self.profile[@"localIP"]])
                 : @"Mostrando configuración de red física del teléfono.";
         } else if (idx == 2) {
             popupTitle = sender.isOn ? @"🌎 Hora e Idioma Aplicados" : @"⚪ Hora e Idioma en Pausa";
