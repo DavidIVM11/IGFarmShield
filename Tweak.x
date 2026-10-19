@@ -89,7 +89,14 @@ static uint64_t randomSeed64(NSString *salt) {
     return hash ^ r;
 }
 
-// Detecta llamadas del ejecutable de la App y de sus librerías Swift, dejando libre a CFNetwork y Crane
+static void applyLowLevelCTimeZone(NSString *tzName) {
+    if (!tzName || [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "] || tzName.length == 0) return;
+    setenv("TZ", [tzName UTF8String], 1);
+    tzset();
+}
+
+// Detecta llamadas del ejecutable de la App y de sus librerías Swift (vital para Reddit),
+// dejando libres a CFNetwork, libnetwork y Crane para no interferir con Shadowrocket
 static BOOL isCallerFromTargetApp(const void *retAddr) {
     if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
     Dl_info info;
@@ -218,12 +225,22 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bund
         NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
         if ([cPrefs isKindOfClass:[NSDictionary class]] && [cPrefs count] > 0) {
             if (!craneName && craneID) craneName = findCraneNameInNode(cPrefs, craneID);
-            if (!craneName && origCraneIDFV) craneName = findCraneNameInNode(cPrefs, origCraneIDFV);
+            if (!craneName && origCraneIDFV) {
+                NSString *foundByIDFV = findCraneNameInNode(cPrefs, origCraneIDFV);
+                if (foundByIDFV) {
+                    craneName = foundByIDFV;
+                    if (!craneID) craneID = origCraneIDFV;
+                }
+            }
             if (!craneName) craneName = findCraneNameInNode(cPrefs, folderUUID);
         }
     }
 
+    if (!craneID && origCraneIDFV && origCraneIDFV.length >= 32) {
+        craneID = origCraneIDFV;
+    }
     if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
+
     if (!craneName || craneName.length == 0) {
         NSDictionary *userInfo = [meta isKindOfClass:[NSDictionary class]] ? meta[@"MCMMetadataUserInfo"] : nil;
         if ((!userInfo || [userInfo count] == 0) || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
@@ -269,16 +286,20 @@ static void ensureProfileLoaded() {
     NSDictionary *settingsEntry = nil;
     NSString *matchedSettingsKey = nil;
 
-    // 1. Emparejamiento exacto por ruta, UUID de carpeta, Crane ID o Nombre de contenedor
+    // 1. Emparejamiento exacto entre los 30+ contenedores por ruta física, UUID de carpeta, IDFV de Crane o Nombre
     for (NSString *existingKey in byUUID) {
         NSDictionary *cand = byUUID[existingKey];
         if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
         NSString *candPath = cand[@"path"] ?: @"";
         NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
+        NSString *candIDFV = cand[@"idfv"] ?: @"";
         NSString *candName = cand[@"containerName"] ?: @"";
 
         if ([candPath isEqualToString:homePath] ||
             [existingKey caseInsensitiveCompare:keyUUID] == NSOrderedSame ||
+            (origCraneIDFV.length > 0 && ([existingKey caseInsensitiveCompare:origCraneIDFV] == NSOrderedSame ||
+                                          [candCraneID caseInsensitiveCompare:origCraneIDFV] == NSOrderedSame ||
+                                          [candIDFV caseInsensitiveCompare:origCraneIDFV] == NSOrderedSame)) ||
             (candCraneID.length > 0 && ![candCraneID isEqualToString:@"Default"] && [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame) ||
             (craneName.length > 0 && ![craneName isEqualToString:@"Default"] && [candName caseInsensitiveCompare:craneName] == NSOrderedSame)) {
             settingsEntry = cand;
@@ -287,11 +308,14 @@ static void ensureProfileLoaded() {
         }
     }
 
-    // 2. Fallback seguro exclusivamente para el contenedor marcado como activo en Crane (sin mezclar los 30 contenedores)
+    // 2. Fallback seguro si el contenedor recién creado en Crane aún tenía path vacío y está marcado como activo
     if (!settingsEntry && craneActiveIDForApp.length > 0) {
         for (NSString *existingKey in byUUID) {
             NSDictionary *cand = byUUID[existingKey];
             if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
+            NSString *candPath = cand[@"path"] ?: @"";
+            if (candPath.length > 0 && ![candPath isEqualToString:homePath]) continue;
+
             NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
             NSString *candName = cand[@"containerName"] ?: @"";
 
@@ -318,9 +342,9 @@ static void ensureProfileLoaded() {
         }
     }
 
-    NSString *nativeCraneUUID = ([craneID containsString:@"-"] && craneID.length >= 32)
-        ? [craneID uppercaseString]
-        : (origCraneIDFV ?: [[NSUUID UUID] UUIDString]);
+    NSString *nativeCraneUUID = (origCraneIDFV && origCraneIDFV.length >= 32)
+        ? [origCraneIDFV uppercaseString]
+        : (([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString]);
 
     if (!profile || !profile[@"bootSessionUUID"]) {
         uint64_t seed = randomSeed64(keyUUID);
@@ -383,6 +407,9 @@ static void ensureProfileLoaded() {
         profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
         profile[@"bundleID"] = bundleID;
         profile[@"path"] = homePath;
+        if (craneName.length > 0 && ![craneName isEqualToString:keyUUID] && [profile[@"containerName"] isEqualToString:@"Default"]) {
+            profile[@"containerName"] = craneName;
+        }
     }
 
     [profile writeToFile:localPlist atomically:YES];
@@ -418,11 +445,15 @@ static void ensureProfileLoaded() {
     NSString *lanIP = profile[@"localIP"] ?: @"192.168.1.45";
     s_spoofedLanAddr = inet_addr([lanIP UTF8String]);
 
+    if (s_spoofLocation && profile[@"timeZone"]) {
+        applyLowLevelCTimeZone(profile[@"timeZone"]);
+    }
+
     s_inInternalCall = NO;
 }
 
 // ============================================================================
-// ICONO FIJO EN BARRA SUPERIOR (COMPATIBLE CON UIWINDOWSCENE DE iOS 16)
+// CÁPSULA FIJA EN BARRA SUPERIOR (COMPATIBLE CON UIWINDOWSCENE DE iOS 16)
 // ============================================================================
 static void showStartupBannerAndPersistentIcon(int attempt) {
     if (bannerShownThisSession) return;
@@ -641,6 +672,23 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
     return ret;
 }
 
+// Silencia únicamente alertas intrusivas de Apple ID / iCloud sin bloquear ASAuthorizationController en el login
+%hook UIViewController
+- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    if ((s_spoofSecurity || s_spoofIDs) && [viewControllerToPresent isKindOfClass:[UIAlertController class]]) {
+        UIAlertController *ac = (UIAlertController *)viewControllerToPresent;
+        NSString *t = [ac.title ?: @"" lowercaseString];
+        NSString *m = [ac.message ?: @"" lowercaseString];
+        if ([t containsString:@"apple id"] || [t containsString:@"icloud"] ||
+            [m containsString:@"apple id"] || [m containsString:@"icloud"]) {
+            if (completion) completion();
+            return;
+        }
+    }
+    %orig;
+}
+%end
+
 %hook UIApplication
 - (BOOL)canOpenURL:(NSURL *)url {
     if (s_spoofSecurity && url && url.scheme) {
@@ -806,7 +854,7 @@ static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRe
 }
 %end
 
-// Camufla utun/ppp/ipsec como lo0 ante el binario de la App y aísla la IP privada de en0
+// Camufla utun/ppp/ipsec y aísla la IP privada de en0 solo ante la App y Swift (dejando libre a CFNetwork)
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || !s_spoofNetwork || s_spoofedLanAddr == 0) return res;
@@ -822,6 +870,10 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
                 strncmp(curr->ifa_name, "tap", 3) == 0) {
                 strcpy(curr->ifa_name, "lo0");
                 curr->ifa_flags &= ~IFF_POINTOPOINT;
+                if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
+                    struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
+                    addr->sin_addr.s_addr = inet_addr("127.0.0.1");
+                }
             } else if (strcmp(curr->ifa_name, "en0") == 0 &&
                        curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
                 struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
@@ -972,6 +1024,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
         if ([k isEqualToString:@"DYLD_INSERT_LIBRARIES"] ||
             [k isEqualToString:@"_MSSafeMode"] ||
             [k isEqualToString:@"_SafeMode"] ||
+            [k isEqualToString:@"TZ"] ||
             [k hasPrefix:@"CRANE_"]) {
             [cleanEnv removeObjectForKey:k];
         }
@@ -1008,8 +1061,10 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 %end
 
 %ctor {
+    // 1. Cargar perfil desde Foundation sin invocar UIKit prematuramente en %ctor
     ensureProfileLoaded();
 
+    // 2. Activar hooks C seguros en ElleKit (sin access/stat/lstat que crashean los stubs cortos del kernel)
     MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
     MSHookFunction((void *)fopen, (void *)custom_fopen, (void **)&orig_fopen);
