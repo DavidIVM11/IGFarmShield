@@ -7,6 +7,7 @@
 #import <arpa/inet.h>
 #import <net/if.h>
 #import <sys/sysctl.h>
+#import <sys/stat.h>
 #import <spawn.h>
 
 extern char **environ;
@@ -17,7 +18,17 @@ extern char **environ;
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 31
+#define CURRENT_SCHEMA_VERSION 32
+
+static NSArray<NSString *> *residualSubdirectoriesToTrack(void) {
+    return @[
+        @"tmp",
+        @"Library/Caches",
+        @"Library/WebKit",
+        @"Library/Saved Application State",
+        @"SystemData/com.apple.SafariViewService"
+    ];
+}
 
 @interface PSViewController : UIViewController
 @end
@@ -222,6 +233,7 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
     return nil;
 }
 
+// Conteo exacto a nivel de sistema de archivos (lstat) para detectar bases SQLite/WAL, snapshots y cachés de WebKit
 static void accumulateDirectoryCacheUsage(NSString *dirPath, unsigned long long *outBytes, NSUInteger *outFiles) {
     if (!dirPath || dirPath.length == 0) return;
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -231,14 +243,13 @@ static void accumulateDirectoryCacheUsage(NSString *dirPath, unsigned long long 
     NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:dirPath];
     NSString *relPath = nil;
     while ((relPath = [enumerator nextObject])) {
-        NSDictionary *attrs = [enumerator fileAttributes];
-        if (!attrs) {
-            NSString *full = [dirPath stringByAppendingPathComponent:relPath];
-            attrs = [fm attributesOfItemAtPath:full error:nil];
-        }
-        if ([attrs[NSFileType] isEqualToString:NSFileTypeRegular]) {
-            if (outBytes) *outBytes += [attrs[NSFileSize] unsignedLongLongValue];
-            if (outFiles) (*outFiles)++;
+        NSString *fullPath = [dirPath stringByAppendingPathComponent:relPath];
+        struct stat st;
+        if (lstat([fullPath fileSystemRepresentation], &st) == 0) {
+            if (S_ISREG(st.st_mode)) {
+                if (outBytes) *outBytes += (unsigned long long)st.st_size;
+                if (outFiles) (*outFiles)++;
+            }
         }
     }
 }
@@ -255,6 +266,35 @@ static void purgeDirectoryCacheContents(NSString *dirPath, unsigned long long *f
         NSString *full = [dirPath stringByAppendingPathComponent:item];
         [fm removeItemAtPath:full error:nil];
     }
+}
+
+// Calcula cuántos elementos y bytes hay actualmente en la memoria del Portapapeles (UIPasteboard)
+static void inspectPasteboardUsage(NSUInteger *outItemCount, unsigned long long *outBytes) {
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    NSArray *items = pb.items;
+    NSUInteger count = items.count;
+    unsigned long long bytes = 0;
+
+    for (NSDictionary<NSString *, id> *dict in items) {
+        if (![dict isKindOfClass:[NSDictionary class]]) continue;
+        for (NSString *typeKey in dict) {
+            id val = dict[typeKey];
+            if ([val isKindOfClass:[NSData class]]) {
+                bytes += [(NSData *)val length];
+            } else if ([val isKindOfClass:[NSString class]]) {
+                bytes += [(NSString *)val lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+            } else if ([val isKindOfClass:[NSURL class]]) {
+                bytes += [[(NSURL *)val absoluteString] lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+            }
+        }
+    }
+    if (count == 0 && pb.string.length > 0) {
+        count = 1;
+        bytes = [pb.string lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    }
+
+    if (outItemCount) *outItemCount = count;
+    if (outBytes) *outBytes = bytes;
 }
 
 static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip, NSString *ispRaw, NSString *cc, NSString *city, NSString *region, NSString *tz, BOOL isMobileFlag) {
@@ -416,8 +456,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (NSString *)enforceExclusiveModeWhenToggledOn;
 - (void)deduplicateActiveIfMultiple;
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid;
-- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path allowEnableDefault:(BOOL)allowEnable;
-- (void)saveProfile:(NSMutableDictionary *)profile forUUID:(NSString *)uuid;
+- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path allowEnableDefault:(BOOL)allowEnable saveNow:(BOOL)saveNow;
+- (void)saveProfile:(NSMutableDictionary *)profile forUUID:(NSString *)uuid saveNow:(BOOL)saveNow;
 - (void)setContainer:(NSString *)targetUUID enabled:(BOOL)enabled inBundle:(NSString *)bundleID;
 - (void)purgeGhostContainerFromTweak:(NSDictionary *)prof;
 @end
@@ -478,7 +518,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     }
     [self saveState];
 
-    self.residualSummary = @"Calculando caché en segundo plano... (Auto-limpieza al cerrar activa)";
+    self.residualSummary = @"Calculando caché acumulada y portapapeles...";
     [self scanAndSyncAllContainers];
     [self auditStealthEngineStatus];
     [self calculateResidualTraces];
@@ -534,7 +574,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     subLbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     subLbl.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
     subLbl.textColor = [UIColor secondaryLabelColor];
-    subLbl.text = @"Auto-Purga al Cerrar • Hasta 30 Contenedores";
+    subLbl.text = @"Optimizado para 30+ Contenedores • Anti-Leaks";
     [card addSubview:subLbl];
 
     UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 240, 18)];
@@ -568,7 +608,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     if (cPath.length > 0 && [fm fileExistsAtPath:cPath]) {
         NSString *localPlist = [cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
         [fm removeItemAtPath:localPlist error:nil];
-        for (NSString *sub in @[@"tmp", @"Library/Caches", @"Library/WebKit/WebsiteData", @"Library/Saved Application State"]) {
+        for (NSString *sub in residualSubdirectoriesToTrack()) {
             purgeDirectoryCacheContents([cPath stringByAppendingPathComponent:sub], NULL, NULL);
         }
     }
@@ -622,8 +662,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     }
 
     self.stealthDetailReport =
-        @"¿Cómo funciona el Modo Invisible y la Auto-Limpieza?\n"
-        @"1. Auto-Limpieza al Cerrar de Segundo Plano: Cada vez que sales o deslizas para cerrar Instagram o Reddit, el tweak borra automáticamente tmp, Library/Caches, WebKit y Saved Application State de ese contenedor sin cerrar tu sesión.\n\n"
+        @"¿Cómo funciona la Gestión de 30+ Contenedores y Rastro?\n"
+        @"1. Acumulación Orgánica y Limpieza Manual: La caché de cada contenedor se acumula de forma natural mientras usas la cuenta (sin auto-borrarse al minimizar para no gastar datos del proxy) y puedes auditarla y purgarla junto con el Portapapeles desde el botón inferior.\n\n"
         @"2. Cápsula Fija Superior (UIWindowScene): Muestra arriba una cápsula verde (🛡️ Nombre) cuando el contenedor está protegido.\n\n"
         @"3. Ocultación de Túnel (__SCOPED__ + getifaddrs): Camufla utun como lo0 ante la app y aísla la IP LAN en0 sin afectar a Shadowrocket.";
 }
@@ -637,7 +677,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     return nil;
 }
 
-- (void)saveProfile:(NSMutableDictionary *)profile forUUID:(NSString *)uuid {
+- (void)saveProfile:(NSMutableDictionary *)profile forUUID:(NSString *)uuid saveNow:(BOOL)saveNow {
     if (!uuid || uuid.length == 0 || !profile) return;
     profile[@"containerUUID"] = uuid;
     profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
@@ -647,12 +687,17 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         : [NSMutableDictionary dictionary];
     byUUID[uuid] = profile;
     self.state[@"containersByUUID"] = byUUID;
-    [self saveState];
+
+    if (saveNow) {
+        [self saveState];
+    }
 
     NSString *p = profile[@"path"];
     if ([p isKindOfClass:[NSString class]] && p.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:p]) {
         NSString *localPlist = [p stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
-        [profile writeToFile:localPlist atomically:YES];
+        if (saveNow || ![[NSFileManager defaultManager] fileExistsAtPath:localPlist]) {
+            [profile writeToFile:localPlist atomically:YES];
+        }
     }
 }
 
@@ -687,7 +732,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             NSString *u = p[@"containerUUID"];
             BOOL keepOn = [u isEqualToString:chosenUUID];
             p[@"enabled"] = @(keepOn);
-            [self saveProfile:p forUUID:u];
+            [self saveProfile:p forUUID:u saveNow:NO];
         }
     }
 }
@@ -730,7 +775,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             NSString *u = p[@"containerUUID"];
             BOOL keepOn = [u isEqualToString:chosenUUID];
             p[@"enabled"] = @(keepOn);
-            [self saveProfile:p forUUID:u];
+            [self saveProfile:p forUUID:u saveNow:YES];
             if (keepOn) {
                 [keptNames addObject:[NSString stringWithFormat:@"%@: %@", isIG ? @"IG" : @"Reddit", p[@"containerName"] ?: @"Default"]];
             }
@@ -750,10 +795,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         if (!u) continue;
         if ([u isEqualToString:targetUUID]) {
             p[@"enabled"] = @(enabled);
-            [self saveProfile:p forUUID:u];
+            [self saveProfile:p forUUID:u saveNow:YES];
         } else if (enabled && exclusive) {
             p[@"enabled"] = @NO;
-            [self saveProfile:p forUUID:u];
+            [self saveProfile:p forUUID:u saveNow:YES];
         }
     }
 
@@ -761,7 +806,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     killAppProcess([bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
 }
 
-- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path allowEnableDefault:(BOOL)allowEnable {
+- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path allowEnableDefault:(BOOL)allowEnable saveNow:(BOOL)saveNow {
     if (!bundleID) bundleID = @"com.burbn.instagram";
     if (!uuid || uuid.length == 0) uuid = craneID ?: @"Default";
     if (!craneID || craneID.length == 0) craneID = uuid;
@@ -806,7 +851,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     BOOL hasValidCraneUUID = ([craneID containsString:@"-"] && craneID.length >= 32);
     NSString *nativeCraneIDFV = hasValidCraneUUID ? [craneID uppercaseString] : (profile[@"idfv"] ?: [[NSUUID UUID] UUIDString]);
 
-    if (!profile || !profile[@"bootSessionUUID"]) {
+    BOOL isNewProfile = (!profile || !profile[@"bootSessionUUID"]);
+
+    if (isNewProfile) {
         BOOL wasEnabled = (profile && profile[@"enabled"] != nil) ? [profile[@"enabled"] boolValue] : NO;
 
         uint64_t seed = randomSeedPrefs64(uuid);
@@ -874,7 +921,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         if (path.length > 0) profile[@"path"] = path;
     }
 
-    [self saveProfile:profile forUUID:uuid];
+    [self saveProfile:profile forUUID:uuid saveNow:(saveNow || isNewProfile)];
     return profile;
 }
 
@@ -1032,7 +1079,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                                                          craneID:craneID
                                                      defaultName:detectedName
                                                             path:fullPath
-                                              allowEnableDefault:NO];
+                                              allowEnableDefault:NO
+                                                         saveNow:NO];
         [seenKeys addObject:[folderUUID lowercaseString]];
         [seenKeys addObject:[craneID lowercaseString]];
         [seenKeys addObject:[detectedName lowercaseString]];
@@ -1065,7 +1113,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                                                              craneID:cID
                                                          defaultName:cName
                                                                 path:@""
-                                                  allowEnableDefault:NO];
+                                                  allowEnableDefault:NO
+                                                             saveNow:NO];
             [seenKeys addObject:[cID lowercaseString]];
             [seenKeys addObject:[cName lowercaseString]];
             [targetList addObject:prof];
@@ -1107,10 +1156,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         [self deduplicateActiveIfMultiple];
     }
 
+    // Una única escritura en disco al terminar el escaneo de hasta 30+ contenedores
     [self saveState];
 }
 
-// Escaneo asíncrono en segundo plano para soportar 30+ contenedores sin congelar la UI
+// Escaneo asíncrono de los 30+ contenedores + memoria viva del Portapapeles (UIPasteboard)
 - (void)calculateResidualTraces {
     self.vpnActive = NO;
     self.vpnInterfaceName = @"Inactivo";
@@ -1146,6 +1196,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         freeifaddrs(interfaces);
     }
 
+    NSUInteger pbItems = 0;
+    unsigned long long pbBytes = 0;
+    inspectPasteboardUsage(&pbItems, &pbBytes);
+
     NSMutableArray *pathsToScan = [NSMutableArray array];
     for (NSArray *list in @[self.igContainersList ?: @[], self.redditContainersList ?: @[]]) {
         for (NSDictionary *prof in list) {
@@ -1160,15 +1214,22 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         unsigned long long residualBytes = 0;
         NSUInteger residualFiles = 0;
+        NSArray<NSString *> *trackedSubs = residualSubdirectoriesToTrack();
 
         for (NSString *cPath in pathsToScan) {
-            for (NSString *sub in @[@"tmp", @"Library/Caches", @"Library/WebKit/WebsiteData", @"Library/Saved Application State"]) {
+            for (NSString *sub in trackedSubs) {
                 accumulateDirectoryCacheUsage([cPath stringByAppendingPathComponent:sub], &residualBytes, &residualFiles);
             }
         }
 
         double mb = (double)residualBytes / (1024.0 * 1024.0);
-        NSString *summary = [NSString stringWithFormat:@"%lu archivos (%.2f MB) • Auto-limpieza activa al cerrar app", (unsigned long)residualFiles, mb];
+        double pbKB = (double)pbBytes / 1024.0;
+        NSString *pbText = (pbItems > 0)
+            ? [NSString stringWithFormat:@"Portapapeles: %lu ítem(s) (%.1f KB)", (unsigned long)pbItems, pbKB]
+            : @"Portapapeles: Vacío (0 KB)";
+
+        NSString *summary = [NSString stringWithFormat:@"Caché en %lu contenedor(es): %lu archivos (%.2f MB)\n%@",
+                             (unsigned long)pathsToScan.count, (unsigned long)residualFiles, mb, pbText];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -1190,28 +1251,36 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     NSUInteger removedCount = 0;
     NSMutableSet *cleanedPaths = [NSMutableSet set];
 
+    NSUInteger pbItemsBefore = 0;
+    unsigned long long pbBytesBefore = 0;
+    inspectPasteboardUsage(&pbItemsBefore, &pbBytesBefore);
+
     [UIPasteboard generalPasteboard].items = @[];
+    [UIPasteboard generalPasteboard].string = @"";
     [[NSURLCache sharedURLCache] removeAllCachedResponses];
 
+    NSArray<NSString *> *trackedSubs = residualSubdirectoriesToTrack();
     for (NSArray *list in @[self.igContainersList, self.redditContainersList]) {
         for (NSDictionary *prof in list) {
             NSString *cPath = prof[@"path"];
             if (![cPath isKindOfClass:[NSString class]] || cPath.length == 0 || [cleanedPaths containsObject:cPath]) continue;
             [cleanedPaths addObject:cPath];
 
-            for (NSString *sub in @[@"tmp", @"Library/Caches", @"Library/WebKit/WebsiteData", @"Library/Saved Application State"]) {
+            for (NSString *sub in trackedSubs) {
                 purgeDirectoryCacheContents([cPath stringByAppendingPathComponent:sub], &freedBytes, &removedCount);
             }
         }
     }
 
     double freedMB = (double)freedBytes / (1024.0 * 1024.0);
+    double pbFreedKB = (double)pbBytesBefore / 1024.0;
     [self calculateResidualTraces];
     [self.tableView reloadData];
 
     if (showPopup) {
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Caché y Rastro Eliminados"
-                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados.\n• %lu archivos eliminados (%.2f MB liberados).\n• Portapapeles vaciado.", (unsigned long)removedCount, freedMB]
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Caché y Portapapeles Eliminados"
+                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados.\n• %lu archivos residuales eliminados (%.2f MB liberados).\n• Portapapeles purgado: %lu ítem(s) (%.1f KB).",
+                                                                             (unsigned long)removedCount, freedMB, (unsigned long)pbItemsBefore, pbFreedKB]
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"Listo" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:ac animated:YES completion:nil];
@@ -1226,7 +1295,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     if (section == 0) return @"CONTROL PRINCIPAL (100% MANUAL)";
     if (section == 1) return @"CONTENEDORES POR APLICACIÓN (CRANE)";
     if (section == 2) return @"ESTADO DE RED Y MODO INVISIBLE";
-    return @"LIMPIEZA GLOBAL Y AUTO-PURGA";
+    return @"LIMPIEZA DE CACHÉ Y PORTAPAPELES";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -1348,7 +1417,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     cell.detailTextLabel.numberOfLines = 0;
     cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     cell.textLabel.textColor = [UIColor systemRedColor];
-    cell.textLabel.text = @"Cerrar Apps y Limpiar Rastro Residual Ahora";
+    cell.textLabel.text = @"Cerrar Apps y Purgar Caché + Portapapeles";
     cell.detailTextLabel.text = self.residualSummary;
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     return cell;
@@ -1409,7 +1478,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     if (indexPath.section == 2 && indexPath.row == 1) {
         triggerHaptic();
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Modo Invisible y Auto-Limpieza"
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Modo Invisible y Gestión de Rastro"
                                                                     message:self.stealthDetailReport
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDefault handler:nil]];
@@ -1649,7 +1718,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
 - (void)saveCurrentProfile {
     if (self.parentRoot && self.profile && self.containerUUID) {
-        [self.parentRoot saveProfile:self.profile forUUID:self.containerUUID];
+        [self.parentRoot saveProfile:self.profile forUUID:self.containerUUID saveNow:YES];
         [self.parentRoot auditStealthEngineStatus];
         killAppProcess([self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
     }
@@ -1698,7 +1767,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"shield.lefthalf.filled", contOn ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Activar Escudo en este Contenedor";
-            cell.detailTextLabel.text = contOn ? @"Activo • Cápsula verde en barra y Auto-Limpieza al cerrar" : @"En pausa manual (Cápsula gris en barra superior)";
+            cell.detailTextLabel.text = contOn ? @"Activo • Cápsula verde en barra y aislamiento completo" : @"En pausa manual (Cápsula gris en barra superior)";
             cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = contOn;
@@ -1887,7 +1956,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:sender.isOn ? @"🟢 Contenedor Protegido" : @"⚪ Contenedor en Pausa"
                                                                     message:sender.isOn
-                                                                        ? [NSString stringWithFormat:@"Escudo activado para \"%@\".\n• IDFV (Crane): %@\n• BootUUID Fijo: %@\n• Auto-limpieza al cerrar app: Activa", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
+                                                                        ? [NSString stringWithFormat:@"Escudo activado para \"%@\".\n• IDFV (Crane): %@\n• BootUUID Fijo: %@", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
                                                                         : @"Este contenedor está en pausa manual y no modificará nada hasta que lo vuelvas a encender."
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
