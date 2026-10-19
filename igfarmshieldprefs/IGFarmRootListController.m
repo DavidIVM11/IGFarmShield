@@ -26,6 +26,8 @@ static NSArray<NSString *> *residualSubdirectoriesToTrack(void) {
         @"Library/Caches",
         @"Library/WebKit",
         @"Library/Saved Application State",
+        @"Library/SplashBoard/Snapshots",
+        @"Library/Logs",
         @"SystemData/com.apple.SafariViewService"
     ];
 }
@@ -144,6 +146,7 @@ static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
                 NSString *kLow = [kStr lowercaseString];
                 BOOL isMetaKey = ([kLow containsString:@"active"] ||
                                   [kLow containsString:@"selected"] ||
+                                  [kLow containsString:@"default"] ||
                                   [kLow containsString:@"bundle"] ||
                                   [kLow containsString:@"version"] ||
                                   [kLow containsString:@"identifier"] ||
@@ -233,7 +236,6 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
     return nil;
 }
 
-// Conteo exacto a nivel de sistema de archivos (lstat) para detectar bases SQLite/WAL, snapshots y cachés de WebKit
 static void accumulateDirectoryCacheUsage(NSString *dirPath, unsigned long long *outBytes, NSUInteger *outFiles) {
     if (!dirPath || dirPath.length == 0) return;
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -268,7 +270,38 @@ static void purgeDirectoryCacheContents(NSString *dirPath, unsigned long long *f
     }
 }
 
-// Calcula cuántos elementos y bytes hay actualmente en la memoria del Portapapeles (UIPasteboard)
+// Recolecta todas las rutas reales en disco de los contenedores de Instagram y Reddit
+static NSArray<NSString *> *collectAllPhysicalContainerPaths(NSArray *igList, NSArray *rdList) {
+    NSMutableSet<NSString *> *uniquePaths = [NSMutableSet set];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    for (NSArray *list in @[igList ?: @[], rdList ?: @[]]) {
+        for (NSDictionary *prof in list) {
+            NSString *cPath = prof[@"path"];
+            if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [fm fileExistsAtPath:cPath]) {
+                [uniquePaths addObject:cPath];
+            }
+        }
+    }
+
+    NSString *appsDir = @"/var/mobile/Containers/Data/Application";
+    NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
+    for (NSString *folderUUID in uuids) {
+        NSString *fullPath = [appsDir stringByAppendingPathComponent:folderUUID];
+        NSString *metaPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
+        if (![meta isKindOfClass:[NSDictionary class]]) continue;
+        NSString *mcmID = meta[@"MCMMetadataIdentifier"] ?: @"";
+        if ([mcmID caseInsensitiveCompare:@"com.burbn.instagram"] == NSOrderedSame ||
+            [mcmID caseInsensitiveCompare:@"com.reddit.Reddit"] == NSOrderedSame) {
+            [uniquePaths addObject:fullPath];
+        }
+    }
+
+    return [uniquePaths allObjects];
+}
+
+// Mide textos, enlaces, imágenes (UIImage) y datos binarios reales en el Portapapeles
 static void inspectPasteboardUsage(NSUInteger *outItemCount, unsigned long long *outBytes) {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
     NSArray *items = pb.items;
@@ -285,12 +318,27 @@ static void inspectPasteboardUsage(NSUInteger *outItemCount, unsigned long long 
                 bytes += [(NSString *)val lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
             } else if ([val isKindOfClass:[NSURL class]]) {
                 bytes += [[(NSURL *)val absoluteString] lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+            } else if ([val isKindOfClass:[UIImage class]]) {
+                UIImage *img = (UIImage *)val;
+                if (img.CGImage) {
+                    bytes += (unsigned long long)(CGImageGetHeight(img.CGImage) * CGImageGetBytesPerRow(img.CGImage));
+                } else {
+                    NSData *imgData = UIImagePNGRepresentation(img);
+                    bytes += imgData.length;
+                }
             }
         }
     }
-    if (count == 0 && pb.string.length > 0) {
-        count = 1;
-        bytes = [pb.string lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+
+    if (bytes == 0 && (pb.hasStrings || pb.hasURLs || pb.hasImages)) {
+        if (pb.string.length > 0) {
+            if (count == 0) count = 1;
+            bytes += [pb.string lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+        }
+        if (pb.image && pb.image.CGImage) {
+            if (count == 0) count = 1;
+            bytes += (unsigned long long)(CGImageGetHeight(pb.image.CGImage) * CGImageGetBytesPerRow(pb.image.CGImage));
+        }
     }
 
     if (outItemCount) *outItemCount = count;
@@ -519,9 +567,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [self saveState];
 
     self.residualSummary = @"Calculando caché acumulada y portapapeles...";
-    [self scanAndSyncAllContainers];
-    [self auditStealthEngineStatus];
-    [self calculateResidualTraces];
 
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
@@ -663,9 +708,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     self.stealthDetailReport =
         @"¿Cómo funciona la Gestión de 30+ Contenedores y Rastro?\n"
-        @"1. Acumulación Orgánica y Limpieza Manual: La caché de cada contenedor se acumula de forma natural mientras usas la cuenta (sin auto-borrarse al minimizar para no gastar datos del proxy) y puedes auditarla y purgarla junto con el Portapapeles desde el botón inferior.\n\n"
+        @"1. Escaneo Físico Completo: Audita y limpia las carpetas reales en disco (tmp, Caches, WebKit, Snapshots, Logs) de todos los contenedores de Instagram y Reddit más el Portapapeles (incluyendo imágenes).\n\n"
         @"2. Cápsula Fija Superior (UIWindowScene): Muestra arriba una cápsula verde (🛡️ Nombre) cuando el contenedor está protegido.\n\n"
-        @"3. Ocultación de Túnel (__SCOPED__ + getifaddrs): Camufla utun como lo0 ante la app y aísla la IP LAN en0 sin afectar a Shadowrocket.";
+        @"3. Ocultación de Túnel (__SCOPED__ + getifaddrs): Camufla utun como lo0 ante la app y aísla la IP LAN en0 sin interferir con Shadowrocket.";
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -816,22 +861,30 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         : [NSMutableDictionary dictionary];
 
     NSMutableDictionary *profile = nil;
+    NSString *preservedPath = (path && path.length > 0) ? path : nil;
+
     if ([byUUID[uuid] isKindOfClass:[NSDictionary class]] && byUUID[uuid][@"bootSessionUUID"]) {
         profile = [byUUID[uuid] mutableCopy];
+        if (!preservedPath && [profile[@"path"] isKindOfClass:[NSString class]] && [profile[@"path"] length] > 0) {
+            preservedPath = profile[@"path"];
+        }
     }
     if (!profile) {
         for (NSString *existingKey in [byUUID allKeys]) {
             NSDictionary *cand = byUUID[existingKey];
             if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID] || !cand[@"bootSessionUUID"]) continue;
             NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
+            NSString *candIDFV = cand[@"idfv"] ?: @"";
             NSString *candName = cand[@"containerName"] ?: @"";
             NSString *candPath = cand[@"path"] ?: @"";
             if ([existingKey caseInsensitiveCompare:uuid] == NSOrderedSame ||
-                [existingKey caseInsensitiveCompare:craneID] == NSOrderedSame ||
+                (![craneID isEqualToString:@"Default"] && ([existingKey caseInsensitiveCompare:craneID] == NSOrderedSame ||
+                                                          [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame ||
+                                                          [candIDFV caseInsensitiveCompare:craneID] == NSOrderedSame)) ||
                 (path.length > 0 && [candPath isEqualToString:path]) ||
-                (candCraneID.length > 0 && [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame) ||
-                (dName.length > 0 && [candName caseInsensitiveCompare:dName] == NSOrderedSame)) {
+                (dName.length > 0 && ![dName isEqualToString:@"Default"] && [candName caseInsensitiveCompare:dName] == NSOrderedSame)) {
                 profile = [cand mutableCopy];
+                if (!preservedPath && candPath.length > 0) preservedPath = candPath;
                 if (![existingKey isEqualToString:uuid]) {
                     [byUUID removeObjectForKey:existingKey];
                     self.state[@"containersByUUID"] = byUUID;
@@ -840,8 +893,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             }
         }
     }
-    if (!profile && path.length > 0) {
-        NSDictionary *disk = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Library/.igshield_container.plist"]];
+    if (!profile && preservedPath.length > 0) {
+        NSDictionary *disk = [NSDictionary dictionaryWithContentsOfFile:[preservedPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"]];
         if ([disk isKindOfClass:[NSDictionary class]] && disk[@"bootSessionUUID"]) {
             profile = [disk mutableCopy];
         }
@@ -877,7 +930,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             @"craneIdentifier": craneID,
             @"containerName": cleanCraneName,
             @"bundleID": bundleID,
-            @"path": path ?: @"",
+            @"path": preservedPath ?: @"",
             @"enabled": @(wasEnabled),
             @"spoofIDs": profile[@"spoofIDs"] ?: @YES,
             @"spoofNetwork": profile[@"spoofNetwork"] ?: @YES,
@@ -918,7 +971,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         profile[@"craneIdentifier"] = craneID;
         profile[@"containerName"] = cleanCraneName;
         profile[@"bundleID"] = bundleID;
-        if (path.length > 0) profile[@"path"] = path;
+        if (preservedPath.length > 0) profile[@"path"] = preservedPath;
     }
 
     [self saveProfile:profile forUUID:uuid saveNow:(saveNow || isNewProfile)];
@@ -928,7 +981,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)scanAndSyncAllContainers {
     self.igContainersList = [NSMutableArray array];
     self.redditContainersList = [NSMutableArray array];
-    NSMutableSet *seenKeys = [NSMutableSet set];
+    NSMutableSet *seenIGKeys = [NSMutableSet set];
+    NSMutableSet *seenRDKeys = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL exclusive = [self.state[@"exclusiveMode"] boolValue];
 
@@ -1012,6 +1066,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *bundleID = isIG ? @"com.burbn.instagram" : @"com.reddit.Reddit";
         NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
         NSMutableArray *targetList = isIG ? self.igContainersList : self.redditContainersList;
+        NSMutableSet *seenKeys = isIG ? seenIGKeys : seenRDKeys;
 
         NSString *craneID = nil;
         NSString *detectedName = nil;
@@ -1037,18 +1092,33 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             }
         }
 
-        BOOL folderHasCraneMeta = (craneID != nil || detectedName != nil || ([userInfo isKindOfClass:[NSDictionary class]] && [userInfo count] > 0));
-        BOOL appUsesCrane = isIG ? (igHasCraneConfigured || folderHasCraneMeta) : (rdHasCraneConfigured || folderHasCraneMeta);
+        // Recuperar craneIdentifier, idfv y nombre guardados por Tweak.x (ignorando "Default" genéricos)
+        NSDictionary *localSaved = [NSDictionary dictionaryWithContentsOfFile:[fullPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"]];
+        NSString *savedIDFV = nil;
+        if ([localSaved isKindOfClass:[NSDictionary class]]) {
+            NSString *savedCID = localSaved[@"craneIdentifier"];
+            if (!craneID && [savedCID isKindOfClass:[NSString class]] && savedCID.length > 0 && [savedCID caseInsensitiveCompare:@"Default"] != NSOrderedSame) {
+                craneID = savedCID;
+            }
+            NSString *savedName = localSaved[@"containerName"];
+            if (!detectedName && [savedName isKindOfClass:[NSString class]] && savedName.length > 0 && [savedName caseInsensitiveCompare:@"Default"] != NSOrderedSame) {
+                detectedName = savedName;
+            }
+            if ([localSaved[@"idfv"] isKindOfClass:[NSString class]] && [localSaved[@"idfv"] length] >= 32) {
+                savedIDFV = localSaved[@"idfv"];
+            }
+        }
 
+        BOOL folderHasCraneMeta = (craneID != nil || detectedName != nil || savedIDFV != nil || ([userInfo isKindOfClass:[NSDictionary class]] && [userInfo count] > 0));
+        BOOL appUsesCrane = isIG ? (igHasCraneConfigured || folderHasCraneMeta) : (rdHasCraneConfigured || folderHasCraneMeta);
         if (!appUsesCrane) continue;
 
-        if (!craneID) craneID = @"Default";
-        if ([hiddenSet containsObject:[craneID lowercaseString]]) continue;
+        NSDictionary *cEntry = nil;
+        if (craneID.length > 0) cEntry = craneMap[[craneID lowercaseString]];
+        if (!cEntry && savedIDFV.length > 0) cEntry = craneMap[[savedIDFV lowercaseString]];
+        if (!cEntry) cEntry = craneMap[[folderUUID lowercaseString]];
+        if (!cEntry && detectedName.length > 0) cEntry = craneMap[[detectedName lowercaseString]];
 
-        NSDictionary *cEntry = craneMap[[craneID lowercaseString]] ?: craneMap[[folderUUID lowercaseString]];
-        if (!cEntry && detectedName.length > 0) {
-            cEntry = craneMap[[detectedName lowercaseString]];
-        }
         if ([cEntry isKindOfClass:[NSDictionary class]]) {
             if ([cEntry[@"name"] length] > 0) detectedName = cEntry[@"name"];
             if ([cEntry[@"id"] length] > 0) craneID = cEntry[@"id"];
@@ -1056,12 +1126,26 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         if (!detectedName) {
             for (NSDictionary *src in craneSources) {
-                detectedName = findCraneNameByID(src, craneID);
+                if (craneID.length > 0) detectedName = findCraneNameByID(src, craneID);
+                if (detectedName) break;
+                if (savedIDFV.length > 0) detectedName = findCraneNameByID(src, savedIDFV);
                 if (detectedName) break;
                 detectedName = findCraneNameByID(src, folderUUID);
                 if (detectedName) break;
             }
         }
+
+        if (!craneID || craneID.length == 0) {
+            if ((!userInfo || [userInfo count] == 0) && ![seenKeys containsObject:@"default"]) {
+                craneID = @"Default";
+            } else if (savedIDFV.length > 0) {
+                craneID = savedIDFV;
+            } else {
+                craneID = folderUUID;
+            }
+        }
+
+        if ([hiddenSet containsObject:[craneID lowercaseString]]) continue;
 
         if (!detectedName || detectedName.length == 0) {
             if ([craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
@@ -1072,7 +1156,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }
 
         if ([hiddenSet containsObject:[detectedName lowercaseString]]) continue;
-        if ([seenKeys containsObject:[craneID lowercaseString]] || [seenKeys containsObject:[detectedName lowercaseString]]) continue;
+        if ([seenKeys containsObject:[folderUUID lowercaseString]] ||
+            [seenKeys containsObject:[craneID lowercaseString]]) {
+            continue;
+        }
 
         NSMutableDictionary *prof = [self ensureProfileForBundle:bundleID
                                                             uuid:folderUUID
@@ -1083,7 +1170,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                                                          saveNow:NO];
         [seenKeys addObject:[folderUUID lowercaseString]];
         [seenKeys addObject:[craneID lowercaseString]];
-        [seenKeys addObject:[detectedName lowercaseString]];
+        if (detectedName.length > 0) [seenKeys addObject:[detectedName lowercaseString]];
         [targetList addObject:prof];
     }
 
@@ -1094,6 +1181,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
         NSMutableArray *targetList = isIG ? self.igContainersList : self.redditContainersList;
+        NSMutableSet *seenKeys = isIG ? seenIGKeys : seenRDKeys;
 
         for (NSString *cKey in craneMap) {
             NSDictionary *cEntry = craneMap[cKey];
@@ -1156,11 +1244,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         [self deduplicateActiveIfMultiple];
     }
 
-    // Una única escritura en disco al terminar el escaneo de hasta 30+ contenedores
     [self saveState];
 }
 
-// Escaneo asíncrono de los 30+ contenedores + memoria viva del Portapapeles (UIPasteboard)
 - (void)calculateResidualTraces {
     self.vpnActive = NO;
     self.vpnInterfaceName = @"Inactivo";
@@ -1200,15 +1286,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     unsigned long long pbBytes = 0;
     inspectPasteboardUsage(&pbItems, &pbBytes);
 
-    NSMutableArray *pathsToScan = [NSMutableArray array];
-    for (NSArray *list in @[self.igContainersList ?: @[], self.redditContainersList ?: @[]]) {
-        for (NSDictionary *prof in list) {
-            NSString *cPath = prof[@"path"];
-            if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && ![pathsToScan containsObject:cPath]) {
-                [pathsToScan addObject:cPath];
-            }
-        }
-    }
+    NSArray<NSString *> *pathsToScan = collectAllPhysicalContainerPaths(self.igContainersList, self.redditContainersList);
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -1228,7 +1306,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             ? [NSString stringWithFormat:@"Portapapeles: %lu ítem(s) (%.1f KB)", (unsigned long)pbItems, pbKB]
             : @"Portapapeles: Vacío (0 KB)";
 
-        NSString *summary = [NSString stringWithFormat:@"Caché en %lu contenedor(es): %lu archivos (%.2f MB)\n%@",
+        NSString *summary = [NSString stringWithFormat:@"Caché en %lu carpeta(s): %lu archivos (%.2f MB)\n%@",
                              (unsigned long)pathsToScan.count, (unsigned long)residualFiles, mb, pbText];
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1249,7 +1327,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     unsigned long long freedBytes = 0;
     NSUInteger removedCount = 0;
-    NSMutableSet *cleanedPaths = [NSMutableSet set];
 
     NSUInteger pbItemsBefore = 0;
     unsigned long long pbBytesBefore = 0;
@@ -1259,16 +1336,12 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [UIPasteboard generalPasteboard].string = @"";
     [[NSURLCache sharedURLCache] removeAllCachedResponses];
 
+    NSArray<NSString *> *pathsToClean = collectAllPhysicalContainerPaths(self.igContainersList, self.redditContainersList);
     NSArray<NSString *> *trackedSubs = residualSubdirectoriesToTrack();
-    for (NSArray *list in @[self.igContainersList, self.redditContainersList]) {
-        for (NSDictionary *prof in list) {
-            NSString *cPath = prof[@"path"];
-            if (![cPath isKindOfClass:[NSString class]] || cPath.length == 0 || [cleanedPaths containsObject:cPath]) continue;
-            [cleanedPaths addObject:cPath];
 
-            for (NSString *sub in trackedSubs) {
-                purgeDirectoryCacheContents([cPath stringByAppendingPathComponent:sub], &freedBytes, &removedCount);
-            }
+    for (NSString *cPath in pathsToClean) {
+        for (NSString *sub in trackedSubs) {
+            purgeDirectoryCacheContents([cPath stringByAppendingPathComponent:sub], &freedBytes, &removedCount);
         }
     }
 
@@ -1279,8 +1352,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     if (showPopup) {
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Caché y Portapapeles Eliminados"
-                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados.\n• %lu archivos residuales eliminados (%.2f MB liberados).\n• Portapapeles purgado: %lu ítem(s) (%.1f KB).",
-                                                                             (unsigned long)removedCount, freedMB, (unsigned long)pbItemsBefore, pbFreedKB]
+                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados (%lu carpeta(s) limpiadas).\n• %lu archivos residuales eliminados (%.2f MB liberados).\n• Portapapeles purgado: %lu ítem(s) (%.1f KB).",
+                                                                             (unsigned long)pathsToClean.count, (unsigned long)removedCount, freedMB, (unsigned long)pbItemsBefore, pbFreedKB]
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"Listo" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:ac animated:YES completion:nil];
@@ -1817,7 +1890,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSArray *subtitles = @[
             @"Mantiene el IDFV aislado de Crane y fija un BootSessionUUID constante",
             @"Aísla la IP LAN en en0, oculta utun (__SCOPED__/getifaddrs) y desactiva QUIC",
-            @"Ajusta la zona horaria e idioma (NSLocale) al país de tu proxy",
+            @"Ajusta la zona horaria (C + ObjC) e idioma (NSLocale) al país de tu proxy",
             @"Simula batería, volumen, brillo y espacio libre sin alterar el BootUUID",
             @"Oculta /var/jb, Crane y este tweak en C, Swift y Objective-C"
         ];
