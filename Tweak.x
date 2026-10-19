@@ -27,7 +27,7 @@
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
-#define CURRENT_SCHEMA_VERSION 31
+#define CURRENT_SCHEMA_VERSION 32
 
 @interface NSMutableURLRequest (HTTP3Disable)
 - (void)setAssumesHTTP3Capable:(BOOL)capable;
@@ -51,10 +51,9 @@ static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
 static NSTimeInterval sessionStartTimestamp = 0;
 static BOOL bannerShownThisSession = NO;
-static BOOL lifecycleObserversRegistered = NO;
 static IGFarmPassthroughWindow *persistentBadgeWindow = nil;
 
-// Banderas en memoria RAM para ejecución instantánea
+// Banderas en memoria RAM para ejecución instantánea (O(1)) con 30+ contenedores
 static BOOL s_profileInitialized = NO;
 static BOOL s_shieldActive = NO;
 static BOOL s_spoofIDs = NO;
@@ -122,71 +121,6 @@ static BOOL isCallerFromCraneOrSelf(const void *retAddr) {
         }
     }
     return NO;
-}
-
-// ============================================================================
-// AUTO-LIMPIEZA DE RASTRO RESIDUAL Y CACHÉ DEL CONTENEDOR (SIN CERRAR SESIÓN)
-// ============================================================================
-static void purgeContainerResidualDirs(BOOL includeHeavyCaches) {
-    s_inInternalCall = YES;
-    NSString *homePath = NSHomeDirectory();
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    [[NSURLCache sharedURLCache] removeAllCachedResponses];
-
-    NSArray *targetSubdirs = includeHeavyCaches
-        ? @[@"tmp", @"Library/Caches", @"Library/WebKit/WebsiteData", @"Library/Saved Application State"]
-        : @[@"tmp", @"Library/Saved Application State"];
-
-    for (NSString *sub in targetSubdirs) {
-        NSString *dirPath = [homePath stringByAppendingPathComponent:sub];
-        BOOL isDir = NO;
-        if ([fm fileExistsAtPath:dirPath isDirectory:&isDir] && isDir) {
-            NSArray *items = [fm contentsOfDirectoryAtPath:dirPath error:nil];
-            for (NSString *item in items) {
-                NSString *fullPath = [dirPath stringByAppendingPathComponent:item];
-                [fm removeItemAtPath:fullPath error:nil];
-            }
-        }
-    }
-    s_inInternalCall = NO;
-}
-
-static void registerAutoCleanLifecycleObservers() {
-    if (lifecycleObserversRegistered) return;
-    lifecycleObserversRegistered = YES;
-
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-
-    // Cuando el usuario sale de la app o la desliza para cerrarla de segundo plano, limpia toda la caché residual
-    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
-                    object:nil
-                     queue:nil
-                usingBlock:^(NSNotification * _Nonnull note) {
-        if (!s_shieldActive) return;
-        UIApplication *app = [UIApplication sharedApplication];
-        __block UIBackgroundTaskIdentifier bgTask = [app beginBackgroundTaskWithExpirationHandler:^{
-            if (bgTask != UIBackgroundTaskInvalid) {
-                [app endBackgroundTask:bgTask];
-                bgTask = UIBackgroundTaskInvalid;
-            }
-        }];
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            purgeContainerResidualDirs(YES);
-            if (bgTask != UIBackgroundTaskInvalid) {
-                [app endBackgroundTask:bgTask];
-                bgTask = UIBackgroundTaskInvalid;
-            }
-        });
-    }];
-
-    [nc addObserverForName:UIApplicationWillTerminateNotification
-                    object:nil
-                     queue:nil
-                usingBlock:^(NSNotification * _Nonnull note) {
-        if (!s_shieldActive) return;
-        purgeContainerResidualDirs(YES);
-    }];
 }
 
 static void searchNestedMetadata(id node, NSString **outID, NSString **outName, NSString *bundleID) {
@@ -335,6 +269,7 @@ static void ensureProfileLoaded() {
     NSDictionary *settingsEntry = nil;
     NSString *matchedSettingsKey = nil;
 
+    // 1. Emparejamiento exacto por ruta, UUID de carpeta, Crane ID o Nombre de contenedor
     for (NSString *existingKey in byUUID) {
         NSDictionary *cand = byUUID[existingKey];
         if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
@@ -352,20 +287,17 @@ static void ensureProfileLoaded() {
         }
     }
 
-    if (!settingsEntry) {
+    // 2. Fallback seguro exclusivamente para el contenedor marcado como activo en Crane (sin mezclar los 30 contenedores)
+    if (!settingsEntry && craneActiveIDForApp.length > 0) {
         for (NSString *existingKey in byUUID) {
             NSDictionary *cand = byUUID[existingKey];
             if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
-            NSString *candPath = cand[@"path"] ?: @"";
             NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
             NSString *candName = cand[@"containerName"] ?: @"";
 
-            BOOL matchesActiveInCrane = (craneActiveIDForApp &&
-                ([existingKey caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame ||
-                 [candCraneID caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame ||
-                 [candName caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame));
-
-            if (matchesActiveInCrane || ([cand[@"enabled"] boolValue] && candPath.length == 0)) {
+            if ([existingKey caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame ||
+                [candCraneID caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame ||
+                [candName caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame) {
                 settingsEntry = cand;
                 matchedSettingsKey = existingKey;
                 break;
@@ -457,11 +389,13 @@ static void ensureProfileLoaded() {
 
     if (matchedSettingsKey && byUUID[matchedSettingsKey]) {
         NSMutableDictionary *updatedEntry = [byUUID[matchedSettingsKey] mutableCopy];
-        updatedEntry[@"path"] = homePath;
-        updatedEntry[@"idfv"] = nativeCraneUUID;
-        byUUID[matchedSettingsKey] = updatedEntry;
-        globalSt[@"containersByUUID"] = byUUID;
-        [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
+        if (![updatedEntry[@"path"] isEqualToString:homePath] || ![updatedEntry[@"idfv"] isEqualToString:nativeCraneUUID]) {
+            updatedEntry[@"path"] = homePath;
+            updatedEntry[@"idfv"] = nativeCraneUUID;
+            byUUID[matchedSettingsKey] = updatedEntry;
+            globalSt[@"containersByUUID"] = byUUID;
+            [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
+        }
     }
 
     liveContainerProfile = profile;
@@ -534,14 +468,6 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     }
 
     bannerShownThisSession = YES;
-    registerAutoCleanLifecycleObservers();
-
-    // Limpiar restos temporales al arrancar y programar limpieza completa al cerrar la app
-    if (s_shieldActive) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-            purgeContainerResidualDirs(NO);
-        });
-    }
 
     NSDictionary *prof = liveContainerProfile;
     NSString *cName = prof[@"containerName"] ?: @"Default";
