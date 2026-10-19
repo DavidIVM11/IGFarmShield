@@ -34,11 +34,11 @@
 - (BOOL)assumesHTTP3Capable;
 @end
 
-// Ventana transparente compatible con UIWindowScene de iOS 16 que deja pasar todos los toques
-@interface IGFarmPassthroughWindow : UIWindow
+// Nombre de clase mimetizado con UIKit y filtrado de UIApplication.windows / UIWindowScene.windows
+@interface _UIStatusBarLocalOverlayWindow : UIWindow
 @end
 
-@implementation IGFarmPassthroughWindow
+@implementation _UIStatusBarLocalOverlayWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     return nil;
 }
@@ -51,7 +51,7 @@ static NSString *origCraneIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
 static NSTimeInterval sessionStartTimestamp = 0;
 static BOOL bannerShownThisSession = NO;
-static IGFarmPassthroughWindow *persistentBadgeWindow = nil;
+static _UIStatusBarLocalOverlayWindow *persistentBadgeWindow = nil;
 
 // Banderas en memoria RAM para ejecución instantánea (O(1)) con 30+ contenedores
 static BOOL s_profileInitialized = NO;
@@ -63,6 +63,8 @@ static BOOL s_spoofHardware = NO;
 static BOOL s_spoofSecurity = NO;
 static BOOL s_isCellularMode = YES;
 static in_addr_t s_spoofedLanAddr = 0;
+static char s_containerHomePath[PATH_MAX] = {0};
+static size_t s_containerHomeLen = 0;
 static __thread BOOL s_inInternalCall = NO;
 
 static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
@@ -70,6 +72,7 @@ static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_statfs)(const char *, struct statfs *) = NULL;
 static FILE *(*orig_fopen)(const char *, const char *) = NULL;
+static char *(*orig_getenv)(const char *) = NULL;
 static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
 static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
@@ -95,8 +98,8 @@ static void applyLowLevelCTimeZone(NSString *tzName) {
     tzset();
 }
 
-// Detecta llamadas del ejecutable de la App y de sus librerías Swift (vital para Reddit),
-// dejando libres a CFNetwork, libnetwork y Crane para no interferir con Shadowrocket
+// Detecta llamadas del binario de la App y de su runtime de Swift,
+// excluyendo explícitamente a Crane, CFNetwork, libnetwork y libswiftNetwork
 static BOOL isCallerFromTargetApp(const void *retAddr) {
     if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
     Dl_info info;
@@ -105,25 +108,12 @@ static BOOL isCallerFromTargetApp(const void *retAddr) {
             strstr(info.dli_fname, "Crane") != NULL ||
             strstr(info.dli_fname, "crane") != NULL ||
             strstr(info.dli_fname, "CFNetwork") != NULL ||
-            strstr(info.dli_fname, "libnetwork") != NULL) {
+            strstr(info.dli_fname, "libnetwork") != NULL ||
+            strstr(info.dli_fname, "libswiftNetwork") != NULL) {
             return NO;
         }
         if (strstr(info.dli_fname, "/Containers/Bundle/Application/") != NULL ||
             strstr(info.dli_fname, "libswift") != NULL) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-static BOOL isCallerFromCraneOrSelf(const void *retAddr) {
-    if (s_inInternalCall) return YES;
-    if (!retAddr || !orig_dladdr) return NO;
-    Dl_info info;
-    if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
-        if (strstr(info.dli_fname, "Crane") != NULL ||
-            strstr(info.dli_fname, "crane") != NULL ||
-            strstr(info.dli_fname, "IGFarmShield") != NULL) {
             return YES;
         }
     }
@@ -200,9 +190,9 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bund
     NSString *craneID = nil;
     NSString *craneName = nil;
 
-    const char *envName = getenv("CRANE_CONTAINER_NAME");
-    const char *envID = getenv("CRANE_CONTAINER_ID");
-    const char *envIdent = getenv("CRANE_IDENTIFIER");
+    const char *envName = orig_getenv ? orig_getenv("CRANE_CONTAINER_NAME") : getenv("CRANE_CONTAINER_NAME");
+    const char *envID = orig_getenv ? orig_getenv("CRANE_CONTAINER_ID") : getenv("CRANE_CONTAINER_ID");
+    const char *envIdent = orig_getenv ? orig_getenv("CRANE_IDENTIFIER") : getenv("CRANE_IDENTIFIER");
 
     if (envName && strlen(envName) > 0) craneName = [NSString stringWithUTF8String:envName];
     if (envID && strlen(envID) > 0) craneID = [NSString stringWithUTF8String:envID];
@@ -264,6 +254,12 @@ static void ensureProfileLoaded() {
 
     sessionStartTimestamp = [[NSDate date] timeIntervalSince1970];
     NSString *homePath = NSHomeDirectory();
+    if (homePath.length > 0) {
+        strncpy(s_containerHomePath, [homePath UTF8String], sizeof(s_containerHomePath) - 1);
+        s_containerHomePath[sizeof(s_containerHomePath) - 1] = '\0';
+        s_containerHomeLen = strlen(s_containerHomePath);
+    }
+
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.burbn.instagram";
 
     NSDictionary *ident = resolveCraneIdentityDict(homePath, bundleID);
@@ -286,7 +282,6 @@ static void ensureProfileLoaded() {
     NSDictionary *settingsEntry = nil;
     NSString *matchedSettingsKey = nil;
 
-    // 1. Emparejamiento exacto entre los 30+ contenedores por ruta física, UUID de carpeta, IDFV de Crane o Nombre
     for (NSString *existingKey in byUUID) {
         NSDictionary *cand = byUUID[existingKey];
         if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
@@ -308,7 +303,6 @@ static void ensureProfileLoaded() {
         }
     }
 
-    // 2. Fallback seguro si el contenedor recién creado en Crane aún tenía path vacío y está marcado como activo
     if (!settingsEntry && craneActiveIDForApp.length > 0) {
         for (NSString *existingKey in byUUID) {
             NSDictionary *cand = byUUID[existingKey];
@@ -453,13 +447,14 @@ static void ensureProfileLoaded() {
 }
 
 // ============================================================================
-// CÁPSULA FIJA EN BARRA SUPERIOR (COMPATIBLE CON UIWINDOWSCENE DE iOS 16)
+// CÁPSULA FIJA EN BARRA SUPERIOR (OCULTA DE LOS ARREGLOS DE VENTANAS DE LA APP)
 // ============================================================================
 static void showStartupBannerAndPersistentIcon(int attempt) {
     if (bannerShownThisSession) return;
     ensureProfileLoaded();
     if (!liveContainerProfile) return;
 
+    s_inInternalCall = YES;
     UIWindowScene *activeScene = nil;
     UIWindow *targetWin = nil;
 
@@ -488,6 +483,7 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
             }
         }
     }
+    s_inInternalCall = NO;
 
     if (!targetWin) {
         if (attempt < 10) {
@@ -506,9 +502,9 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
 
     if (!persistentBadgeWindow) {
         if (activeScene) {
-            persistentBadgeWindow = [[IGFarmPassthroughWindow alloc] initWithWindowScene:activeScene];
+            persistentBadgeWindow = [[_UIStatusBarLocalOverlayWindow alloc] initWithWindowScene:activeScene];
         } else {
-            persistentBadgeWindow = [[IGFarmPassthroughWindow alloc] initWithFrame:screenBounds];
+            persistentBadgeWindow = [[_UIStatusBarLocalOverlayWindow alloc] initWithFrame:screenBounds];
         }
         persistentBadgeWindow.frame = CGRectMake(0, 0, screenBounds.size.width, 44);
         persistentBadgeWindow.backgroundColor = [UIColor clearColor];
@@ -574,31 +570,43 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
 }
 
 // ============================================================================
-// MODO INVISIBLE ESTABLE (OCULTA JAILBREAK, CRANE Y TWEAK)
+// MODO INVISIBLE ESTABLE (RESPETA LA CARPETA DE DATOS DEL CONTENEDOR Y CRANE)
 // ============================================================================
 static BOOL isHiddenPathForTargetAppC(const char *path) {
     if (!path) return NO;
 
+    // 1. Permitir siempre los Cryptexes nativos de iOS 16 (WebKit / OAuth)
     if (strstr(path, "Cryptex") != NULL || strstr(path, "cryptex") != NULL) {
         return NO;
     }
 
+    // 2. Si la ruta pertenece al propio directorio de datos del contenedor activo,
+    // permitir todo (incluyendo redirecciones de Crane) excepto el plist de IGFarmShield
+    if (s_containerHomeLen > 0 && strncmp(path, s_containerHomePath, s_containerHomeLen) == 0) {
+        if (strstr(path, ".igshield_container") != NULL || strstr(path, "igfarmshield") != NULL) {
+            return YES;
+        }
+        return NO;
+    }
+
+    // 3. Ocultar el propio tweak IGFarmShield y sus archivos globales
     if (strstr(path, "IGFarmShield") != NULL ||
         strstr(path, "igfarmshield") != NULL ||
         strstr(path, ".igshield_container") != NULL) {
         return YES;
     }
 
+    // 4. Ocultar los dylibs y plists globales de Crane fuera del contenedor
     if (strstr(path, "Crane.dylib") != NULL ||
         strstr(path, "libcrane") != NULL ||
         strstr(path, "CraneGUI") != NULL ||
         strstr(path, "com.opa334.crane") != NULL ||
         strstr(path, "/Application Support/Crane") != NULL ||
-        strstr(path, "/Library/Crane") != NULL ||
-        strstr(path, "___Crane_Containers") != NULL) {
+        strstr(path, "/Library/Crane") != NULL) {
         return YES;
     }
 
+    // 5. Ocultar rutas de Jailbreak rootless / rootful, gestores de paquetes y hooks
     if (strncmp(path, "/var/jb", 7) == 0 ||
         strncmp(path, "/private/var/jb", 15) == 0 ||
         strncmp(path, "/private/preboot", 16) == 0 ||
@@ -634,6 +642,19 @@ static FILE *custom_fopen(const char *path, const char *mode) {
         }
     }
     return orig_fopen(path, mode);
+}
+
+static char *custom_getenv(const char *name) {
+    if (s_spoofSecurity && name && isCallerFromTargetApp(__builtin_return_address(0))) {
+        if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
+            strcmp(name, "_MSSafeMode") == 0 ||
+            strcmp(name, "_SafeMode") == 0 ||
+            strcmp(name, "TZ") == 0 ||
+            strncmp(name, "CRANE_", 6) == 0) {
+            return NULL;
+        }
+    }
+    return orig_getenv(name);
 }
 
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
@@ -689,6 +710,7 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 }
 %end
 
+// Filtra la ventana de la cápsula superior para que la App nunca la vea en .windows
 %hook UIApplication
 - (BOOL)canOpenURL:(NSURL *)url {
     if (s_spoofSecurity && url && url.scheme) {
@@ -698,6 +720,25 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
         }
     }
     return %orig;
+}
+- (NSArray<UIWindow *> *)windows {
+    NSArray<UIWindow *> *orig = %orig;
+    if (!persistentBadgeWindow || s_inInternalCall || !orig) return orig;
+    if (![orig containsObject:persistentBadgeWindow]) return orig;
+    NSMutableArray<UIWindow *> *filtered = [orig mutableCopy];
+    [filtered removeObject:persistentBadgeWindow];
+    return filtered;
+}
+%end
+
+%hook UIWindowScene
+- (NSArray<UIWindow *> *)windows {
+    NSArray<UIWindow *> *orig = %orig;
+    if (!persistentBadgeWindow || s_inInternalCall || !orig) return orig;
+    if (![orig containsObject:persistentBadgeWindow]) return orig;
+    NSMutableArray<UIWindow *> *filtered = [orig mutableCopy];
+    [filtered removeObject:persistentBadgeWindow];
+    return filtered;
 }
 %end
 
@@ -854,34 +895,44 @@ static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRe
 }
 %end
 
-// Camufla utun/ppp/ipsec y aísla la IP privada de en0 solo ante la App y Swift (dejando libre a CFNetwork)
+// Desvincula limpiamente los nodos utun/ppp/ipsec sin duplicar lo0 y aísla la IP privada en en0
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || !s_spoofNetwork || s_spoofedLanAddr == 0) return res;
     if (!isCallerFromTargetApp(__builtin_return_address(0))) return res;
 
-    struct ifaddrs *curr = *ifap;
+    struct ifaddrs *head = *ifap;
+    struct ifaddrs *prev = NULL;
+    struct ifaddrs *curr = head;
+
     while (curr) {
+        BOOL isTunnelIf = NO;
         if (curr->ifa_name) {
             if (strncmp(curr->ifa_name, "utun", 4) == 0 ||
                 strncmp(curr->ifa_name, "ppp", 3) == 0 ||
                 strncmp(curr->ifa_name, "ipsec", 5) == 0 ||
                 strncmp(curr->ifa_name, "tun", 3) == 0 ||
                 strncmp(curr->ifa_name, "tap", 3) == 0) {
-                strcpy(curr->ifa_name, "lo0");
-                curr->ifa_flags &= ~IFF_POINTOPOINT;
-                if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
-                    struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
-                    addr->sin_addr.s_addr = inet_addr("127.0.0.1");
-                }
+                isTunnelIf = YES;
             } else if (strcmp(curr->ifa_name, "en0") == 0 &&
                        curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
                 struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
                 addr->sin_addr.s_addr = s_spoofedLanAddr;
             }
         }
+
+        if (isTunnelIf) {
+            if (prev) {
+                prev->ifa_next = curr->ifa_next;
+            } else {
+                head = curr->ifa_next;
+            }
+        } else {
+            prev = curr;
+        }
         curr = curr->ifa_next;
     }
+    *ifap = head;
     return res;
 }
 
@@ -951,7 +1002,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 %hook NSFileManager
 - (NSDictionary<NSFileAttributeKey, id> *)attributesOfFileSystemForPath:(NSString *)path error:(NSError * _Nullable *)error {
     NSDictionary *orig = %orig;
-    if (!s_spoofHardware || !orig || !liveContainerProfile) return orig;
+    if (!s_spoofHardware || !orig || !liveContainerProfile || !isCallerFromTargetApp(__builtin_return_address(0))) return orig;
     NSMutableDictionary *modified = [orig mutableCopy];
     if (liveContainerProfile[@"freeBytes"]) {
         unsigned long long baseFree = [liveContainerProfile[@"freeBytes"] unsignedLongLongValue];
@@ -961,40 +1012,36 @@ static int custom_statfs(const char *path, struct statfs *buf) {
     return modified;
 }
 - (BOOL)fileExistsAtPath:(NSString *)path {
-    if (!s_spoofSecurity || !path || isCallerFromCraneOrSelf(__builtin_return_address(0))) {
-        return %orig;
-    }
-    if (isHiddenPathForTargetAppC([path UTF8String])) {
-        return NO;
+    if (s_spoofSecurity && path && isCallerFromTargetApp(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC([path UTF8String])) {
+            return NO;
+        }
     }
     return %orig;
 }
 - (BOOL)fileExistsAtPath:(NSString *)path isDirectory:(BOOL *)isDirectory {
-    if (!s_spoofSecurity || !path || isCallerFromCraneOrSelf(__builtin_return_address(0))) {
-        return %orig;
-    }
-    if (isHiddenPathForTargetAppC([path UTF8String])) {
-        return NO;
+    if (s_spoofSecurity && path && isCallerFromTargetApp(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC([path UTF8String])) {
+            return NO;
+        }
     }
     return %orig;
 }
 - (NSArray<NSString *> *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError * _Nullable *)error {
-    if (!s_spoofSecurity || !path || isCallerFromCraneOrSelf(__builtin_return_address(0))) {
-        return %orig;
-    }
-    if (isHiddenPathForTargetAppC([path UTF8String])) {
-        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
-        return nil;
+    if (s_spoofSecurity && path && isCallerFromTargetApp(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC([path UTF8String])) {
+            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
+            return nil;
+        }
     }
     return %orig;
 }
 - (NSDictionary<NSFileAttributeKey, id> *)attributesOfItemAtPath:(NSString *)path error:(NSError * _Nullable *)error {
-    if (!s_spoofSecurity || !path || isCallerFromCraneOrSelf(__builtin_return_address(0))) {
-        return %orig;
-    }
-    if (isHiddenPathForTargetAppC([path UTF8String])) {
-        if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
-        return nil;
+    if (s_spoofSecurity && path && isCallerFromTargetApp(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC([path UTF8String])) {
+            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
+            return nil;
+        }
     }
     return %orig;
 }
@@ -1002,7 +1049,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 
 %hook NSURL
 - (BOOL)checkResourceIsReachableAndReturnError:(NSError * _Nullable *)error {
-    if (s_spoofSecurity && [self isFileURL] && !isCallerFromCraneOrSelf(__builtin_return_address(0))) {
+    if (s_spoofSecurity && [self isFileURL] && isCallerFromTargetApp(__builtin_return_address(0))) {
         NSString *p = [self path];
         if (p && isHiddenPathForTargetAppC([p UTF8String])) {
             if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
@@ -1016,7 +1063,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 %hook NSProcessInfo
 - (NSDictionary<NSString *, NSString *> *)environment {
     NSDictionary *orig = %orig;
-    if (!s_spoofSecurity || !orig || isCallerFromCraneOrSelf(__builtin_return_address(0))) {
+    if (!s_spoofSecurity || !orig || !isCallerFromTargetApp(__builtin_return_address(0))) {
         return orig;
     }
     NSMutableDictionary *cleanEnv = [orig mutableCopy];
@@ -1061,11 +1108,14 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 %end
 
 %ctor {
-    // 1. Cargar perfil desde Foundation sin invocar UIKit prematuramente en %ctor
+    // 1. Hookear dladdr y getenv primero para que ensureProfileLoaded resuelva limpio
+    MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
+    MSHookFunction((void *)getenv, (void *)custom_getenv, (void **)&orig_getenv);
+
+    // 2. Cargar perfil en memoria desde Foundation sin tocar UIKit en %ctor
     ensureProfileLoaded();
 
-    // 2. Activar hooks C seguros en ElleKit (sin access/stat/lstat que crashean los stubs cortos del kernel)
-    MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
+    // 3. Activar el resto de hooks C seguros en ElleKit
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
     MSHookFunction((void *)fopen, (void *)custom_fopen, (void **)&orig_fopen);
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
