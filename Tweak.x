@@ -344,7 +344,7 @@ static void ensureProfileLoaded() {
         uint64_t seed = randomSeed64(keyUUID);
         NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
         NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
-        NSArray *subnets = @[@"192.168.1", @"192.168.0", @"10.0.0", @"192.168.50", @"172.16.0", @"192.168.10"];
+        NSArray *subnets = @[@"192.168.1"];
 
         NSString *oui = ouis[seed % ouis.count];
         NSString *ssidPref = ssidPrefixes[(seed >> 3) % ssidPrefixes.count];
@@ -406,13 +406,24 @@ static void ensureProfileLoaded() {
         }
     }
 
+    // Saneamiento automático de subred local para evitar conflictos con 10.0.0.0/8 y 172.16.0.0/12 del TUN
+    NSString *lanIP = profile[@"localIP"] ?: @"192.168.1.45";
+    if (![lanIP hasPrefix:@"192.168.1."]) {
+        uint64_t fixSeed = randomSeed64(keyUUID);
+        lanIP = [NSString stringWithFormat:@"192.168.1.%d", 15 + (int)(fixSeed % 220)];
+        profile[@"localIP"] = lanIP;
+    }
+
     [profile writeToFile:localPlist atomically:YES];
 
     if (matchedSettingsKey && byUUID[matchedSettingsKey]) {
         NSMutableDictionary *updatedEntry = [byUUID[matchedSettingsKey] mutableCopy];
-        if (![updatedEntry[@"path"] isEqualToString:homePath] || ![updatedEntry[@"idfv"] isEqualToString:nativeCraneUUID]) {
+        if (![updatedEntry[@"path"] isEqualToString:homePath] ||
+            ![updatedEntry[@"idfv"] isEqualToString:nativeCraneUUID] ||
+            ![updatedEntry[@"localIP"] isEqualToString:lanIP]) {
             updatedEntry[@"path"] = homePath;
             updatedEntry[@"idfv"] = nativeCraneUUID;
+            updatedEntry[@"localIP"] = lanIP;
             byUUID[matchedSettingsKey] = updatedEntry;
             globalSt[@"containersByUUID"] = byUUID;
             [globalSt writeToFile:GLOBAL_STATE_PLIST atomically:YES];
@@ -436,7 +447,6 @@ static void ensureProfileLoaded() {
     s_spoofSecurity = s_shieldActive && (profile[@"spoofSecurity"] == nil ? YES : [profile[@"spoofSecurity"] boolValue]);
     s_isCellularMode = ![profile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
 
-    NSString *lanIP = profile[@"localIP"] ?: @"192.168.1.45";
     s_spoofedLanAddr = inet_addr([lanIP UTF8String]);
 
     if (s_spoofLocation && profile[@"timeZone"]) {
