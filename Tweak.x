@@ -635,36 +635,36 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
     }
 
     if (s_containerHomeLen > 0 && strncmp(path, s_containerHomePath, s_containerHomeLen) == 0) {
-        if (strstr(path, ".igshield_container") != NULL || containsIgnoreCaseC(path, "igfarmshield")) {
+        if (containsIgnoreCaseC(path, ".igshield_container") || containsIgnoreCaseC(path, "igfarmshield")) {
             return YES;
         }
         return NO;
     }
 
     if (containsIgnoreCaseC(path, "igfarmshield") ||
-        strstr(path, ".igshield_container") != NULL) {
+        containsIgnoreCaseC(path, ".igshield_container")) {
         return YES;
     }
 
-    if (strstr(path, "Crane.dylib") != NULL ||
-        strstr(path, "libcrane") != NULL ||
-        strstr(path, "CraneGUI") != NULL ||
-        strstr(path, "com.opa334.crane") != NULL ||
-        strstr(path, "/Application Support/Crane") != NULL ||
-        strstr(path, "/Library/Crane") != NULL) {
+    if (containsIgnoreCaseC(path, "crane.dylib") ||
+        containsIgnoreCaseC(path, "libcrane") ||
+        containsIgnoreCaseC(path, "cranegui") ||
+        containsIgnoreCaseC(path, "com.opa334.crane") ||
+        containsIgnoreCaseC(path, "/application support/crane") ||
+        containsIgnoreCaseC(path, "/library/crane")) {
         return YES;
     }
 
     if (strncmp(path, "/var/jb", 7) == 0 ||
         strncmp(path, "/private/var/jb", 15) == 0 ||
         strncmp(path, "/private/preboot", 16) == 0 ||
-        strncmp(path, "/Applications/Sileo.app", 23) == 0 ||
-        strncmp(path, "/Applications/Zebra.app", 23) == 0 ||
-        strncmp(path, "/Applications/Filza.app", 23) == 0 ||
-        strncmp(path, "/Applications/Cydia.app", 23) == 0 ||
+        containsIgnoreCaseC(path, "/applications/sileo.app") ||
+        containsIgnoreCaseC(path, "/applications/zebra.app") ||
+        containsIgnoreCaseC(path, "/applications/filza.app") ||
+        containsIgnoreCaseC(path, "/applications/cydia.app") ||
         containsIgnoreCaseC(path, "ellekit") ||
         containsIgnoreCaseC(path, "choicy") ||
-        strstr(path, "Shadow.dylib") != NULL ||
+        containsIgnoreCaseC(path, "shadow.dylib") ||
         containsIgnoreCaseC(path, "sileo") ||
         containsIgnoreCaseC(path, "filza") ||
         containsIgnoreCaseC(path, "palera1n") ||
@@ -673,7 +673,7 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
         containsIgnoreCaseC(path, "substrate") ||
         containsIgnoreCaseC(path, "substitute") ||
         containsIgnoreCaseC(path, "tweakinject") ||
-        strstr(path, "apt/sources.list") != NULL) {
+        containsIgnoreCaseC(path, "apt/sources.list")) {
         return YES;
     }
     return NO;
