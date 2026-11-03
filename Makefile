@@ -1,5 +1,4 @@
 TARGET := iphone:clang:latest:15.0
-ARCHS = arm64
 INSTALL_TARGET_PROCESSES = Instagram Reddit Preferences
 THEOS_PACKAGE_SCHEME = rootless
 
@@ -9,7 +8,7 @@ TWEAK_NAME = IGFarmShield
 
 IGFarmShield_FILES = Tweak.x
 IGFarmShield_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-error
-IGFarmShield_FRAMEWORKS = UIKit Foundation CFNetwork CoreGraphics QuartzCore CoreTelephony SystemConfiguration Security LocalAuthentication AVFoundation
+IGFarmShield_FRAMEWORKS = UIKit Foundation CoreFoundation CFNetwork CoreGraphics QuartzCore CoreTelephony SystemConfiguration Security LocalAuthentication AVFoundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
