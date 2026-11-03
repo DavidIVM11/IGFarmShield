@@ -3,11 +3,15 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <AVFoundation/AVFoundation.h>
+#import <sys/types.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
 #import <ifaddrs.h>
 #import <arpa/inet.h>
 #import <net/if.h>
 #import <sys/sysctl.h>
 #import <sys/stat.h>
+#import <string.h>
 #import <spawn.h>
 
 extern char **environ;
@@ -18,7 +22,7 @@ extern char **environ;
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 32
+#define CURRENT_SCHEMA_VERSION 33
 
 static NSArray<NSString *> *residualSubdirectoriesToTrack(void) {
     return @[
@@ -64,7 +68,7 @@ static UIImage *settingsBadgeIcon(NSString *symbolName, UIColor *bgColor) {
     return img;
 }
 
-static void triggerHaptic() {
+static void triggerHaptic(void) {
     UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [gen prepare];
     [gen impactOccurred];
@@ -88,6 +92,34 @@ static void killAppProcess(NSString *procName) {
     pid_t pid;
     const char *args[] = {"/var/jb/usr/bin/killall", "-9", [procName UTF8String], NULL};
     posix_spawn(&pid, args[0], NULL, NULL, (char *const *)args, environ);
+}
+
+static BOOL isTunnelInterfacePrefsName(NSString *ifName) {
+    if (!ifName) return NO;
+    NSString *low = [ifName lowercaseString];
+    return ([low hasPrefix:@"utun"] ||
+            [low hasPrefix:@"ppp"] ||
+            [low hasPrefix:@"ipsec"] ||
+            [low hasPrefix:@"tun"] ||
+            [low hasPrefix:@"tap"] ||
+            [low hasPrefix:@"wg"]);
+}
+
+static void writeContainerLocalPlistSafely(NSDictionary *prof) {
+    if (!prof) return;
+    NSString *cPath = prof[@"path"];
+    if (![cPath isKindOfClass:[NSString class]] || cPath.length == 0) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:cPath]) return;
+
+    NSString *libDir = [cPath stringByAppendingPathComponent:@"Library"];
+    if (![fm fileExistsAtPath:libDir]) {
+        [fm createDirectoryAtPath:libDir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    NSString *localPlist = [libDir stringByAppendingPathComponent:@".igshield_container.plist"];
+    [prof writeToFile:localPlist atomically:YES];
+    chmod([localPlist fileSystemRepresentation], 0644);
 }
 
 static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
@@ -455,6 +487,14 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             city = json[@"city"];
             region = json[@"region"];
             tz = json[@"timezone"];
+        } else if (json[@"ipAddress"] && json[@"countryCode"]) {
+            ip = json[@"ipAddress"];
+            isp = json[@"asnOrganization"] ?: @"ISP";
+            cc = json[@"countryCode"];
+            city = json[@"cityName"];
+            region = json[@"regionName"];
+            NSArray *tzArr = [json[@"timeZones"] isKindOfClass:[NSArray class]] ? json[@"timeZones"] : nil;
+            tz = (tzArr && tzArr.count > 0) ? tzArr.firstObject : @"America/New_York";
         } else if ([json[@"status"] isEqualToString:@"success"] && json[@"query"]) {
             ip = json[@"query"];
             isp = json[@"isp"] ?: @"ISP";
@@ -499,6 +539,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 @property (nonatomic, strong) NSString *stealthDetailReport;
 @property (nonatomic, strong) NSString *residualSummary;
 - (void)saveState;
+- (void)syncAllContainerLocalPlists;
 - (UIView *)buildHeaderBannerView;
 - (void)auditStealthEngineStatus;
 - (void)scanAndSyncAllContainers;
@@ -568,10 +609,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     if (![self.state[@"hiddenContainerIDs"] isKindOfClass:[NSArray class]]) {
         self.state[@"hiddenContainerIDs"] = @[];
     }
-    [self saveState];
 
     self.igContainersList = [NSMutableArray array];
     self.redditContainersList = [NSMutableArray array];
+    [self saveState];
+
     self.residualSummary = @"Calculando caché acumulada y portapapeles...";
 
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
@@ -625,10 +667,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     subLbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     subLbl.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
     subLbl.textColor = [UIColor secondaryLabelColor];
-    subLbl.text = @"Aislamiento multicuenta • Anti-Leaks TCP";
+    subLbl.text = @"Aislamiento multicuenta • Anti-QUIC TCP Puro";
     [card addSubview:subLbl];
 
-    UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 240, 18)];
+    UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 250, 18)];
     pill.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
     pill.textColor = (masterOn && self.stealthCurrentlyActive) ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
     pill.text = (masterOn && self.stealthCurrentlyActive)
@@ -643,6 +685,52 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)saveState {
     self.state[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
     [self.state writeToFile:STATE_PLIST atomically:YES];
+    chmod([STATE_PLIST fileSystemRepresentation], 0644);
+}
+
+// Sincroniza effectiveShieldActive en RAM, en STATE_PLIST y dentro de cada contenedor
+- (void)syncAllContainerLocalPlists {
+    BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
+    BOOL igOn = [self.state[@"enableIG"] boolValue];
+    BOOL rdOn = [self.state[@"enableReddit"] boolValue];
+
+    NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
+        ? [self.state[@"containersByUUID"] mutableCopy]
+        : [NSMutableDictionary dictionary];
+
+    NSArray *groups = @[
+        @[@(igOn), self.igContainersList ?: @[]],
+        @[@(rdOn), self.redditContainersList ?: @[]]
+    ];
+
+    for (NSArray *grp in groups) {
+        BOOL appOn = [grp[0] boolValue];
+        NSMutableArray *list = grp[1];
+        if (![list isKindOfClass:[NSMutableArray class]]) continue;
+        for (NSUInteger i = 0; i < list.count; i++) {
+            NSMutableDictionary *prof = [list[i] isKindOfClass:[NSMutableDictionary class]]
+                ? list[i]
+                : [list[i] mutableCopy];
+            if (!prof) continue;
+
+            NSString *u = prof[@"containerUUID"];
+            if (u.length > 0 && [byUUID[u] isKindOfClass:[NSDictionary class]]) {
+                prof = [byUUID[u] mutableCopy];
+            }
+
+            BOOL contOn = [prof[@"enabled"] boolValue];
+            prof[@"effectiveShieldActive"] = @(masterOn && appOn && contOn);
+            prof[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
+            list[i] = prof;
+            if (u.length > 0) {
+                byUUID[u] = prof;
+            }
+            writeContainerLocalPlistSafely(prof);
+        }
+    }
+
+    self.state[@"containersByUUID"] = byUUID;
+    [self saveState];
 }
 
 - (void)purgeGhostContainerFromTweak:(NSDictionary *)prof {
@@ -707,16 +795,16 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     self.stealthCurrentlyActive = (activeStealthCount > 0);
 
     if (self.stealthCurrentlyActive) {
-        self.stealthSummary = [NSString stringWithFormat:@"🟢 Activo en %lu contenedor(es) — Ocultamiento persistente de huellas", (unsigned long)activeStealthCount];
+        self.stealthSummary = [NSString stringWithFormat:@"🟢 Activo en %lu contenedor(es) — Sincronizado en Sandbox", (unsigned long)activeStealthCount];
     } else {
         self.stealthSummary = @"⚪ En pausa — Activa un contenedor para iniciar el aislamiento";
     }
 
     self.stealthDetailReport =
-        @"Especificaciones del Subsistema de Aislamiento:\n\n"
-        @"1. Cápsula de Estado Superior (_UIStatusBarLocalOverlayWindow): Muestra un indicador flotante centrado (🛡️ Nombre) en la barra de estado y lo filtra de UIApplication.windows y UIWindowScene.windows.\n\n"
-        @"2. Enmascaramiento de Entorno y Hooks C/ObjC: Suprime la visibilidad de archivos de jailbreak, plists de Crane y variables de inyección mediante ganchos en access, stat, lstat, fopen, getenv, dyld, dladdr, NSFileManager y NSURL, preservando la variable TZ en C.\n\n"
-        @"3. Coherencia de Red (__SCOPED__ + getifaddrs): En modo móvil (CELLULAR) reporta pdp_ip0 y oculta tanto utun como en0 ante el binario de la app; en modo Wi-Fi aísla la IP LAN en en0 sin alterar las rutas de Shadowrocket.";
+        @"Especificaciones del Subsistema v33:\n\n"
+        @"1. Bloqueo POSIX de QUIC/HTTP3 e IPv6: Intercepta connect(), sendto() y sendmsg() a bajo nivel para rechazar UDP 443/80 y salidas IPv6 externas, forzando TCP puro sobre Fake-IP / SOCKS5h.\n\n"
+        @"2. Sincronización Directa en Sandbox: Calcula effectiveShieldActive y lo guarda en Library/.igshield_container.plist dentro de cada contenedor para evitar fallos de lectura en /var/jb.\n\n"
+        @"3. Coherencia de Interfaces y Ventana Propia: Enmascara utun sin desplazar el puntero raíz de freeifaddrs() ni apagar en0 en Wi-Fi, e inyecta el indicador superior en una ventana superpuesta aislada.";
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -733,6 +821,25 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     profile[@"containerUUID"] = uuid;
     profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
 
+    BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
+    NSString *bID = profile[@"bundleID"] ?: @"com.burbn.instagram";
+    BOOL appOn = [bID isEqualToString:@"com.burbn.instagram"]
+        ? [self.state[@"enableIG"] boolValue]
+        : [self.state[@"enableReddit"] boolValue];
+    BOOL contOn = [profile[@"enabled"] boolValue];
+    profile[@"effectiveShieldActive"] = @(masterOn && appOn && contOn);
+
+    for (NSMutableArray *list in @[self.igContainersList ?: @[], self.redditContainersList ?: @[]]) {
+        if (![list isKindOfClass:[NSMutableArray class]]) continue;
+        for (NSUInteger i = 0; i < list.count; i++) {
+            NSDictionary *item = list[i];
+            if ([item[@"containerUUID"] isEqualToString:uuid]) {
+                list[i] = profile;
+                break;
+            }
+        }
+    }
+
     NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
         ? [self.state[@"containersByUUID"] mutableCopy]
         : [NSMutableDictionary dictionary];
@@ -747,7 +854,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     if ([p isKindOfClass:[NSString class]] && p.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:p]) {
         NSString *localPlist = [p stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
         if (saveNow || ![[NSFileManager defaultManager] fileExistsAtPath:localPlist]) {
-            [profile writeToFile:localPlist atomically:YES];
+            writeContainerLocalPlistSafely(profile);
         }
     }
 }
@@ -781,16 +888,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         for (NSMutableDictionary *p in list) {
             NSString *u = p[@"containerUUID"];
-            BOOL wasOn = [p[@"enabled"] boolValue];
             BOOL keepOn = [u isEqualToString:chosenUUID];
-            if (wasOn != keepOn) {
-                p[@"enabled"] = @(keepOn);
-                [self saveProfile:p forUUID:u saveNow:NO];
-                NSString *cPath = p[@"path"];
-                if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
-                    [p writeToFile:[cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
-                }
-            }
+            p[@"enabled"] = @(keepOn);
+            [self saveProfile:p forUUID:u saveNow:NO];
         }
     }
 }
@@ -831,23 +931,16 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         for (NSMutableDictionary *p in list) {
             NSString *u = p[@"containerUUID"];
-            BOOL wasOn = [p[@"enabled"] boolValue];
             BOOL keepOn = [u isEqualToString:chosenUUID];
             p[@"enabled"] = @(keepOn);
             [self saveProfile:p forUUID:u saveNow:NO];
-            if (wasOn != keepOn) {
-                NSString *cPath = p[@"path"];
-                if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
-                    [p writeToFile:[cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
-                }
-            }
             if (keepOn) {
                 [keptNames addObject:[NSString stringWithFormat:@"%@: %@", isIG ? @"IG" : @"Reddit", p[@"containerName"] ?: @"Default"]];
             }
         }
     }
 
-    [self saveState];
+    [self syncAllContainerLocalPlists];
     return [keptNames componentsJoinedByString:@"\n• "];
 }
 
@@ -862,21 +955,13 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         if ([u isEqualToString:targetUUID]) {
             p[@"enabled"] = @(enabled);
             [self saveProfile:p forUUID:u saveNow:NO];
-            NSString *cPath = p[@"path"];
-            if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
-                [p writeToFile:[cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
-            }
         } else if (enabled && exclusive && [p[@"enabled"] boolValue]) {
             p[@"enabled"] = @NO;
             [self saveProfile:p forUUID:u saveNow:NO];
-            NSString *cPath = p[@"path"];
-            if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
-                [p writeToFile:[cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
-            }
         }
     }
 
-    [self saveState];
+    [self syncAllContainerLocalPlists];
     [self auditStealthEngineStatus];
     killAppProcess([bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
 }
@@ -935,7 +1020,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     NSString *nativeCraneIDFV = hasValidCraneUUID ? [craneID uppercaseString] : (profile[@"idfv"] ?: [[NSUUID UUID] UUIDString]);
 
     BOOL isNewProfile = (!profile || !profile[@"bootSessionUUID"]);
-    BOOL needsLocalDiskSync = NO;
 
     if (isNewProfile) {
         BOOL wasEnabled = (profile && profile[@"enabled"] != nil) ? [profile[@"enabled"] boolValue] : NO;
@@ -943,16 +1027,13 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         uint64_t seed = randomSeedPrefs64(uuid);
         NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
         NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
-        NSArray *subnets = @[@"192.168.1"];
 
         NSString *oui = ouis[seed % ouis.count];
         NSString *ssidPref = ssidPrefixes[(seed >> 3) % ssidPrefixes.count];
-        NSString *subnet = subnets[(seed >> 5) % subnets.count];
-
         NSString *bssid = [NSString stringWithFormat:@"%@:%02x:%02x:%02x",
                            oui, (unsigned int)((seed >> 8) & 0xFF), (unsigned int)((seed >> 16) & 0xFF), (unsigned int)((seed >> 24) & 0xFF)];
         NSString *ssid = [NSString stringWithFormat:@"%@-%02X-5G", ssidPref, (unsigned int)(seed & 0xFF)];
-        NSString *localIP = [NSString stringWithFormat:@"%@.%d", subnet, 12 + (int)(seed % 230)];
+        NSString *localIP = [NSString stringWithFormat:@"192.168.1.%d", 12 + (int)(seed % 230)];
         unsigned long long freeBytes = ((14200ULL + (seed % 32000ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
 
         profile = [@{
@@ -963,6 +1044,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             @"bundleID": bundleID,
             @"path": preservedPath ?: @"",
             @"enabled": @(wasEnabled),
+            @"effectiveShieldActive": @NO,
             @"spoofIDs": profile[@"spoofIDs"] ?: @YES,
             @"spoofNetwork": profile[@"spoofNetwork"] ?: @YES,
             @"spoofLocation": profile[@"spoofLocation"] ?: @YES,
@@ -995,10 +1077,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     } else {
         [profile removeObjectForKey:@"uptimeOffset"];
         [profile removeObjectForKey:@"customRotatedIDFV"];
-        if (![profile[@"idfv"] isEqualToString:nativeCraneIDFV] ||
-            ![profile[@"containerName"] isEqualToString:cleanCraneName]) {
-            needsLocalDiskSync = YES;
-        }
         profile[@"idfv"] = nativeCraneIDFV;
         profile[@"craneOriginalIDFV"] = nativeCraneIDFV;
         profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
@@ -1009,19 +1087,14 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         if (preservedPath.length > 0) profile[@"path"] = preservedPath;
     }
 
-    // Saneamiento de IP local para mantenerla estrictamente en la subred 192.168.1.x
     NSString *lanIP = profile[@"localIP"] ?: @"192.168.1.45";
     if (![lanIP hasPrefix:@"192.168.1."]) {
         uint64_t fixSeed = randomSeedPrefs64(uuid);
         lanIP = [NSString stringWithFormat:@"192.168.1.%d", 15 + (int)(fixSeed % 220)];
         profile[@"localIP"] = lanIP;
-        needsLocalDiskSync = YES;
     }
 
     [self saveProfile:profile forUUID:uuid saveNow:(saveNow || isNewProfile)];
-    if (needsLocalDiskSync && preservedPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:preservedPath]) {
-        [profile writeToFile:[preservedPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
-    }
     return profile;
 }
 
@@ -1297,7 +1370,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         [self deduplicateActiveIfMultiple];
     }
 
-    [self saveState];
+    [self syncAllContainerLocalPlists];
 }
 
 - (void)calculateResidualTraces {
@@ -1315,17 +1388,26 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     self.realFreeDisk = [NSString stringWithFormat:@"%.2f GB libres", (double)freeBytes / (1024.0*1024.0*1024.0)];
 
     struct ifaddrs *interfaces = NULL;
-    if (getifaddrs(&interfaces) == 0) {
+    if (getifaddrs(&interfaces) == 0 && interfaces != NULL) {
         struct ifaddrs *temp = interfaces;
         while (temp != NULL) {
-            if (temp->ifa_addr && temp->ifa_addr->sa_family == AF_INET && (temp->ifa_flags & IFF_UP)) {
+            if (temp->ifa_name && temp->ifa_addr && (temp->ifa_flags & IFF_UP)) {
                 NSString *ifName = [NSString stringWithUTF8String:temp->ifa_name];
-                char addrBuf[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &((struct sockaddr_in *)temp->ifa_addr)->sin_addr, addrBuf, INET_ADDRSTRLEN);
-                NSString *ipStr = [NSString stringWithUTF8String:addrBuf];
-                if ([ifName isEqualToString:@"en0"] && ipStr) {
-                    self.realLocalIP = ipStr;
-                } else if ([ifName hasPrefix:@"utun"] || [ifName hasPrefix:@"ppp"] || [ifName hasPrefix:@"ipsec"]) {
+                if (temp->ifa_addr->sa_family == AF_INET) {
+                    struct sockaddr_in sin;
+                    memcpy(&sin, temp->ifa_addr, sizeof(sin));
+                    if (sin.sin_addr.s_addr != 0) {
+                        char addrBuf[INET_ADDRSTRLEN] = {0};
+                        inet_ntop(AF_INET, &sin.sin_addr, addrBuf, INET_ADDRSTRLEN);
+                        NSString *ipStr = [NSString stringWithUTF8String:addrBuf];
+                        if ([ifName isEqualToString:@"en0"] && ipStr.length > 0) {
+                            self.realLocalIP = ipStr;
+                        } else if (isTunnelInterfacePrefsName(ifName)) {
+                            self.vpnActive = YES;
+                            self.vpnInterfaceName = ifName;
+                        }
+                    }
+                } else if (temp->ifa_addr->sa_family == AF_INET6 && isTunnelInterfacePrefsName(ifName) && !self.vpnActive) {
                     self.vpnActive = YES;
                     self.vpnInterfaceName = ifName;
                 }
@@ -1446,7 +1528,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"shield.fill", masterOn ? [UIColor systemBlueColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Subsistema IGFarmShield";
-            cell.detailTextLabel.text = masterOn ? @"Operativo (Habilita el contenedor objetivo para aplicar perfiles)" : @"En pausa (Subsistema completamente inactivo)";
+            cell.detailTextLabel.text = masterOn ? @"Operativo (Sincronizado en Sandbox con cada contenedor)" : @"En pausa (Subsistema completamente inactivo)";
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = masterOn;
             sw.tag = 10;
@@ -1457,7 +1539,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"lock.fill", excl ? [UIColor systemIndigoColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:15.5 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Aislamiento Exclusivo";
-            cell.detailTextLabel.text = excl ? @"Activo (Al activar un contenedor se suspenden los demás de forma automática)" : @"Inactivo (Control manual independiente por contenedor)";
+            cell.detailTextLabel.text = excl ? @"Activo (Al activar un contenedor se suspenden los demás automáticamente)" : @"Inactivo (Control manual independiente por contenedor)";
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = excl;
             sw.tag = 11;
@@ -1526,8 +1608,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Túnel Proxy / SOCKS5";
             cell.detailTextLabel.text = self.vpnActive
-                ? [NSString stringWithFormat:@"Enrutado (%@) • Interfaces utun enmascaradas", self.vpnInterfaceName]
-                : @"Sin túnel de red activo";
+                ? [NSString stringWithFormat:@"Enrutado (%@) • UDP 443/80 e IPv6 bloqueados en POSIX", self.vpnInterfaceName]
+                : @"Sin túnel de red activo en este momento";
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
             cell.imageView.image = settingsBadgeIcon(@"eye.slash.fill", self.stealthCurrentlyActive ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
@@ -1555,7 +1637,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     triggerHaptic();
     if (sender.tag == 10) {
         self.state[@"masterEnabled"] = @(sender.isOn);
-        [self saveState];
+        [self syncAllContainerLocalPlists];
         [self auditStealthEngineStatus];
         killAppProcess(@"Instagram");
         killAppProcess(@"Reddit");
@@ -1563,7 +1645,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         [self.tableView reloadData];
     } else if (sender.tag == 11) {
         self.state[@"exclusiveMode"] = @(sender.isOn);
-        [self saveState];
         if (sender.isOn) {
             NSString *keptSummary = [self enforceExclusiveModeWhenToggledOn];
             [self auditStealthEngineStatus];
@@ -1577,6 +1658,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             [ac addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:ac animated:YES completion:nil];
         } else {
+            [self syncAllContainerLocalPlists];
             [self.tableView reloadData];
         }
     }
@@ -1757,7 +1839,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     BOOL isCell = [prof[@"CarrierMode"] isEqualToString:@"CELLULAR"];
     NSString *netDesc = isCell
         ? [NSString stringWithFormat:@"4G: %@", prof[@"CarrierName"] ?: @"Móvil"]
-        : [NSString stringWithFormat:@"Wi-Fi (%@)", prof[@"localIP"] ?: @"LAN"];
+        : @"Wi-Fi Residencial";
     int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
     if (masterOn && appOn && contOn) {
@@ -1781,7 +1863,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)toggleAppMaster:(UISwitch *)sender {
     triggerHaptic();
     self.parentRoot.state[self.appStateKey] = @(sender.isOn);
-    [self.parentRoot saveState];
+    [self.parentRoot syncAllContainerLocalPlists];
     [self.parentRoot auditStealthEngineStatus];
     killAppProcess([self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
     [self.tableView reloadData];
@@ -1847,6 +1929,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)saveCurrentProfile {
     if (self.parentRoot && self.profile && self.containerUUID) {
         [self.parentRoot saveProfile:self.profile forUUID:self.containerUUID saveNow:YES];
+        [self.parentRoot syncAllContainerLocalPlists];
         [self.parentRoot auditStealthEngineStatus];
         killAppProcess([self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
     }
@@ -1895,7 +1978,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"shield.lefthalf.filled", contOn ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Activar Perfil en este Contenedor";
-            cell.detailTextLabel.text = contOn ? @"Activo (Indicador superior visible y aislamiento completo)" : @"En pausa (Sin perfiles inyectados)";
+            cell.detailTextLabel.text = contOn ? @"Activo (Sincronizado en Sandbox con indicador superior)" : @"En pausa (Sin perfiles inyectados)";
             cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = contOn;
@@ -1937,14 +2020,14 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         ];
         NSArray *titles = @[
             @"Aislamiento de Identificadores",
-            @"Enrutamiento y Red TCP",
+            @"Enrutamiento TCP Puro y Anti-QUIC",
             @"Geolocalización y Zona Horaria",
             @"Simulación de Hardware Humano",
             @"Subsistema de Ocultamiento"
         ];
         NSArray *subtitles = @[
             @"Mantiene el IDFV de Crane aislado y fija un BootSessionUUID constante",
-            @"Oculta utun (y en0 en modo 4G), reporta pdp_ip0 y bloquea QUIC/HTTP3",
+            @"Oculta utun, bloquea QUIC (UDP 443/80) e IPv6 externo en POSIX sin alterar Fake-IP",
             @"Ajusta la zona horaria (C TZ + NSTimeZone) e idioma al país del proxy",
             @"Simula batería, volumen, brillo y espacio libre sin alterar la identidad",
             @"Suprime rastros de jailbreak, Crane y tweak en C y Objective-C"
@@ -2007,13 +2090,13 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 if (!on) {
                     cell.detailTextLabel.text = [NSString stringWithFormat:@"○ En pausa (IP LAN real: %@)", self.parentRoot.realLocalIP ?: @"LAN"];
                 } else if (isCell) {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL 4G ESTRICTO:\nOperadora: %@ (MCC %@ / MNC %@)\nInterfaz:  pdp_ip0 (en0 y utun ocultos)",
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL 4G + TCP PURO:\nOperadora: %@ (MCC %@ / MNC %@)\nProtección: Anti-QUIC POSIX (UDP 443/80) + utun oculto",
                                                  self.profile[@"CarrierName"] ?: @"T-Mobile",
                                                  self.profile[@"CarrierMCC"] ?: @"310",
                                                  self.profile[@"CarrierMNC"] ?: @"260"];
                 } else {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL RESIDENCIAL WI-FI:\nLAN Local: %@ • SSID: %@ (%@)",
-                                                 self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]];
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL RESIDENCIAL WI-FI + TCP PURO:\nSSID Simulado: %@ (%@)\nProtección: Anti-QUIC POSIX (UDP 443/80) + utun oculto",
+                                                 self.profile[@"ssid"], self.profile[@"bssid"]];
                 }
                 break;
             }
@@ -2082,7 +2165,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:sender.isOn ? @"🟢 Contenedor Operativo" : @"⚪ Contenedor en Pausa"
                                                                     message:sender.isOn
-                                                                        ? [NSString stringWithFormat:@"Perfil activado para \"%@\".\n• IDFV: %@\n• BootUUID: %@", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
+                                                                        ? [NSString stringWithFormat:@"Perfil activado y sincronizado en Sandbox para \"%@\".\n• IDFV: %@\n• BootUUID: %@", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
                                                                         : @"Contenedor suspendido. No se aplicarán perfiles de aislamiento."
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -2106,11 +2189,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 : @"Utilizando identificadores nativos del sistema.";
         } else if (idx == 1) {
             BOOL isCell = [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"];
-            popupTitle = sender.isOn ? @"📡 Enrutamiento Protegido" : @"⚪ Enrutamiento Nativo";
+            popupTitle = sender.isOn ? @"📡 Enrutamiento TCP Puro Activo" : @"⚪ Enrutamiento Nativo";
             popupMsg = sender.isOn
                 ? (isCell
-                   ? [NSString stringWithFormat:@"Modo móvil 4G activo (%@) • Interfaz pdp_ip0 (en0 y utun ocultos)", self.profile[@"CarrierName"]]
-                   : [NSString stringWithFormat:@"Modo Wi-Fi activo • LAN: %@", self.profile[@"localIP"]])
+                   ? [NSString stringWithFormat:@"Modo móvil 4G (%@) • UDP 443/80 e IPv6 bloqueados en POSIX • utun oculto", self.profile[@"CarrierName"]]
+                   : [NSString stringWithFormat:@"Modo Wi-Fi (%@) • UDP 443/80 e IPv6 bloqueados en POSIX • utun oculto", self.profile[@"ssid"]])
                 : @"Utilizando tablas de red nativas.";
         } else if (idx == 2) {
             popupTitle = sender.isOn ? @"🌎 Geolocalización Aplicada" : @"⚪ Geolocalización Nativa";
@@ -2223,8 +2306,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)syncWithLiveIPAndAuditVPS:(BOOL)sendToVPS {
     NSArray *endpoints = @[
         @"https://ipwho.is/",
-        @"https://ipapi.co/json/",
         @"https://ipinfo.io/json",
+        @"https://ipapi.co/json/",
+        @"https://freeipapi.com/api/json",
         @"http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,timezone,isp,mobile,query"
     ];
 
@@ -2232,7 +2316,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         if (!parsed || error) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Error de Conexión"
-                                                                            message:@"No se pudo resolver la IP pública a través del proxy. Verifica la conectividad de la red."
+                                                                            message:@"No se pudo resolver la IP pública a través del proxy. Verifica la conectividad de Shadowrocket."
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
@@ -2257,7 +2341,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 BOOL isCell = [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"];
                 UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"✅ Parámetros de Red Sincronizados"
                                                                             message:[NSString stringWithFormat:@"• Contenedor: %@\n• IP Pública: %@\n• ISP: %@\n• Perfil: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
-                                                                                     self.profile[@"containerName"], ip, ispRaw, isCell ? @"📱 Red Móvil 4G (pdp_ip0)" : @"🛜 Wi-Fi Residencial", city, region, [cc uppercaseString], tz]
+                                                                                     self.profile[@"containerName"], ip, ispRaw, isCell ? @"📱 Red Móvil 4G" : @"🛜 Wi-Fi Residencial", city, region, [cc uppercaseString], tz]
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
@@ -2268,7 +2352,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *plat = [self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"INSTAGRAM" : @"REDDIT";
         NSString *cName = self.profile[@"containerName"] ?: @"Default";
         NSString *contEnc = [cName stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"Default";
-        NSString *ispEnc = [ispRaw stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
+        NSString *ispEnc = [(ispRaw ?: @"") stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
 
         int shieldActiveFlag = [self isModOn:@"spoofSecurity"] ? 1 : 0;
         NSString *vpsUrlStr = [NSString stringWithFormat:@"%@?ip=%@&contenedor=%@&plataforma=%@&shield=%d&bssid=%@&isp=%@&cc=%@",
