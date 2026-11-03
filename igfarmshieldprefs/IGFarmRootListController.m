@@ -270,7 +270,6 @@ static void purgeDirectoryCacheContents(NSString *dirPath, unsigned long long *f
     }
 }
 
-// Recolecta todas las rutas reales en disco de los contenedores de Instagram y Reddit
 static NSArray<NSString *> *collectAllPhysicalContainerPaths(NSArray *igList, NSArray *rdList) {
     NSMutableSet<NSString *> *uniquePaths = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -301,7 +300,6 @@ static NSArray<NSString *> *collectAllPhysicalContainerPaths(NSArray *igList, NS
     return [uniquePaths allObjects];
 }
 
-// Mide textos, enlaces, imágenes (UIImage) y datos binarios reales en el Portapapeles
 static void inspectPasteboardUsage(NSUInteger *outItemCount, unsigned long long *outBytes) {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
     NSArray *items = pb.items;
@@ -566,6 +564,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     }
     [self saveState];
 
+    self.igContainersList = [NSMutableArray array];
+    self.redditContainersList = [NSMutableArray array];
     self.residualSummary = @"Calculando caché acumulada y portapapeles...";
 
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
@@ -879,8 +879,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             NSString *candPath = cand[@"path"] ?: @"";
             if ([existingKey caseInsensitiveCompare:uuid] == NSOrderedSame ||
                 (![craneID isEqualToString:@"Default"] && ([existingKey caseInsensitiveCompare:craneID] == NSOrderedSame ||
-                                                          [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame ||
-                                                          [candIDFV caseInsensitiveCompare:craneID] == NSOrderedSame)) ||
+                                                           [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame ||
+                                                           [candIDFV caseInsensitiveCompare:craneID] == NSOrderedSame)) ||
                 (path.length > 0 && [candPath isEqualToString:path]) ||
                 (dName.length > 0 && ![dName isEqualToString:@"Default"] && [candName caseInsensitiveCompare:dName] == NSOrderedSame)) {
                 profile = [cand mutableCopy];
@@ -977,7 +977,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     // Saneamiento de IP local para mantenerla estrictamente en la subred 192.168.1.x
     NSString *lanIP = profile[@"localIP"] ?: @"192.168.1.45";
     if (![lanIP hasPrefix:@"192.168.1."]) {
-        uint64_t fixSeed = randomSeed64(uuid);
+        uint64_t fixSeed = randomSeedPrefs64(uuid);
         lanIP = [NSString stringWithFormat:@"192.168.1.%d", 15 + (int)(fixSeed % 220)];
         profile[@"localIP"] = lanIP;
     }
@@ -2053,7 +2053,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *popupMsg = @"";
 
         if (idx == 0) {
-            popupTitle = sender.isOn ? @"🔑 Identificadores Aislados" : @"⚪ Identificadores Nativo";
+            popupTitle = sender.isOn ? @"🔑 Identificadores Aislados" : @"⚪ Identificadores Nativos";
             popupMsg = sender.isOn
                 ? [NSString stringWithFormat:@"• IDFV: %@\n• BootUUID: %@", self.profile[@"idfv"], self.profile[@"bootSessionUUID"]]
                 : @"Utilizando identificadores nativos del sistema.";
@@ -2222,7 +2222,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *cName = self.profile[@"containerName"] ?: @"Default";
         NSString *contEnc = [cName stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"Default";
         NSString *ispEnc = [ispRaw stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
-        
+
         int shieldActiveFlag = [self isModOn:@"spoofSecurity"] ? 1 : 0;
         NSString *vpsUrlStr = [NSString stringWithFormat:@"%@?ip=%@&contenedor=%@&plataforma=%@&shield=%d&bssid=%@&isp=%@&cc=%@",
                                VPS_AUDIT_URL, ip, contEnc, plat, shieldActiveFlag, self.profile[@"bssid"] ?: @"", ispEnc, cc];
@@ -2245,5 +2245,4 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }] resume];
     });
 }
-
 @end
