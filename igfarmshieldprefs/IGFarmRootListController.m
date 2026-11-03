@@ -22,7 +22,7 @@ extern char **environ;
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 32
+#define CURRENT_SCHEMA_VERSION 33
 
 static NSArray<NSString *> *residualSubdirectoriesToTrack(void) {
     return @[
