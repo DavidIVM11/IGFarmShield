@@ -71,6 +71,9 @@ static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_statfs)(const char *, struct statfs *) = NULL;
+static int (*orig_access)(const char *, int) = NULL;
+static int (*orig_stat)(const char *, struct stat *) = NULL;
+static int (*orig_lstat)(const char *, struct stat *) = NULL;
 static FILE *(*orig_fopen)(const char *, const char *) = NULL;
 static char *(*orig_getenv)(const char *) = NULL;
 static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
@@ -98,8 +101,8 @@ static void applyLowLevelCTimeZone(NSString *tzName) {
     tzset();
 }
 
-// Detecta llamadas del binario de la App y de su runtime de Swift,
-// excluyendo explícitamente a Crane, CFNetwork, libnetwork y libswiftNetwork
+// Filtra exclusivamente llamadas originadas dentro del bundle de la App (/Containers/Bundle/Application/)
+// Deja intactos a Crane, CFNetwork, libnetwork y librerías del sistema (libswift*)
 static BOOL isCallerFromTargetApp(const void *retAddr) {
     if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
     Dl_info info;
@@ -109,11 +112,10 @@ static BOOL isCallerFromTargetApp(const void *retAddr) {
             strstr(info.dli_fname, "crane") != NULL ||
             strstr(info.dli_fname, "CFNetwork") != NULL ||
             strstr(info.dli_fname, "libnetwork") != NULL ||
-            strstr(info.dli_fname, "libswiftNetwork") != NULL) {
+            strstr(info.dli_fname, "libswift") != NULL) {
             return NO;
         }
-        if (strstr(info.dli_fname, "/Containers/Bundle/Application/") != NULL ||
-            strstr(info.dli_fname, "libswift") != NULL) {
+        if (strstr(info.dli_fname, "/Containers/Bundle/Application/") != NULL) {
             return YES;
         }
     }
@@ -336,9 +338,14 @@ static void ensureProfileLoaded() {
         }
     }
 
+    NSString *existingProfileIDFV = ([profile[@"idfv"] isKindOfClass:[NSString class]] && [profile[@"idfv"] length] >= 32)
+        ? [profile[@"idfv"] uppercaseString]
+        : nil;
     NSString *nativeCraneUUID = (origCraneIDFV && origCraneIDFV.length >= 32)
         ? [origCraneIDFV uppercaseString]
-        : (([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString]);
+        : (([craneID containsString:@"-"] && craneID.length >= 32)
+            ? [craneID uppercaseString]
+            : (existingProfileIDFV ?: [[NSUUID UUID] UUIDString]));
 
     if (!profile || !profile[@"bootSessionUUID"]) {
         uint64_t seed = randomSeed64(keyUUID);
@@ -406,7 +413,7 @@ static void ensureProfileLoaded() {
         }
     }
 
-    // Saneamiento automático de subred local para evitar conflictos con 10.0.0.0/8 y 172.16.0.0/12 del TUN
+    // Saneamiento automático de subred local en 192.168.1.x
     NSString *lanIP = profile[@"localIP"] ?: @"192.168.1.45";
     if (![lanIP hasPrefix:@"192.168.1."]) {
         uint64_t fixSeed = randomSeed64(keyUUID);
@@ -580,7 +587,7 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
 }
 
 // ============================================================================
-// MODO INVISIBLE ESTABLE (RESPETA LA CARPETA DE DATOS DEL CONTENEDOR Y CRANE)
+// MODO INVISIBLE EN C Y OBJECTIVE-C (RESPETA LA CARPETA INTERNA DEL CONTENEDOR)
 // ============================================================================
 static BOOL isHiddenPathForTargetAppC(const char *path) {
     if (!path) return NO;
@@ -591,7 +598,7 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
     }
 
     // 2. Si la ruta pertenece al propio directorio de datos del contenedor activo,
-    // permitir todo (incluyendo redirecciones de Crane) excepto el plist de IGFarmShield
+    // permitir todo excepto el plist interno de IGFarmShield
     if (s_containerHomeLen > 0 && strncmp(path, s_containerHomePath, s_containerHomeLen) == 0) {
         if (strstr(path, ".igshield_container") != NULL || strstr(path, "igfarmshield") != NULL) {
             return YES;
@@ -644,6 +651,36 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
     return NO;
 }
 
+static int custom_access(const char *path, int amode) {
+    if (s_spoofSecurity && path && isCallerFromTargetApp(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return orig_access(path, amode);
+}
+
+static int custom_stat(const char *path, struct stat *buf) {
+    if (s_spoofSecurity && path && isCallerFromTargetApp(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return orig_stat(path, buf);
+}
+
+static int custom_lstat(const char *path, struct stat *buf) {
+    if (s_spoofSecurity && path && isCallerFromTargetApp(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC(path)) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return orig_lstat(path, buf);
+}
+
 static FILE *custom_fopen(const char *path, const char *mode) {
     if (s_spoofSecurity && path && isCallerFromTargetApp(__builtin_return_address(0))) {
         if (isHiddenPathForTargetAppC(path)) {
@@ -654,12 +691,12 @@ static FILE *custom_fopen(const char *path, const char *mode) {
     return orig_fopen(path, mode);
 }
 
+// Oculta variables de inyección y de Crane sin bloquear "TZ" para preservar la zona horaria en C
 static char *custom_getenv(const char *name) {
     if (s_spoofSecurity && name && isCallerFromTargetApp(__builtin_return_address(0))) {
         if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
             strcmp(name, "_MSSafeMode") == 0 ||
             strcmp(name, "_SafeMode") == 0 ||
-            strcmp(name, "TZ") == 0 ||
             strncmp(name, "CRANE_", 6) == 0) {
             return NULL;
         }
@@ -703,7 +740,6 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
     return ret;
 }
 
-// Silencia únicamente alertas intrusivas de Apple ID / iCloud sin bloquear ASAuthorizationController en el login
 %hook UIViewController
 - (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
     if ((s_spoofSecurity || s_spoofIDs) && [viewControllerToPresent isKindOfClass:[UIAlertController class]]) {
@@ -720,7 +756,6 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 }
 %end
 
-// Filtra la ventana de la cápsula superior para que la App nunca la vea en .windows
 %hook UIApplication
 - (BOOL)canOpenURL:(NSURL *)url {
     if (s_spoofSecurity && url && url.scheme) {
@@ -799,7 +834,7 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 %end
 
 // ============================================================================
-// OCULTACIÓN DE TÚNEL/PROXY (__SCOPED__ + GETIFADDRS) Y BLOQUEO DE HTTP/3
+// OCULTACIÓN DE TÚNEL/PROXY (__SCOPED__ + GETIFADDRS) Y COHERENCIA 4G / WI-FI
 // ============================================================================
 static CFDictionaryRef custom_CFNetworkCopySystemProxySettings(void) {
     CFDictionaryRef origRef = orig_CFNetworkCopySystemProxySettings ? orig_CFNetworkCopySystemProxySettings() : NULL;
@@ -808,6 +843,7 @@ static CFDictionaryRef custom_CFNetworkCopySystemProxySettings(void) {
 
     NSDictionary *origDict = (__bridge NSDictionary *)origRef;
     NSMutableDictionary *cleanDict = [NSMutableDictionary dictionary];
+    NSString *fallbackInterface = s_isCellularMode ? @"pdp_ip0" : @"en0";
 
     NSDictionary *scoped = origDict[@"__SCOPED__"];
     if ([scoped isKindOfClass:[NSDictionary class]]) {
@@ -819,17 +855,18 @@ static CFDictionaryRef custom_CFNetworkCopySystemProxySettings(void) {
                 [low containsString:@"tap"] ||
                 [low containsString:@"ppp"] ||
                 [low containsString:@"ipsec"] ||
-                [low containsString:@"wg"]) {
+                [low containsString:@"wg"] ||
+                (s_isCellularMode && [low isEqualToString:@"en0"])) {
                 continue;
             }
             cleanScoped[ifKey] = scoped[ifKey];
         }
         if (cleanScoped.count == 0) {
-            cleanScoped[@"en0"] = @{};
+            cleanScoped[fallbackInterface] = @{};
         }
         cleanDict[@"__SCOPED__"] = cleanScoped;
     } else {
-        cleanDict[@"__SCOPED__"] = @{@"en0": @{}};
+        cleanDict[@"__SCOPED__"] = @{fallbackInterface: @{}};
     }
 
     CFRelease(origRef);
@@ -905,7 +942,8 @@ static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRe
 }
 %end
 
-// Desvincula limpiamente los nodos utun/ppp/ipsec sin duplicar lo0 y aísla la IP privada en en0
+// Desvincula limpiamente los nodos utun/ppp/ipsec ante el binario de la App
+// En modo CELLULAR oculta también en0; en modo WIFI_ONLY aísla la IP LAN en en0
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || !s_spoofNetwork || s_spoofedLanAddr == 0) return res;
@@ -916,22 +954,25 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     struct ifaddrs *curr = head;
 
     while (curr) {
-        BOOL isTunnelIf = NO;
+        BOOL shouldHideInterface = NO;
         if (curr->ifa_name) {
             if (strncmp(curr->ifa_name, "utun", 4) == 0 ||
                 strncmp(curr->ifa_name, "ppp", 3) == 0 ||
                 strncmp(curr->ifa_name, "ipsec", 5) == 0 ||
                 strncmp(curr->ifa_name, "tun", 3) == 0 ||
                 strncmp(curr->ifa_name, "tap", 3) == 0) {
-                isTunnelIf = YES;
-            } else if (strcmp(curr->ifa_name, "en0") == 0 &&
-                       curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
-                struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
-                addr->sin_addr.s_addr = s_spoofedLanAddr;
+                shouldHideInterface = YES;
+            } else if (strcmp(curr->ifa_name, "en0") == 0) {
+                if (s_isCellularMode) {
+                    shouldHideInterface = YES;
+                } else if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
+                    struct sockaddr_in *addr = (struct sockaddr_in *)curr->ifa_addr;
+                    addr->sin_addr.s_addr = s_spoofedLanAddr;
+                }
             }
         }
 
-        if (isTunnelIf) {
+        if (shouldHideInterface) {
             if (prev) {
                 prev->ifa_next = curr->ifa_next;
             } else {
@@ -970,7 +1011,11 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
 - (NSUUID *)identifierForVendor {
     NSUUID *origUUID = %orig;
     if (!origCraneIDFV && origUUID) {
-        origCraneIDFV = [origUUID UUIDString];
+        origCraneIDFV = [[origUUID UUIDString] uppercaseString];
+        if (liveContainerProfile && origCraneIDFV.length >= 32) {
+            liveContainerProfile[@"idfv"] = origCraneIDFV;
+            liveContainerProfile[@"craneOriginalIDFV"] = origCraneIDFV;
+        }
     }
     return origUUID;
 }
@@ -1070,6 +1115,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 }
 %end
 
+// Limpia variables de entorno de inyección y de Crane sin eliminar "TZ"
 %hook NSProcessInfo
 - (NSDictionary<NSString *, NSString *> *)environment {
     NSDictionary *orig = %orig;
@@ -1081,7 +1127,6 @@ static int custom_statfs(const char *path, struct statfs *buf) {
         if ([k isEqualToString:@"DYLD_INSERT_LIBRARIES"] ||
             [k isEqualToString:@"_MSSafeMode"] ||
             [k isEqualToString:@"_SafeMode"] ||
-            [k isEqualToString:@"TZ"] ||
             [k hasPrefix:@"CRANE_"]) {
             [cleanEnv removeObjectForKey:k];
         }
@@ -1122,11 +1167,15 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
     MSHookFunction((void *)getenv, (void *)custom_getenv, (void **)&orig_getenv);
 
-    // 2. Cargar perfil en memoria desde Foundation sin tocar UIKit en %ctor
+    // 2. Capturar el IDFV aislado de Crane y cargar el perfil del contenedor en RAM
+    origCraneIDFV = [[[[UIDevice currentDevice] identifierForVendor] UUIDString] uppercaseString];
     ensureProfileLoaded();
 
     // 3. Activar el resto de hooks C seguros en ElleKit
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+    MSHookFunction((void *)access, (void *)custom_access, (void **)&orig_access);
+    MSHookFunction((void *)stat, (void *)custom_stat, (void **)&orig_stat);
+    MSHookFunction((void *)lstat, (void *)custom_lstat, (void **)&orig_lstat);
     MSHookFunction((void *)fopen, (void *)custom_fopen, (void **)&orig_fopen);
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
