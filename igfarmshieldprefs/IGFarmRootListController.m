@@ -22,7 +22,7 @@ extern char **environ;
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 33
+#define CURRENT_SCHEMA_VERSION 32
 
 static NSArray<NSString *> *residualSubdirectoriesToTrack(void) {
     return @[
@@ -688,7 +688,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     chmod([STATE_PLIST fileSystemRepresentation], 0644);
 }
 
-// Sincroniza effectiveShieldActive en RAM, en STATE_PLIST y dentro de cada contenedor
+// Sincroniza masterEnabled, appEnabled y effectiveShieldActive dentro de cada contenedor para lectura autónoma en Sandbox
 - (void)syncAllContainerLocalPlists {
     BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
     BOOL igOn = [self.state[@"enableIG"] boolValue];
@@ -719,6 +719,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             }
 
             BOOL contOn = [prof[@"enabled"] boolValue];
+            prof[@"masterEnabled"] = @(masterOn);
+            prof[@"appEnabled"] = @(appOn);
             prof[@"effectiveShieldActive"] = @(masterOn && appOn && contOn);
             prof[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
             list[i] = prof;
@@ -801,9 +803,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     }
 
     self.stealthDetailReport =
-        @"Especificaciones del Subsistema v33:\n\n"
+        @"Especificaciones del Subsistema:\n\n"
         @"1. Bloqueo POSIX de QUIC/HTTP3 e IPv6: Intercepta connect(), sendto() y sendmsg() a bajo nivel para rechazar UDP 443/80 y salidas IPv6 externas, forzando TCP puro sobre Fake-IP / SOCKS5h.\n\n"
-        @"2. Sincronización Directa en Sandbox: Calcula effectiveShieldActive y lo guarda en Library/.igshield_container.plist dentro de cada contenedor para evitar fallos de lectura en /var/jb.\n\n"
+        @"2. Sincronización Directa en Sandbox: Guarda masterEnabled, appEnabled y effectiveShieldActive en Library/.igshield_container.plist dentro de cada contenedor para operar sin depender de /var/jb.\n\n"
         @"3. Coherencia de Interfaces y Ventana Propia: Enmascara utun sin desplazar el puntero raíz de freeifaddrs() ni apagar en0 en Wi-Fi, e inyecta el indicador superior en una ventana superpuesta aislada.";
 }
 
@@ -827,6 +829,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         ? [self.state[@"enableIG"] boolValue]
         : [self.state[@"enableReddit"] boolValue];
     BOOL contOn = [profile[@"enabled"] boolValue];
+    profile[@"masterEnabled"] = @(masterOn);
+    profile[@"appEnabled"] = @(appOn);
     profile[@"effectiveShieldActive"] = @(masterOn && appOn && contOn);
 
     for (NSMutableArray *list in @[self.igContainersList ?: @[], self.redditContainersList ?: @[]]) {
@@ -1044,6 +1048,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             @"bundleID": bundleID,
             @"path": preservedPath ?: @"",
             @"enabled": @(wasEnabled),
+            @"masterEnabled": self.state[@"masterEnabled"] ?: @NO,
+            @"appEnabled": @NO,
             @"effectiveShieldActive": @NO,
             @"spoofIDs": profile[@"spoofIDs"] ?: @YES,
             @"spoofNetwork": profile[@"spoofNetwork"] ?: @YES,
