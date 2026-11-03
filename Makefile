@@ -1,19 +1,16 @@
 TARGET := iphone:clang:latest:15.0
+INSTALL_TARGET_PROCESSES = Instagram Reddit Preferences
 THEOS_PACKAGE_SCHEME = rootless
-ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
-BUNDLE_NAME = IGFarmShieldPrefs
+TWEAK_NAME = IGFarmShield
 
-IGFarmShieldPrefs_FILES = IGFarmRootListController.m
-IGFarmShieldPrefs_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore AVFoundation
-IGFarmShieldPrefs_INSTALL_PATH = /Library/PreferenceBundles
-IGFarmShieldPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-error
-IGFarmShieldPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup
+IGFarmShield_FILES = Tweak.x
+IGFarmShield_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-error
+IGFarmShield_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore CoreTelephony SystemConfiguration CFNetwork Security LocalAuthentication AVFoundation
 
-include $(THEOS_MAKE_PATH)/bundle.mk
+include $(THEOS_MAKE_PATH)/tweak.mk
 
-internal-stage::
-	$(ECHO_NOTHING)mkdir -p $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences$(ECHO_END)
-	$(ECHO_NOTHING)mkdir -p$(THEOS_STAGING_DIR)/Library/PreferenceBundles/IGFarmShieldPrefs.bundle$(ECHO_END)$(ECHO_NOTHING)cp entry.plist $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences/IGFarmShieldPrefs.plist$(ECHO_END)$(ECHO_NOTHING)cp Info.plist $(THEOS_STAGING_DIR)/Library/PreferenceBundles/IGFarmShieldPrefs.bundle/Info.plist$(ECHO_END)$(ECHO_NOTHING)cp IGFarmShieldIcon*.png $(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences/ 2>/dev/null || true$(ECHO_END)$(ECHO_NOTHING)cp IGFarmShieldIcon*.png $(THEOS_STAGING_DIR)/Library/PreferenceBundles/IGFarmShieldPrefs.bundle/ 2>/dev/null \vert{}\vert{} true$(ECHO_END)
+SUBPROJECTS += igfarmshieldprefs
+include $(THEOS_MAKE_PATH)/aggregate.mk
