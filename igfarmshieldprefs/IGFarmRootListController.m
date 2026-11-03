@@ -270,8 +270,13 @@ static void purgeDirectoryCacheContents(NSString *dirPath, unsigned long long *f
     }
 }
 
-static NSArray<NSString *> *collectAllPhysicalContainerPaths(NSArray *igList, NSArray *rdList) {
+static NSArray<NSString *> *collectAllPhysicalContainerPaths(NSArray *igList, NSArray *rdList, NSArray *hiddenIDs) {
     NSMutableSet<NSString *> *uniquePaths = [NSMutableSet set];
+    NSMutableSet<NSString *> *hiddenSet = [NSMutableSet set];
+    for (NSString *h in hiddenIDs ?: @[]) {
+        if ([h isKindOfClass:[NSString class]]) [hiddenSet addObject:[h lowercaseString]];
+    }
+
     NSFileManager *fm = [NSFileManager defaultManager];
 
     for (NSArray *list in @[igList ?: @[], rdList ?: @[]]) {
@@ -286,6 +291,7 @@ static NSArray<NSString *> *collectAllPhysicalContainerPaths(NSArray *igList, NS
     NSString *appsDir = @"/var/mobile/Containers/Data/Application";
     NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
     for (NSString *folderUUID in uuids) {
+        if ([hiddenSet containsObject:[folderUUID lowercaseString]]) continue;
         NSString *fullPath = [appsDir stringByAppendingPathComponent:folderUUID];
         NSString *metaPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
         NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
@@ -708,9 +714,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     self.stealthDetailReport =
         @"Especificaciones del Subsistema de Aislamiento:\n\n"
-        @"1. Cápsula de Estado Superior (UIWindowScene): Muestra un indicador flotante centrado (🛡️ Nombre) en la barra de estado para verificar visualmente el contenedor activo.\n\n"
-        @"2. Enmascaramiento de Entorno y Hooks: Suprime la visibilidad de archivos del sistema de archivos, plists de Crane y directorios de jailbreak (rootless/rootful) mediante ganchos en fopen, dyld, dladdr, NSFileManager y NSURL.\n\n"
-        @"3. Gestión de Red y Túnel (__SCOPED__): Oculta interfaces virtuales utun ante llamadas de CFNetwork sin alterar las rutas lógicas del túnel de Shadowrocket.";
+        @"1. Cápsula de Estado Superior (_UIStatusBarLocalOverlayWindow): Muestra un indicador flotante centrado (🛡️ Nombre) en la barra de estado y lo filtra de UIApplication.windows y UIWindowScene.windows.\n\n"
+        @"2. Enmascaramiento de Entorno y Hooks C/ObjC: Suprime la visibilidad de archivos de jailbreak, plists de Crane y variables de inyección mediante ganchos en access, stat, lstat, fopen, getenv, dyld, dladdr, NSFileManager y NSURL, preservando la variable TZ en C.\n\n"
+        @"3. Coherencia de Red (__SCOPED__ + getifaddrs): En modo móvil (CELLULAR) reporta pdp_ip0 y oculta tanto utun como en0 ante el binario de la app; en modo Wi-Fi aísla la IP LAN en en0 sin alterar las rutas de Shadowrocket.";
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -775,9 +781,16 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         for (NSMutableDictionary *p in list) {
             NSString *u = p[@"containerUUID"];
+            BOOL wasOn = [p[@"enabled"] boolValue];
             BOOL keepOn = [u isEqualToString:chosenUUID];
-            p[@"enabled"] = @(keepOn);
-            [self saveProfile:p forUUID:u saveNow:NO];
+            if (wasOn != keepOn) {
+                p[@"enabled"] = @(keepOn);
+                [self saveProfile:p forUUID:u saveNow:NO];
+                NSString *cPath = p[@"path"];
+                if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
+                    [p writeToFile:[cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
+                }
+            }
         }
     }
 }
@@ -818,15 +831,23 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         for (NSMutableDictionary *p in list) {
             NSString *u = p[@"containerUUID"];
+            BOOL wasOn = [p[@"enabled"] boolValue];
             BOOL keepOn = [u isEqualToString:chosenUUID];
             p[@"enabled"] = @(keepOn);
-            [self saveProfile:p forUUID:u saveNow:YES];
+            [self saveProfile:p forUUID:u saveNow:NO];
+            if (wasOn != keepOn) {
+                NSString *cPath = p[@"path"];
+                if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
+                    [p writeToFile:[cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
+                }
+            }
             if (keepOn) {
                 [keptNames addObject:[NSString stringWithFormat:@"%@: %@", isIG ? @"IG" : @"Reddit", p[@"containerName"] ?: @"Default"]];
             }
         }
     }
 
+    [self saveState];
     return [keptNames componentsJoinedByString:@"\n• "];
 }
 
@@ -840,13 +861,22 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         if (!u) continue;
         if ([u isEqualToString:targetUUID]) {
             p[@"enabled"] = @(enabled);
-            [self saveProfile:p forUUID:u saveNow:YES];
-        } else if (enabled && exclusive) {
+            [self saveProfile:p forUUID:u saveNow:NO];
+            NSString *cPath = p[@"path"];
+            if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
+                [p writeToFile:[cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
+            }
+        } else if (enabled && exclusive && [p[@"enabled"] boolValue]) {
             p[@"enabled"] = @NO;
-            [self saveProfile:p forUUID:u saveNow:YES];
+            [self saveProfile:p forUUID:u saveNow:NO];
+            NSString *cPath = p[@"path"];
+            if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
+                [p writeToFile:[cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
+            }
         }
     }
 
+    [self saveState];
     [self auditStealthEngineStatus];
     killAppProcess([bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
 }
@@ -905,6 +935,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     NSString *nativeCraneIDFV = hasValidCraneUUID ? [craneID uppercaseString] : (profile[@"idfv"] ?: [[NSUUID UUID] UUIDString]);
 
     BOOL isNewProfile = (!profile || !profile[@"bootSessionUUID"]);
+    BOOL needsLocalDiskSync = NO;
 
     if (isNewProfile) {
         BOOL wasEnabled = (profile && profile[@"enabled"] != nil) ? [profile[@"enabled"] boolValue] : NO;
@@ -964,6 +995,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     } else {
         [profile removeObjectForKey:@"uptimeOffset"];
         [profile removeObjectForKey:@"customRotatedIDFV"];
+        if (![profile[@"idfv"] isEqualToString:nativeCraneIDFV] ||
+            ![profile[@"containerName"] isEqualToString:cleanCraneName]) {
+            needsLocalDiskSync = YES;
+        }
         profile[@"idfv"] = nativeCraneIDFV;
         profile[@"craneOriginalIDFV"] = nativeCraneIDFV;
         profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
@@ -980,9 +1015,13 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         uint64_t fixSeed = randomSeedPrefs64(uuid);
         lanIP = [NSString stringWithFormat:@"192.168.1.%d", 15 + (int)(fixSeed % 220)];
         profile[@"localIP"] = lanIP;
+        needsLocalDiskSync = YES;
     }
 
     [self saveProfile:profile forUUID:uuid saveNow:(saveNow || isNewProfile)];
+    if (needsLocalDiskSync && preservedPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:preservedPath]) {
+        [profile writeToFile:[preservedPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"] atomically:YES];
+    }
     return profile;
 }
 
@@ -1078,6 +1117,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         NSString *craneID = nil;
         NSString *detectedName = nil;
+        NSString *mcmUUID = [meta[@"MCMMetadataUUID"] isKindOfClass:[NSString class]] ? meta[@"MCMMetadataUUID"] : nil;
 
         for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
             if ([meta[rk] isKindOfClass:[NSString class]] && [meta[rk] length] > 0) detectedName = meta[rk];
@@ -1123,6 +1163,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSDictionary *cEntry = nil;
         if (craneID.length > 0) cEntry = craneMap[[craneID lowercaseString]];
         if (!cEntry && savedIDFV.length > 0) cEntry = craneMap[[savedIDFV lowercaseString]];
+        if (!cEntry && mcmUUID.length > 0) cEntry = craneMap[[mcmUUID lowercaseString]];
         if (!cEntry) cEntry = craneMap[[folderUUID lowercaseString]];
         if (!cEntry && detectedName.length > 0) cEntry = craneMap[[detectedName lowercaseString]];
 
@@ -1137,6 +1178,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 if (detectedName) break;
                 if (savedIDFV.length > 0) detectedName = findCraneNameByID(src, savedIDFV);
                 if (detectedName) break;
+                if (mcmUUID.length > 0) detectedName = findCraneNameByID(src, mcmUUID);
+                if (detectedName) break;
                 detectedName = findCraneNameByID(src, folderUUID);
                 if (detectedName) break;
             }
@@ -1147,6 +1190,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 craneID = @"Default";
             } else if (savedIDFV.length > 0) {
                 craneID = savedIDFV;
+            } else if (mcmUUID.length > 0) {
+                craneID = mcmUUID;
             } else {
                 craneID = folderUUID;
             }
@@ -1177,6 +1222,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                                                          saveNow:NO];
         [seenKeys addObject:[folderUUID lowercaseString]];
         [seenKeys addObject:[craneID lowercaseString]];
+        if (mcmUUID.length > 0) [seenKeys addObject:[mcmUUID lowercaseString]];
         if (detectedName.length > 0) [seenKeys addObject:[detectedName lowercaseString]];
         [targetList addObject:prof];
     }
@@ -1293,7 +1339,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     unsigned long long pbBytes = 0;
     inspectPasteboardUsage(&pbItems, &pbBytes);
 
-    NSArray<NSString *> *pathsToScan = collectAllPhysicalContainerPaths(self.igContainersList, self.redditContainersList);
+    NSArray *hiddenIDs = [self.state[@"hiddenContainerIDs"] isKindOfClass:[NSArray class]] ? self.state[@"hiddenContainerIDs"] : @[];
+    NSArray<NSString *> *pathsToScan = collectAllPhysicalContainerPaths(self.igContainersList, self.redditContainersList, hiddenIDs);
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -1343,7 +1390,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [UIPasteboard generalPasteboard].string = @"";
     [[NSURLCache sharedURLCache] removeAllCachedResponses];
 
-    NSArray<NSString *> *pathsToClean = collectAllPhysicalContainerPaths(self.igContainersList, self.redditContainersList);
+    NSArray *hiddenIDs = [self.state[@"hiddenContainerIDs"] isKindOfClass:[NSArray class]] ? self.state[@"hiddenContainerIDs"] : @[];
+    NSArray<NSString *> *pathsToClean = collectAllPhysicalContainerPaths(self.igContainersList, self.redditContainersList, hiddenIDs);
     NSArray<NSString *> *trackedSubs = residualSubdirectoriesToTrack();
 
     for (NSString *cPath in pathsToClean) {
@@ -1708,7 +1756,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     NSString *shortIDFV = [prof[@"idfv"] length] >= 8 ? [prof[@"idfv"] substringToIndex:8] : prof[@"idfv"];
     BOOL isCell = [prof[@"CarrierMode"] isEqualToString:@"CELLULAR"];
     NSString *netDesc = isCell
-        ? [NSString stringWithFormat:@"Red: %@", prof[@"CarrierName"] ?: @"Móvil"]
+        ? [NSString stringWithFormat:@"4G: %@", prof[@"CarrierName"] ?: @"Móvil"]
         : [NSString stringWithFormat:@"Wi-Fi (%@)", prof[@"localIP"] ?: @"LAN"];
     int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
@@ -1847,7 +1895,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"shield.lefthalf.filled", contOn ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Activar Perfil en este Contenedor";
-            cell.detailTextLabel.text = contOn ? @"Activo (Indicador superior visible y purga automática configurada)" : @"En pausa (Sin perfiles inyectados)";
+            cell.detailTextLabel.text = contOn ? @"Activo (Indicador superior visible y aislamiento completo)" : @"En pausa (Sin perfiles inyectados)";
             cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = contOn;
@@ -1896,10 +1944,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         ];
         NSArray *subtitles = @[
             @"Mantiene el IDFV de Crane aislado y fija un BootSessionUUID constante",
-            @"Aísla la IP LAN en en0, oculta interfaces utun y bloquea QUIC/HTTP3",
-            @"Ajusta la zona horaria e idioma (NSLocale) al país del proxy activo",
+            @"Oculta utun (y en0 en modo 4G), reporta pdp_ip0 y bloquea QUIC/HTTP3",
+            @"Ajusta la zona horaria (C TZ + NSTimeZone) e idioma al país del proxy",
             @"Simula batería, volumen, brillo y espacio libre sin alterar la identidad",
-            @"Suprime rastros de jailbreak y plists de herramientas en tiempo de ejecución"
+            @"Suprime rastros de jailbreak, Crane y tweak en C y Objective-C"
         ];
         NSArray *keys = @[@"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity"];
 
@@ -1959,11 +2007,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 if (!on) {
                     cell.detailTextLabel.text = [NSString stringWithFormat:@"○ En pausa (IP LAN real: %@)", self.parentRoot.realLocalIP ?: @"LAN"];
                 } else if (isCell) {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL ESTRICTO:\nOperadora: %@ (MCC %@ / MNC %@)\nLAN Local: %@ • Túnel Protegido",
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL 4G ESTRICTO:\nOperadora: %@ (MCC %@ / MNC %@)\nInterfaz:  pdp_ip0 (en0 y utun ocultos)",
                                                  self.profile[@"CarrierName"] ?: @"T-Mobile",
                                                  self.profile[@"CarrierMCC"] ?: @"310",
-                                                 self.profile[@"CarrierMNC"] ?: @"260",
-                                                 self.profile[@"localIP"] ?: @"192.168.1.45"];
+                                                 self.profile[@"CarrierMNC"] ?: @"260"];
                 } else {
                     cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL RESIDENCIAL WI-FI:\nLAN Local: %@ • SSID: %@ (%@)",
                                                  self.profile[@"localIP"], self.profile[@"ssid"], self.profile[@"bssid"]];
@@ -1975,7 +2022,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"🌎 Geolocalización y Huso Horario";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"● PARÁMETROS INYECTADOS:\nIP / ISP:      %@ (%@)\nRegión:        %@\nZona/Idioma:   %@ (%@)",
+                    ? [NSString stringWithFormat:@"● PARÁMETROS INYECTADOS (C TZ + ObjC):\nIP / ISP:      %@ (%@)\nRegión:        %@\nZona/Idioma:   %@ (%@)",
                        self.profile[@"lastSyncedIP"] ?: @"Pendiente", self.profile[@"ispName"] ?: @"ISP",
                        self.profile[@"cityCountry"] ?: @"N/A", self.profile[@"timeZone"], self.profile[@"localeID"]]
                     : [NSString stringWithFormat:@"○ En pausa (Zona horaria real: %@)", [[NSTimeZone localTimeZone] name]];
@@ -1996,7 +2043,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"🛡️ Estado de Ocultamiento";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? @"● SUBSISTEMA ACTIVO:\nSuprimiendo rastros de jailbreak y ganchos de entorno en este contenedor."
+                    ? @"● SUBSISTEMA ACTIVO:\nProtegidos: access/stat/lstat/fopen/getenv/dyld/dladdr/NSFileManager"
                     : @"○ En pausa (Hooks inactivos en este contenedor)";
                 break;
             }
@@ -2062,7 +2109,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             popupTitle = sender.isOn ? @"📡 Enrutamiento Protegido" : @"⚪ Enrutamiento Nativo";
             popupMsg = sender.isOn
                 ? (isCell
-                   ? [NSString stringWithFormat:@"Modo móvil activo (%@) • LAN: %@", self.profile[@"CarrierName"], self.profile[@"localIP"]]
+                   ? [NSString stringWithFormat:@"Modo móvil 4G activo (%@) • Interfaz pdp_ip0 (en0 y utun ocultos)", self.profile[@"CarrierName"]]
                    : [NSString stringWithFormat:@"Modo Wi-Fi activo • LAN: %@", self.profile[@"localIP"]])
                 : @"Utilizando tablas de red nativas.";
         } else if (idx == 2) {
@@ -2082,7 +2129,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         } else if (idx == 4) {
             popupTitle = sender.isOn ? @"🛡️ Ocultamiento Activo" : @"⚪ Ocultamiento en Pausa";
             popupMsg = sender.isOn
-                ? @"Subsistema de ocultamiento operando en este contenedor."
+                ? @"Subsistema de ocultamiento C/ObjC operando en este contenedor."
                 : @"Subsistema de ocultamiento inactivo en este contenedor.";
         }
 
@@ -2210,7 +2257,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 BOOL isCell = [self.profile[@"CarrierMode"] isEqualToString:@"CELLULAR"];
                 UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"✅ Parámetros de Red Sincronizados"
                                                                             message:[NSString stringWithFormat:@"• Contenedor: %@\n• IP Pública: %@\n• ISP: %@\n• Perfil: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
-                                                                                     self.profile[@"containerName"], ip, ispRaw, isCell ? @"📱 Red Móvil" : @"🛜 Wi-Fi Residencial", city, region, [cc uppercaseString], tz]
+                                                                                     self.profile[@"containerName"], ip, ispRaw, isCell ? @"📱 Red Móvil 4G (pdp_ip0)" : @"🛜 Wi-Fi Residencial", city, region, [cc uppercaseString], tz]
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
@@ -2245,4 +2292,5 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }] resume];
     });
 }
+
 @end
