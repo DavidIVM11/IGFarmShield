@@ -20,6 +20,7 @@
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <string.h>
+#import <strings.h>
 #import <stdlib.h>
 #import <stdio.h>
 #import <time.h>
@@ -84,6 +85,17 @@ static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
 static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
 static CFArrayRef (*orig_CFNetworkCopyProxiesForURL)(CFURLRef, CFDictionaryRef) = NULL;
 
+static BOOL containsIgnoreCaseC(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !*needle) return NO;
+    size_t nLen = strlen(needle);
+    for (const char *p = haystack; *p != '\0'; p++) {
+        if (strncasecmp(p, needle, nLen) == 0) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 static uint64_t randomSeed64(NSString *salt) {
     uint64_t hash = 14695981039346656037ULL;
     const char *bytes = [salt UTF8String];
@@ -135,15 +147,14 @@ static BOOL isCallerFromTargetApp(const void *retAddr) {
     if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
     Dl_info info;
     if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
-        if (strstr(info.dli_fname, "IGFarmShield") != NULL ||
-            strstr(info.dli_fname, "Crane") != NULL ||
-            strstr(info.dli_fname, "crane") != NULL ||
+        if (containsIgnoreCaseC(info.dli_fname, "IGFarmShield") ||
+            containsIgnoreCaseC(info.dli_fname, "crane") ||
             strstr(info.dli_fname, "CFNetwork") != NULL ||
             strstr(info.dli_fname, "libnetwork") != NULL ||
             strstr(info.dli_fname, "libswift") != NULL) {
             return NO;
         }
-        if (strstr(info.dli_fname, "/Containers/Bundle/Application/") != NULL) {
+        if (containsIgnoreCaseC(info.dli_fname, "/containers/bundle/application/")) {
             return YES;
         }
     }
@@ -619,19 +630,18 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
 static BOOL isHiddenPathForTargetAppC(const char *path) {
     if (!path) return NO;
 
-    if (strstr(path, "Cryptex") != NULL || strstr(path, "cryptex") != NULL) {
+    if (containsIgnoreCaseC(path, "cryptex")) {
         return NO;
     }
 
     if (s_containerHomeLen > 0 && strncmp(path, s_containerHomePath, s_containerHomeLen) == 0) {
-        if (strstr(path, ".igshield_container") != NULL || strstr(path, "igfarmshield") != NULL) {
+        if (strstr(path, ".igshield_container") != NULL || containsIgnoreCaseC(path, "igfarmshield")) {
             return YES;
         }
         return NO;
     }
 
-    if (strstr(path, "IGFarmShield") != NULL ||
-        strstr(path, "igfarmshield") != NULL ||
+    if (containsIgnoreCaseC(path, "igfarmshield") ||
         strstr(path, ".igshield_container") != NULL) {
         return YES;
     }
@@ -652,20 +662,17 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
         strncmp(path, "/Applications/Zebra.app", 23) == 0 ||
         strncmp(path, "/Applications/Filza.app", 23) == 0 ||
         strncmp(path, "/Applications/Cydia.app", 23) == 0 ||
-        strstr(path, "ellekit") != NULL ||
-        strstr(path, "Choicy") != NULL ||
-        strstr(path, "choicy") != NULL ||
+        containsIgnoreCaseC(path, "ellekit") ||
+        containsIgnoreCaseC(path, "choicy") ||
         strstr(path, "Shadow.dylib") != NULL ||
-        strstr(path, "Sileo") != NULL ||
-        strstr(path, "sileo") != NULL ||
-        strstr(path, "Filza") != NULL ||
-        strstr(path, "filza") != NULL ||
-        strstr(path, "palera1n") != NULL ||
-        strstr(path, "Dopamine") != NULL ||
-        strstr(path, "MobileSubstrate") != NULL ||
-        strstr(path, "substrate") != NULL ||
-        strstr(path, "Substitute") != NULL ||
-        strstr(path, "TweakInject") != NULL ||
+        containsIgnoreCaseC(path, "sileo") ||
+        containsIgnoreCaseC(path, "filza") ||
+        containsIgnoreCaseC(path, "palera1n") ||
+        containsIgnoreCaseC(path, "dopamine") ||
+        containsIgnoreCaseC(path, "mobilesubstrate") ||
+        containsIgnoreCaseC(path, "substrate") ||
+        containsIgnoreCaseC(path, "substitute") ||
+        containsIgnoreCaseC(path, "tweakinject") ||
         strstr(path, "apt/sources.list") != NULL) {
         return YES;
     }
@@ -727,9 +734,8 @@ static char *custom_getenv(const char *name) {
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
     const char *name = orig_dyld_get_image_name(image_index);
     if (s_spoofSecurity && name && isCallerFromTargetApp(__builtin_return_address(0))) {
-        if (strstr(name, "IGFarmShield") != NULL ||
-            strstr(name, "Crane") != NULL ||
-            strstr(name, "crane") != NULL ||
+        if (containsIgnoreCaseC(name, "igfarmshield") ||
+            containsIgnoreCaseC(name, "crane") ||
             isHiddenPathForTargetAppC(name)) {
             static const char *cleanSystemPaths[] = {
                 "/usr/lib/libobjc.A.dylib",
@@ -750,9 +756,8 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
 static int custom_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
     if (s_spoofSecurity && ret != 0 && info && info->dli_fname && isCallerFromTargetApp(__builtin_return_address(0))) {
-        if (strstr(info->dli_fname, "IGFarmShield") != NULL ||
-            strstr(info->dli_fname, "Crane") != NULL ||
-            strstr(info->dli_fname, "crane") != NULL ||
+        if (containsIgnoreCaseC(info->dli_fname, "igfarmshield") ||
+            containsIgnoreCaseC(info->dli_fname, "crane") ||
             isHiddenPathForTargetAppC(info->dli_fname)) {
             info->dli_fname = "/System/Library/Frameworks/UIKitCore.framework/UIKitCore";
         }
@@ -892,6 +897,11 @@ static int evaluateQuicAndIPv6Policy(int sockfd, const struct sockaddr *addr, so
             return 0;
         }
 
+        // Link-local fe80::/10 permitido para descubrimiento local interno del kernel
+        if (sin6.sin6_addr.s6_addr[0] == 0xfe && (sin6.sin6_addr.s6_addr[1] & 0xc0) == 0x80) {
+            return 0;
+        }
+
         static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
         if (memcmp(sin6.sin6_addr.s6_addr, v4mapPrefix, 12) == 0) {
             uint16_t dstPort = ntohs(sin6.sin6_port);
@@ -974,7 +984,9 @@ static CFDictionaryRef custom_CFNetworkCopySystemProxySettings(void) {
 static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings) {
     if (s_spoofNetwork && isCallerFromTargetApp(__builtin_return_address(0))) {
         if (hasActiveUtunTunnel()) {
-            NSDictionary *directProxy = @{ @"ProxyType" : @"kCFProxyTypeNone" };
+            NSDictionary *directProxy = @{
+                (__bridge NSString *)kCFProxyTypeKey : (__bridge NSString *)kCFProxyTypeNone
+            };
             NSArray *arr = @[ directProxy ];
             return (__bridge_retained CFArrayRef)arr;
         }
@@ -998,10 +1010,11 @@ static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRe
 
 %hook NSURLSessionConfiguration
 - (NSDictionary *)connectionProxyDictionary {
-    if (s_spoofNetwork && isCallerFromTargetApp(__builtin_return_address(0))) {
-        if (hasActiveUtunTunnel()) return @{};
+    NSDictionary *orig = %orig;
+    if (s_spoofNetwork && orig != nil && isCallerFromTargetApp(__builtin_return_address(0))) {
+        if (hasActiveUtunTunnel()) return nil;
     }
-    return %orig;
+    return orig;
 }
 %end
 
@@ -1270,6 +1283,8 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     MSHookFunction((void *)getenv, (void *)custom_getenv, (void **)&orig_getenv);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
+    %init;
+
     origCraneIDFV = [[[[UIDevice currentDevice] identifierForVendor] UUIDString] uppercaseString];
     ensureProfileLoaded();
 
@@ -1280,10 +1295,16 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     MSHookFunction((void *)fopen, (void *)custom_fopen, (void **)&orig_fopen);
     MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
-    MSHookFunction((void *)connect, (void *)custom_connect, (void **)&orig_connect);
-    MSHookFunction((void *)sendto, (void *)custom_sendto, (void **)&orig_sendto);
-    MSHookFunction((void *)sendmsg, (void *)custom_sendmsg, (void **)&orig_sendmsg);
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
+
+    void *symConnect = dlsym(RTLD_DEFAULT, "connect");
+    if (symConnect) MSHookFunction(symConnect, (void *)custom_connect, (void **)&orig_connect);
+
+    void *symSendto = dlsym(RTLD_DEFAULT, "sendto");
+    if (symSendto) MSHookFunction(symSendto, (void *)custom_sendto, (void **)&orig_sendto);
+
+    void *symSendmsg = dlsym(RTLD_DEFAULT, "sendmsg");
+    if (symSendmsg) MSHookFunction(symSendmsg, (void *)custom_sendmsg, (void **)&orig_sendmsg);
 
     void *symProxySettings = dlsym(RTLD_DEFAULT, "CFNetworkCopySystemProxySettings");
     if (symProxySettings) {
@@ -1293,8 +1314,6 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     if (symProxiesForURL) {
         MSHookFunction(symProxiesForURL, (void *)custom_CFNetworkCopyProxiesForURL, (void **)&orig_CFNetworkCopyProxiesForURL);
     }
-
-    %init;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         showStartupBannerAndPersistentIcon(0);
