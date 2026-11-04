@@ -19,7 +19,6 @@
 #import <sys/stat.h>
 #import <dirent.h>
 #import <fcntl.h>
-#import <execinfo.h>
 #import <unistd.h>
 #import <errno.h>
 #import <mach-o/dyld.h>
@@ -181,7 +180,6 @@ static BOOL isExemptImageNameC(const char *fname) {
             strstr(fname, "/usr/lib/dyld") != NULL);
 }
 
-// Verifica llamadas directas del binario de la App para CFNetwork Proxy Settings
 static BOOL isCallerFromTargetApp(const void *retAddr) {
     if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
     Dl_info info;
@@ -199,7 +197,6 @@ static BOOL isCallerFromTargetApp(const void *retAddr) {
     return NO;
 }
 
-// Cubre el binario de la App y el runtime de Swift sin interceptar llamadas internas de Foundation hechas por Crane
 static BOOL isCallerAppOrSwift(const void *retAddr) {
     if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
     Dl_info info;
@@ -218,42 +215,6 @@ static BOOL isCallerAppOrSwift(const void *retAddr) {
         }
     }
     return NO;
-}
-
-// Se ejecuta ÚNICAMENTE cuando se consulta una ruta prohibida (/var/jb, Crane, etc.)
-// Permite a Crane/ElleKit acceder a sus archivos a través de Foundation y bloquea a la App/Swift
-static BOOL isAllowedInternalFileCaller(const void *directRetAddr) {
-    if (s_inInternalCall) return YES;
-    if (!orig_dladdr) return NO;
-
-    if (directRetAddr) {
-        Dl_info directInfo;
-        if (orig_dladdr(directRetAddr, &directInfo) != 0 && directInfo.dli_fname) {
-            if (isExemptImageNameC(directInfo.dli_fname)) return YES;
-            if (containsIgnoreCaseC(directInfo.dli_fname, "/containers/bundle/application/")) return NO;
-        }
-    }
-
-    s_inInternalCall = YES;
-    void *callstack[12];
-    int frames = backtrace(callstack, 12);
-    BOOL allowed = NO;
-
-    for (int i = 1; i < frames; i++) {
-        Dl_info frameInfo;
-        if (orig_dladdr(callstack[i], &frameInfo) != 0 && frameInfo.dli_fname) {
-            if (isExemptImageNameC(frameInfo.dli_fname)) {
-                allowed = YES;
-                break;
-            }
-            if (containsIgnoreCaseC(frameInfo.dli_fname, "/containers/bundle/application/")) {
-                allowed = NO;
-                break;
-            }
-        }
-    }
-    s_inInternalCall = NO;
-    return allowed;
 }
 
 static void searchNestedMetadata(id node, NSString **outID, NSString **outName, NSString *bundleID) {
@@ -846,8 +807,8 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
 }
 
 static int custom_access(const char *path, int amode) {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) {
+    if (s_spoofSecurity && path && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC(path)) {
             errno = ENOENT;
             return -1;
         }
@@ -856,8 +817,8 @@ static int custom_access(const char *path, int amode) {
 }
 
 static int custom_faccessat(int fd, const char *path, int mode, int flag) {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) {
+    if (s_spoofSecurity && path && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC(path)) {
             errno = ENOENT;
             return -1;
         }
@@ -866,8 +827,8 @@ static int custom_faccessat(int fd, const char *path, int mode, int flag) {
 }
 
 static int custom_stat(const char *path, struct stat *buf) {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) {
+    if (s_spoofSecurity && path && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC(path)) {
             errno = ENOENT;
             return -1;
         }
@@ -876,8 +837,8 @@ static int custom_stat(const char *path, struct stat *buf) {
 }
 
 static int custom_lstat(const char *path, struct stat *buf) {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) {
+    if (s_spoofSecurity && path && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC(path)) {
             errno = ENOENT;
             return -1;
         }
@@ -886,8 +847,8 @@ static int custom_lstat(const char *path, struct stat *buf) {
 }
 
 static FILE *custom_fopen(const char *path, const char *mode) {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) {
+    if (s_spoofSecurity && path && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC(path)) {
             errno = ENOENT;
             return NULL;
         }
@@ -896,8 +857,8 @@ static FILE *custom_fopen(const char *path, const char *mode) {
 }
 
 static DIR *custom_opendir(const char *dirname) {
-    if (s_spoofSecurity && dirname && isHiddenPathForTargetAppC(dirname)) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) {
+    if (s_spoofSecurity && dirname && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC(dirname)) {
             errno = ENOENT;
             return NULL;
         }
@@ -1277,8 +1238,6 @@ static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRe
 }
 %end
 
-// Oculta utun* y aísla la IP CGNAT (100.x.y.z en pdp_ip0) o LAN (192.168.1.x en en0)
-// sólo ante la App/Swift (CFNetwork y libnetwork ven las interfaces reales intactas)
 static int custom_getifaddrs(struct ifaddrs **ifap) {
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || !s_spoofNetwork) return res;
@@ -1443,20 +1402,20 @@ static int custom_statfs(const char *path, struct statfs *buf) {
     return modified;
 }
 - (BOOL)fileExistsAtPath:(NSString *)path {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) return NO;
+    if (s_spoofSecurity && path && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC([path UTF8String])) return NO;
     }
     return %orig;
 }
 - (BOOL)fileExistsAtPath:(NSString *)path isDirectory:(BOOL *)isDirectory {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) return NO;
+    if (s_spoofSecurity && path && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC([path UTF8String])) return NO;
     }
     return %orig;
 }
 - (NSArray<NSString *> *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError * _Nullable *)error {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) {
+    if (s_spoofSecurity && path && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC([path UTF8String])) {
             if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
             return nil;
         }
@@ -1464,8 +1423,8 @@ static int custom_statfs(const char *path, struct statfs *buf) {
     return %orig;
 }
 - (NSDictionary<NSFileAttributeKey, id> *)attributesOfItemAtPath:(NSString *)path error:(NSError * _Nullable *)error {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
-        if (!isAllowedInternalFileCaller(__builtin_return_address(0))) {
+    if (s_spoofSecurity && path && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (isHiddenPathForTargetAppC([path UTF8String])) {
             if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
             return nil;
         }
@@ -1476,13 +1435,11 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 
 %hook NSURL
 - (BOOL)checkResourceIsReachableAndReturnError:(NSError * _Nullable *)error {
-    if (s_spoofSecurity && [self isFileURL]) {
+    if (s_spoofSecurity && [self isFileURL] && isCallerAppOrSwift(__builtin_return_address(0))) {
         NSString *p = [self path];
         if (p && isHiddenPathForTargetAppC([p UTF8String])) {
-            if (!isAllowedInternalFileCaller(__builtin_return_address(0))) {
-                if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
-                return NO;
-            }
+            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
+            return NO;
         }
     }
     return %orig;
