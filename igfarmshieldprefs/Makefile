@@ -1,15 +1,17 @@
 TARGET := iphone:clang:latest:15.0
 THEOS_PACKAGE_SCHEME = rootless
 ARCHS = arm64
+WARNINGS = -Wno-error
 
 include $(THEOS)/makefiles/common.mk
 
 BUNDLE_NAME = IGFarmShieldPrefs
 
 IGFarmShieldPrefs_FILES = IGFarmRootListController.m
-IGFarmShieldPrefs_FRAMEWORKS = UIKit Foundation CoreFoundation CoreGraphics QuartzCore AVFoundation
+IGFarmShieldPrefs_FRAMEWORKS = UIKit Foundation CoreFoundation CoreGraphics QuartzCore AVFoundation SystemConfiguration
 IGFarmShieldPrefs_INSTALL_PATH = /Library/PreferenceBundles
-IGFarmShieldPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-error
+IGFarmShieldPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-error
+ADDITIONAL_CFLAGS = -Wno-error -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations
 IGFarmShieldPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/bundle.mk
