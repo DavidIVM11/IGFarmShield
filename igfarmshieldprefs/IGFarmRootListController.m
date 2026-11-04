@@ -157,6 +157,7 @@ static BOOL isTunnelInterfacePrefsName(NSString *ifName) {
             [low hasPrefix:@"wg"]);
 }
 
+// Solo escribe en disco cuando el contenido realmente cambió, acelerando la carga de 30+ contenedores
 static void writeContainerLocalPlistSafely(NSDictionary *prof) {
     if (!prof) return;
     NSString *cPath = prof[@"path"];
@@ -170,6 +171,10 @@ static void writeContainerLocalPlistSafely(NSDictionary *prof) {
         [fm createDirectoryAtPath:libDir withIntermediateDirectories:YES attributes:nil error:nil];
     }
     NSString *localPlist = [libDir stringByAppendingPathComponent:@".igshield_container.plist"];
+    NSDictionary *existing = [NSDictionary dictionaryWithContentsOfFile:localPlist];
+    if ([existing isKindOfClass:[NSDictionary class]] && [existing isEqualToDictionary:prof]) {
+        return;
+    }
     [prof writeToFile:localPlist atomically:YES];
     chmod([localPlist fileSystemRepresentation], 0644);
 }
@@ -719,14 +724,17 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     subLbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     subLbl.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
     subLbl.textColor = [UIColor secondaryLabelColor];
-    subLbl.text = @"Aislamiento 30+ Contenedores • TCP Puro • BootTime";
+    subLbl.text = @"Esquema v35 • Kill-Switch + CGNAT 4G + BootTime";
     [card addSubview:subLbl];
 
     UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 260, 18)];
     pill.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
-    if (masterOn && self.stealthCurrentlyActive) {
-        pill.textColor = self.vpnActive ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-        pill.text = [NSString stringWithFormat:@"● ESCUDO ACTIVO • TÚNEL: %@", self.vpnActive ? [self.vpnInterfaceName uppercaseString] : @"DIRECTO"];
+    if (masterOn && self.stealthCurrentlyActive && !self.vpnActive) {
+        pill.textColor = [UIColor systemRedColor];
+        pill.text = @"⛔ KILL-SWITCH ACTIVO (SIN TÚNEL UTUN)";
+    } else if (masterOn && self.stealthCurrentlyActive) {
+        pill.textColor = [UIColor systemGreenColor];
+        pill.text = [NSString stringWithFormat:@"● ESCUDO ACTIVO • TÚNEL: %@", [self.vpnInterfaceName uppercaseString]];
     } else {
         pill.textColor = [UIColor secondaryLabelColor];
         pill.text = @"○ EN PAUSA (CONTENEDOR INACTIVO)";
@@ -743,6 +751,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     chmod([STATE_PLIST fileSystemRepresentation], 0644);
 }
 
+// Fusiona los cambios en memoria sin sobrescribirlos con copias antiguas de byUUID
 - (void)syncAllContainerLocalPlists {
     BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
     BOOL igOn = [self.state[@"enableIG"] boolValue];
@@ -769,7 +778,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
             NSString *u = prof[@"containerUUID"];
             if (u.length > 0 && [byUUID[u] isKindOfClass:[NSDictionary class]]) {
-                prof = [byUUID[u] mutableCopy];
+                NSMutableDictionary *merged = [byUUID[u] mutableCopy];
+                for (NSString *k in prof) {
+                    merged[k] = prof[k];
+                }
+                prof = merged;
             }
 
             BOOL contOn = [prof[@"enabled"] boolValue];
@@ -851,16 +864,16 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     self.stealthCurrentlyActive = (activeStealthCount > 0);
 
     if (self.stealthCurrentlyActive) {
-        self.stealthSummary = [NSString stringWithFormat:@"🟢 Activo en %lu contenedor(es) — Sincronizado en Sandbox", (unsigned long)activeStealthCount];
+        self.stealthSummary = [NSString stringWithFormat:@"🟢 Activo en %lu contenedor(es) — Esquema v35 en Sandbox", (unsigned long)activeStealthCount];
     } else {
         self.stealthSummary = @"⚪ En pausa — Activa un contenedor para iniciar el aislamiento";
     }
 
     self.stealthDetailReport =
         @"Especificaciones del Subsistema v35:\n\n"
-        @"1. Enrutamiento TCP Puro + Anti-QUIC/STUN POSIX: Rechaza instantáneamente datagramas UDP hacia puertos 443/80 (HTTP/3) y STUN (3478/5349/19302+) más salidas IPv6 externas, forzando TCP puro por Shadowrocket sin romper el enlace de sockets en en0.\n\n"
-        @"2. Ocultamiento Ligero O(1) en C, Objective-C y Swift: Filtra rutas de jailbreak (/var/jb, Crane, ElleKit) mediante dladdr directo sin sobrecarga de backtrace().\n\n"
-        @"3. Identidad y BootTime Aislado en Sandbox: Cada contenedor conserva su propio IDFV de Crane, BootSessionUUID, kern.boottime y systemUptime sincronizados localmente en Library/.igshield_container.plist.";
+        @"1. Kill-Switch POSIX + Anti-QUIC/STUN: Corta cualquier salida externa si cae el túnel utun (ENETUNREACH) y rechaza datagramas UDP en puertos != 53 e IPv6 externo.\n\n"
+        @"2. Ocultamiento en C, Objective-C y Swift: Filtra rutas de jailbreak (/var/jb, Crane, ElleKit) en access, faccessat, stat, lstat, fopen, opendir, NSFileManager y NSURL sin bloquear a Crane.\n\n"
+        @"3. Identidad CGNAT 4G y BootTime Aislado: En modo móvil 4G transforma en0 en pdp_ip0 con IP CGNAT (100.64.0.0/10) y sincroniza kern.boottime / systemUptime por contenedor.";
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -1696,18 +1709,18 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         if (indexPath.row == 0) {
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            cell.imageView.image = settingsBadgeIcon(@"network", self.vpnActive ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
+            cell.imageView.image = settingsBadgeIcon(@"network", self.vpnActive ? [UIColor systemGreenColor] : [UIColor systemRedColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-            cell.textLabel.text = @"Túnel Proxy / Anti-QUIC";
+            cell.textLabel.text = @"Túnel Proxy / Kill-Switch POSIX";
             cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
             cell.detailTextLabel.text = self.vpnActive
-                ? [NSString stringWithFormat:@"Enrutado (%@) • TCP Puro (UDP 443/80, STUN e IPv6 bloqueados)", self.vpnInterfaceName]
-                : @"Sin túnel de red activo en este momento";
+                ? [NSString stringWithFormat:@"Enrutado (%@) • TCP Puro (Kill-Switch y bloqueo UDP/IPv6 activos)", self.vpnInterfaceName]
+                : @"⛔ Sin túnel activo — El Kill-Switch bloqueará tráfico en contenedores protegidos";
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
             cell.imageView.image = settingsBadgeIcon(@"eye.slash.fill", self.stealthCurrentlyActive ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-            cell.textLabel.text = @"Subsistema de Ocultamiento";
+            cell.textLabel.text = @"Subsistema de Ocultamiento v35";
             cell.detailTextLabel.textColor = self.stealthCurrentlyActive ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             cell.detailTextLabel.text = self.stealthSummary;
         }
@@ -1781,7 +1794,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     if (indexPath.section == 2 && indexPath.row == 1) {
         triggerHaptic();
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Subsistema de Ocultamiento"
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Subsistema de Ocultamiento v35"
                                                                     message:self.stealthDetailReport
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDefault handler:nil]];
@@ -1931,8 +1944,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     NSString *shortIDFV = [prof[@"idfv"] length] >= 8 ? [prof[@"idfv"] substringToIndex:8] : prof[@"idfv"];
     BOOL isCell = ![prof[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
     NSString *netDesc = isCell
-        ? [NSString stringWithFormat:@"4G: %@", prof[@"CarrierName"] ?: @"Móvil"]
-        : [NSString stringWithFormat:@"Wi-Fi (%@)", prof[@"ssid"] ?: @"LAN"];
+        ? [NSString stringWithFormat:@"4G: %@ (%@)", prof[@"CarrierName"] ?: @"Móvil", prof[@"cellularLocalIP"] ?: @"CGNAT"]
+        : [NSString stringWithFormat:@"Wi-Fi (%@)", prof[@"localIP"] ?: @"LAN"];
     int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
     if (masterOn && appOn && contOn) {
@@ -2074,7 +2087,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             cell.imageView.image = settingsBadgeIcon(@"shield.lefthalf.filled", contOn ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
             cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Activar Perfil en este Contenedor";
-            cell.detailTextLabel.text = contOn ? @"Activo (Sincronizado en Sandbox con indicador superior)" : @"En pausa (Sin perfiles inyectados)";
+            cell.detailTextLabel.text = contOn ? @"Activo (Sincronizado en Sandbox con Kill-Switch e indicador superior)" : @"En pausa (Sin perfiles inyectados)";
             cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
             UISwitch *sw = [[UISwitch alloc] init];
             sw.on = contOn;
@@ -2116,17 +2129,17 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         ];
         NSArray *titles = @[
             @"Aislamiento de Identificadores y BootTime",
-            @"Enrutamiento TCP Puro y Anti-QUIC/STUN",
+            @"Enrutamiento TCP Puro, CGNAT y Kill-Switch",
             @"Geolocalización y Zona Horaria",
             @"Simulación de Hardware Humano",
             @"Subsistema de Ocultamiento (C / ObjC / Swift)"
         ];
         NSArray *subtitles = @[
             @"Aísla IDFV de Crane, BootSessionUUID, kern.boottime y systemUptime por cuenta",
-            @"Oculta utun y bloquea UDP 443/80 (QUIC), STUN e IPv6 externo sin romper sockets locales",
+            @"Activa Kill-Switch (utun), asigna IP CGNAT 100.x.y.z en 4G y bloquea UDP/IPv6 externo",
             @"Ajusta la zona horaria (C TZ + NSTimeZone) e idioma sin duplicados en NSLocale",
             @"Simula batería, volumen, brillo y espacio libre sin alterar la identidad",
-            @"Bloquea /var/jb, Crane y ElleKit en C, Objective-C y Swift con latencia O(1)"
+            @"Bloquea /var/jb, Crane y ElleKit en C, Objective-C y Swift respetando a Crane"
         ];
         NSArray *keys = @[@"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity"];
 
@@ -2181,18 +2194,21 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             case 2: {
                 BOOL on = [self isModOn:@"spoofNetwork"];
                 BOOL isCell = ![self.profile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
-                cell.textLabel.text = @"📡 Configuración de Enrutamiento";
+                cell.textLabel.text = @"📡 Configuración de Enrutamiento y Kill-Switch";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 if (!on) {
                     cell.detailTextLabel.text = [NSString stringWithFormat:@"○ En pausa (IP LAN real: %@)", self.parentRoot.realLocalIP ?: @"LAN"];
                 } else if (isCell) {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL 4G WWAN + TCP PURO:\nOperadora:  %@ (MCC %@ / MNC %@)\nProtección: Anti-QUIC/STUN POSIX + utun oculto",
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL 4G CGNAT + KILL-SWITCH:\nOperadora:  %@ (MCC %@ / MNC %@)\nIP CGNAT (pdp_ip0): %@ • UDP/IPv6 bloqueados",
                                                  self.profile[@"CarrierName"] ?: @"T-Mobile",
                                                  self.profile[@"CarrierMCC"] ?: @"310",
-                                                 self.profile[@"CarrierMNC"] ?: @"260"];
+                                                 self.profile[@"CarrierMNC"] ?: @"260",
+                                                 self.profile[@"cellularLocalIP"] ?: @"100.72.14.88"];
                 } else {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL WI-FI RESIDENCIAL + TCP PURO:\nRouter:     %@ (%@)\nProtección: Anti-QUIC/STUN POSIX + utun oculto",
-                                                 self.profile[@"ssid"], self.profile[@"bssid"]];
+                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL WI-FI RESIDENCIAL + KILL-SWITCH:\nLAN Local (en0): %@ • SSID: %@ (%@)\nProtección: Kill-Switch utun + UDP/IPv6 bloqueados",
+                                                 self.profile[@"localIP"] ?: @"192.168.1.45",
+                                                 self.profile[@"ssid"],
+                                                 self.profile[@"bssid"]];
                 }
                 break;
             }
@@ -2212,8 +2228,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"🔋 Sensores de Comportamiento Físico";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"● TELEMETRÍA SIMULADA:\nBatería: %d%% (Descarga orgánica) • Volumen: %d%%\nBrillo:  %d%% • Almacenamiento Libre: %.2f GB",
-                       batPct, volPct, briPct, freeGB]
+                    ? [NSString stringWithFormat:@"● TELEMETRÍA SIMULADA:\nBatería: %d%% (Descarga orgánica) • Volumen: %d%%\nBrillo:  %d%% • Libre: %.2f GB • Uptime: %@",
+                       batPct, volPct, briPct, freeGB, formatBootUptimeSummary(self.profile)]
                     : [NSString stringWithFormat:@"○ En pausa (Batería real: %d%%)", self.parentRoot.realBatteryPct];
                 break;
             }
@@ -2222,7 +2238,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"🛡️ Estado de Ocultamiento (C / ObjC / Swift)";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? @"● SUBSISTEMA ACTIVO:\nProtegidos: access/faccessat/stat/lstat/fopen/opendir\nEntorno:    getenv/dyld/dladdr/NSFileManager/NSURL/Swift"
+                    ? @"● SUBSISTEMA v35 ACTIVO:\nProtegidos: access/faccessat/stat/lstat/fopen/opendir\nEntorno:    getenv/dyld/dladdr/NSFileManager/NSURL/Swift"
                     : @"○ En pausa (Hooks inactivos en este contenedor)";
                 break;
             }
@@ -2246,7 +2262,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         cell.textLabel.textColor = [UIColor systemOrangeColor];
         cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
         cell.textLabel.text = @"Simular Reinicio de Hardware (Nuevo BootUUID)";
-        cell.detailTextLabel.text = @"Rota BootSessionUUID y kern.boottime manteniendo intacto el IDFV de Crane";
+        cell.detailTextLabel.text = @"Rota BootSessionUUID, kern.boottime e IP CGNAT manteniendo intacto el IDFV de Crane";
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     }
     return cell;
@@ -2261,7 +2277,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:sender.isOn ? @"🟢 Contenedor Operativo" : @"⚪ Contenedor en Pausa"
                                                                     message:sender.isOn
-                                                                        ? [NSString stringWithFormat:@"Perfil activado y sincronizado en Sandbox para \"%@\".\n• IDFV: %@\n• BootUUID: %@\n• Uptime: %@", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"], formatBootUptimeSummary(self.profile)]
+                                                                        ? [NSString stringWithFormat:@"Perfil v35 activado y sincronizado en Sandbox para \"%@\".\n• IDFV: %@\n• BootUUID: %@\n• Uptime: %@", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"], formatBootUptimeSummary(self.profile)]
                                                                         : @"Contenedor suspendido. No se aplicarán perfiles de aislamiento."
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -2285,11 +2301,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 : @"Utilizando identificadores y tiempo de arranque nativos del sistema.";
         } else if (idx == 1) {
             BOOL isCell = ![self.profile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
-            popupTitle = sender.isOn ? @"📡 Enrutamiento TCP Puro Activo" : @"⚪ Enrutamiento Nativo";
+            popupTitle = sender.isOn ? @"📡 Enrutamiento y Kill-Switch Activos" : @"⚪ Enrutamiento Nativo";
             popupMsg = sender.isOn
                 ? (isCell
-                   ? [NSString stringWithFormat:@"Modo móvil 4G (%@) • UDP 443/80, STUN e IPv6 bloqueados en POSIX • utun oculto", self.profile[@"CarrierName"]]
-                   : [NSString stringWithFormat:@"Modo Wi-Fi (%@) • UDP 443/80, STUN e IPv6 bloqueados en POSIX • utun oculto", self.profile[@"ssid"]])
+                   ? [NSString stringWithFormat:@"Modo móvil 4G (%@) • IP CGNAT pdp_ip0: %@ • Kill-Switch y bloqueo UDP/IPv6 activos", self.profile[@"CarrierName"], self.profile[@"cellularLocalIP"]]
+                   : [NSString stringWithFormat:@"Modo Wi-Fi (%@) • LAN en0: %@ • Kill-Switch y bloqueo UDP/IPv6 activos", self.profile[@"ssid"], self.profile[@"localIP"]])
                 : @"Utilizando tablas de red nativas.";
         } else if (idx == 2) {
             popupTitle = sender.isOn ? @"🌎 Geolocalización Aplicada" : @"⚪ Geolocalización Nativa";
@@ -2306,7 +2322,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 ? [NSString stringWithFormat:@"• Batería: %d%%\n• Volumen: %d%%\n• Brillo: %d%%\n• Espacio Libre: %.2f GB", batPct, volPct, briPct, freeGB]
                 : @"Reportando métricas reales del dispositivo.";
         } else if (idx == 4) {
-            popupTitle = sender.isOn ? @"🛡️ Ocultamiento Activo" : @"⚪ Ocultamiento en Pausa";
+            popupTitle = sender.isOn ? @"🛡️ Ocultamiento v35 Activo" : @"⚪ Ocultamiento en Pausa";
             popupMsg = sender.isOn
                 ? @"Subsistema de ocultamiento C, Objective-C y Swift operando en este contenedor."
                 : @"Subsistema de ocultamiento inactivo en este contenedor.";
@@ -2363,9 +2379,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [self.tableView reloadData];
 
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔄 Reinicio de Hardware Simulado"
-                                                                message:[NSString stringWithFormat:@"Ciclo renovado en \"%@\" (IDFV de Crane intacto):\n\n• Nuevo BootUUID:\n%@\n\n• Nuevo Uptime:\n%@",
+                                                                message:[NSString stringWithFormat:@"Ciclo renovado en \"%@\" (IDFV de Crane intacto):\n\n• Nuevo BootUUID:\n%@\n\n• Nueva IP CGNAT 4G:\n%@\n\n• Nuevo Uptime:\n%@",
                                                                          self.profile[@"containerName"],
                                                                          self.profile[@"bootSessionUUID"],
+                                                                         self.profile[@"cellularLocalIP"],
                                                                          formatBootUptimeSummary(self.profile)]
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
@@ -2441,8 +2458,16 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 [self.tableView reloadData];
                 BOOL isCell = ![self.profile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
                 UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"✅ Parámetros de Red Sincronizados"
-                                                                            message:[NSString stringWithFormat:@"• Contenedor: %@\n• IP Pública: %@\n• ISP: %@\n• Perfil: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
-                                                                                     self.profile[@"containerName"], ip, ispRaw, isCell ? @"📱 Red Móvil 4G" : @"🛜 Wi-Fi Residencial", city, region, [cc uppercaseString], tz]
+                                                                            message:[NSString stringWithFormat:@"• Contenedor: %@\n• IP Pública: %@\n• ISP: %@\n• Perfil: %@\n• IP Interna: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
+                                                                                     self.profile[@"containerName"],
+                                                                                     ip,
+                                                                                     ispRaw,
+                                                                                     isCell ? @"📱 Red Móvil 4G (pdp_ip0)" : @"🛜 Wi-Fi Residencial (en0)",
+                                                                                     isCell ? (self.profile[@"cellularLocalIP"] ?: @"100.72.14.88") : (self.profile[@"localIP"] ?: @"192.168.1.45"),
+                                                                                     city,
+                                                                                     region,
+                                                                                     [cc uppercaseString],
+                                                                                     tz]
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:ac animated:YES completion:nil];
@@ -2464,10 +2489,19 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
 
         [[session dataTaskWithURL:[NSURL URLWithString:vpsUrlStr] completionHandler:^(NSData *vData, NSURLResponse *vResp, NSError *vErr) {
-            NSDictionary *vpsJson = (!vErr && vData) ? [NSJSONSerialization JSONObjectWithData:vData options:0 error:nil] : nil;
-            NSString *msj = ([vpsJson isKindOfClass:[NSDictionary class]] && vpsJson[@"mensaje_iphone"])
-                ? vpsJson[@"mensaje_iphone"]
-                : [NSString stringWithFormat:@"⚠️ El VPS no respondió en el puerto 5001 (revisa skip-proxy en Shadowrocket), pero la IP %@ (%@) quedó sincronizada localmente.", ip, ispRaw];
+            NSHTTPURLResponse *httpResp = [vResp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)vResp : nil;
+            BOOL httpOK = (!vErr && httpResp && httpResp.statusCode >= 200 && httpResp.statusCode < 300);
+            NSDictionary *vpsJson = (httpOK && vData) ? [NSJSONSerialization JSONObjectWithData:vData options:0 error:nil] : nil;
+
+            NSString *msj = nil;
+            if ([vpsJson isKindOfClass:[NSDictionary class]] && [vpsJson[@"mensaje_iphone"] isKindOfClass:[NSString class]]) {
+                msj = vpsJson[@"mensaje_iphone"];
+            } else if (httpOK) {
+                msj = [NSString stringWithFormat:@"✅ Auditoría recibida en Proxy Center.\n• IP: %@ (%@)\n• Contenedor: %@", ip, ispRaw, cName];
+            } else {
+                msj = [NSString stringWithFormat:@"⚠️ El VPS no respondió en el puerto 5001, pero la IP %@ (%@) quedó sincronizada localmente en \"%@\".", ip, ispRaw, cName];
+            }
+
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self.tableView reloadData];
                 UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Proxy Center - Auditoría" message:msj preferredStyle:UIAlertControllerStyleAlert];
