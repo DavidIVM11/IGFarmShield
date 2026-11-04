@@ -14,42 +14,23 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Dependencies & Theos (Fast Mode)
+      - name: Install Dependencies & Theos
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
           HOMEBREW_NO_INSTALL_CLEANUP: 1
           HOMEBREW_NO_ENV_HINTS: 1
         run: |
-          brew install ldid xz dpkg
-          export THEOS=~/theos
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
-          if [ ! -d "$THEOS" ]; then
-            git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
-          fi
-          rm -rf $THEOS/sdks
-          git clone --depth 1 https://github.com/theos/sdks.git $THEOS/sdks
+          brew install ldid xz dpkg || brew install xz dpkg || true
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $HOME/theos
+          if ! command -v ldid >/dev/null 2>&1; then curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macos_arm64 -o $HOME/theos/bin/ldid && chmod +x $HOME/theos/bin/ldid; fi
+          rm -rf $HOME/theos/sdks/*
+          curl -sL https://github.com/theos/sdks/archive/refs/heads/master.tar.gz | tar -xzf - -C $HOME/theos/sdks --strip-components=1
 
       - name: Generate Icon, Fix Tabs & Build DEB
         run: |
-          python3 -c '
-          for path in ["Makefile", "igfarmshieldprefs/Makefile"]:
-              with open(path, "r") as f:
-                  lines = f.readlines()
-              fixed = []
-              in_rule = False
-              for line in lines:
-                  if line.strip().endswith("::") or line.strip().endswith(":"):
-                      in_rule = True
-                      fixed.append(line)
-                  elif in_rule and (line.startswith("    ") or line.startswith("\t")):
-                      fixed.append("\t" + line.lstrip())
-                  else:
-                      if line.strip() == "":
-                          in_rule = False
-                      fixed.append(line)
-              with open(path, "w") as f:
-                  f.writelines(fixed)
-          '
+          export THEOS=$HOME/theos
+          python3 -c 'import zlib,struct; s=58; raw=b"".join(b"\x00"+b"".join(b"\xff\xff\xff\xff" if (14<=y<=44 and abs(x-29)<=(16-(y-14)*0.45 if y>26 else 16)) else b"\x00\x7a\xff\xff" for x in range(s)) for y in range(s)); c=lambda t,d: struct.pack(">I",len(d))+t+d+struct.pack(">I",zlib.crc32(t+d)&0xffffffff); p=b"\x89PNG\r\n\x1a\n"+c(b"IHDR",struct.pack(">IIBBBBB",s,s,8,6,0,0,0))+c(b"IDAT",zlib.compress(raw,9))+c(b"IEND",b""); [open(f,"wb").write(p) for f in ("igfarmshieldprefs/IGFarmShieldIcon.png","igfarmshieldprefs/IGFarmShieldIcon@2x.png","igfarmshieldprefs/IGFarmShieldIcon@3x.png")]'
+          perl -i -pe 's/^[ ]+/\t/g' Makefile igfarmshieldprefs/Makefile
           make clean
           make package FINALPACKAGE=1
 
