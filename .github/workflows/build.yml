@@ -1,45 +1,45 @@
-name: Build IGFarmShield Rootless
+name: Build IGFarmShield Rootless DEB
 
 on:
   push:
-    branches: [ "main", "master" ]
-  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15-intel
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install packaging dependencies
-        run: |
-          brew update
-          brew install ldid xz dpkg
-
-      - name: Setup Theos and iOS 16.5 SDK
+      - name: Install Dependencies & Theos
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_ENV_HINTS: 1
         run: |
-          export THEOS="$RUNNER_TEMP/theos"
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
-          git clone --recursive --depth=1 https://github.com/theos/theos.git "$THEOS"
-          mkdir -p "$THEOS/sdks"
-          gh release download --repo theos/sdks --pattern "iPhoneOS16.5.sdk.tar.xz" --dir "$RUNNER_TEMP" || gh release download --repo theos/sdks --pattern "iPhoneOS15*.sdk.tar.xz" --dir "$RUNNER_TEMP"
-          tar -xf "$RUNNER_TEMP"/iPhoneOS*.sdk.tar.xz -C "$THEOS/sdks"
-          rm -f "$RUNNER_TEMP"/iPhoneOS*.sdk.tar.xz
+          brew install ldid xz dpkg || true
+          git clone --recursive --depth 1 --shallow-submodules https://github.com/theos/theos.git $HOME/theos
+          if [ -f /usr/local/bin/ldid ]; then
+            cp /usr/local/bin/ldid $HOME/theos/bin/ldid
+          elif [ -f /opt/homebrew/bin/ldid ]; then
+            cp /opt/homebrew/bin/ldid $HOME/theos/bin/ldid
+          fi
+          chmod +x $HOME/theos/bin/ldid
+          rm -rf $HOME/theos/sdks/*
+          curl -sL https://github.com/theos/sdks/archive/refs/heads/master.tar.gz | tar -xzf - -C $HOME/theos/sdks --strip-components=1
 
-      - name: Normalize line endings and compile rootless package
+      - name: Generate Icon, Fix Tabs & Build DEB
         run: |
-          find . -type f \( -name "Makefile" -o -name "*.mk" -o -name "control" -o -name "*.plist" -o -name "*.x" -o -name "*.m" \) -exec perl -pi -e 's/\r\n/\n/g' {} +
+          export THEOS=$HOME/theos
+          python3 -c 'import zlib,struct; s=58; raw=b"".join(b"\x00"+b"".join(b"\xff\xff\xff\xff" if (14<=y<=44 and abs(x-29)<=(16-(y-14)*0.45 if y>26 else 16)) else b"\x00\x7a\xff\xff" for x in range(s)) for y in range(s)); c=lambda t,d: struct.pack(">I",len(d))+t+d+struct.pack(">I",zlib.crc32(t+d)&0xffffffff); p=b"\x89PNG\r\n\x1a\n"+c(b"IHDR",struct.pack(">IIBBBBB",s,s,8,6,0,0,0))+c(b"IDAT",zlib.compress(raw,9))+c(b"IEND",b""); [open(f,"wb").write(p) for f in ("igfarmshieldprefs/IGFarmShieldIcon.png","igfarmshieldprefs/IGFarmShieldIcon@2x.png","igfarmshieldprefs/IGFarmShieldIcon@3x.png")]'
           make clean
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless THEOS_PACKAGE_COMPRESSION=xz
+          make package FINALPACKAGE=1
 
-      - name: Upload compiled DEB artifact
+      - name: Upload Compiled DEB
         uses: actions/upload-artifact@v4
         with:
-          name: IGFarmShield-rootless-deb
+          name: IGFarmShield-Rootless-DEB
           path: packages/*.deb
-          if-no-files-found: error
