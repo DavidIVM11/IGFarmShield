@@ -28,7 +28,6 @@ extern char **environ;
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
 #define CURRENT_SCHEMA_VERSION 37
 
-// Limita el borrado a cachés temporales volátiles sin tocar WebKit ni sesiones guardadas
 static NSArray<NSString *> *residualSubdirectoriesToTrack(void) {
     return @[
         @"tmp",
@@ -37,9 +36,6 @@ static NSArray<NSString *> *residualSubdirectoriesToTrack(void) {
         @"SystemData/com.apple.SafariViewService"
     ];
 }
-
-@interface PSViewController : UIViewController
-@end
 
 @class IGFarmRootListController;
 
@@ -582,7 +578,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     }] resume];
 }
 
-@interface IGFarmRootListController : PSViewController <UITableViewDelegate, UITableViewDataSource>
+// Hereda de UIViewController e implementa los selectores de PSController para no requerir PSViewController al enlazar
+@interface IGFarmRootListController : UIViewController <UITableViewDelegate, UITableViewDataSource>
+@property (nonatomic, weak) id rootController;
+@property (nonatomic, weak) id parentController;
+@property (nonatomic, strong) id specifier;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableDictionary *state;
 @property (nonatomic, strong) NSMutableArray *igContainersList;
@@ -642,6 +642,22 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 @end
 
 @implementation IGFarmRootListController
+
+// Métodos de protocolo PSController requeridos por Preferences.app / PreferenceLoader
+- (void)handleURL:(NSDictionary *)dictionary {}
+- (BOOL)canBeShownFromSuspendedState { return YES; }
+- (void)willResignActive {}
+- (void)willBecomeActive {}
+- (void)suspend {}
+- (void)didLock {}
+- (void)willUnlock {}
+- (void)didUnlock {}
+- (void)didWake {}
+- (void)showController:(id)controller {}
+- (void)showController:(id)controller animate:(BOOL)animate {}
+- (void)statusBarWillAnimateByHeight:(double)height {}
+- (void)setPreferenceValue:(id)value specifier:(id)specifier {}
+- (id)readPreferenceValue:(id)specifier { return nil; }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -757,7 +773,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     return header;
 }
 
-// Guarda en STATE_PLIST y replica en MIRROR_STATE_PLIST para inmunidad ante el Sandbox rootless
 - (void)saveState {
     self.state[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
     [self.state writeToFile:STATE_PLIST atomically:YES];
@@ -891,7 +906,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     self.stealthDetailReport =
         @"Especificaciones del Subsistema v37:\n\n"
-        @"1. Kill-Switch IPv4 + Anti-QUIC/STUN + IP_BOUND_IF: Exige túnel utun con IPv4 real, bloquea LAN RFC1918 incluso en puerto 53, permite DNS TUN y neutraliza intentos de evasión por IP_BOUND_IF.\n\n"
+        @"1. Kill-Switch IPv4 + Anti-QUIC/STUN + IP_BOUND_IF: Exige túnel utun con IPv4 real, permite DNS (:53), bloquea LAN RFC1918/UDP externo y neutraliza intentos de evasión por IP_BOUND_IF.\n\n"
         @"2. Ocultamiento en C, dlopen, NSData, Objective-C y Swift: Filtra rutas de jailbreak (/var/jb, Crane, ElleKit) respetando las llamadas internas de Crane.\n\n"
         @"3. Carrier Sintético sin SIM, CGNAT 4G y Reloj Coherente: Inyecta CTCarrier virtual en equipos sin SIM física, transforma en0 en pdp_ip0 (100.64.0.0/10) y alinea kern.boottime, systemUptime y CLOCK_UPTIME_RAW.";
 }
@@ -1500,7 +1515,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [self syncAllContainerLocalPlists];
 }
 
-// Exige AF_INET (IPv4 real) en utun para coincidir exactamente con el Kill-Switch de Tweak.x
 - (void)calculateResidualTraces {
     self.vpnActive = NO;
     self.vpnInterfaceName = @"Inactivo";
