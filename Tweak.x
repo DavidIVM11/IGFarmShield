@@ -110,7 +110,6 @@ static void *(*orig_dlopen)(const char *, int) = NULL;
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
 static int (*orig_statfs)(const char *, struct statfs *) = NULL;
 static int (*orig_access)(const char *, int) = NULL;
 static int (*orig_faccessat)(int, const char *, int, int) = NULL;
@@ -362,7 +361,6 @@ static NSString *findCraneNameInNode(id node, NSString *targetID) {
     return nil;
 }
 
-// Prioriza siempre variables vivas de Crane antes de usar el caché local
 static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bundleID, NSDictionary *cachedLocal) {
     NSString *folderUUID = [homePath lastPathComponent] ?: @"Default";
     NSString *craneID = nil;
@@ -421,11 +419,19 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bund
             NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
             if ([cPrefs isKindOfClass:[NSDictionary class]] && [cPrefs count] > 0) {
                 if (!craneName && craneID) craneName = findCraneNameInNode(cPrefs, craneID);
+                if (!craneName && origCraneIDFV) {
+                    NSString *foundByIDFV = findCraneNameInNode(cPrefs, origCraneIDFV);
+                    if (foundByIDFV) {
+                        craneName = foundByIDFV;
+                        if (!craneID) craneID = origCraneIDFV;
+                    }
+                }
                 if (!craneName) craneName = findCraneNameInNode(cPrefs, folderUUID);
             }
         }
     }
 
+    if (!craneID && origCraneIDFV && origCraneIDFV.length >= 32) craneID = origCraneIDFV;
     if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
     if (!craneName || craneName.length == 0) {
         NSDictionary *userInfo = [meta isKindOfClass:[NSDictionary class]] ? meta[@"MCMMetadataUserInfo"] : nil;
@@ -445,8 +451,7 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bund
 
 static NSTimeInterval spoofedSystemUptime(void) {
     struct timespec tsNow;
-    int (*clkFn)(clockid_t, struct timespec *) = orig_clock_gettime ? orig_clock_gettime : clock_gettime;
-    if (clkFn(CLOCK_UPTIME_RAW, &tsNow) == 0 && s_realMonoAtLaunch > 0.0) {
+    if (clock_gettime(CLOCK_UPTIME_RAW, &tsNow) == 0 && s_realMonoAtLaunch > 0.0) {
         double monoNow = (double)tsNow.tv_sec + ((double)tsNow.tv_nsec / 1000000000.0);
         double delta = monoNow - s_realMonoAtLaunch;
         if (delta < 0.0) delta = 0.0;
@@ -482,7 +487,6 @@ static void ensureProfileLoaded(void) {
     NSString *craneID = ident[@"craneID"];
     NSString *craneName = ident[@"craneName"];
 
-    // Intenta leer GLOBAL_STATE_PLIST y cae en MIRROR_STATE_PLIST (/var/jb/Library/Application Support/...) inmune al Sandbox
     NSDictionary *loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST];
     if (![loadedGlobal isKindOfClass:[NSDictionary class]] || loadedGlobal.count == 0) {
         loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:MIRROR_STATE_PLIST];
@@ -507,8 +511,12 @@ static void ensureProfileLoaded(void) {
                 if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
                 NSString *candPath = cand[@"path"] ?: @"";
                 NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
+                NSString *candIDFV = cand[@"idfv"] ?: @"";
                 NSString *candName = cand[@"containerName"] ?: @"";
                 if ([candPath isEqualToString:homePath] ||
+                    (origCraneIDFV.length > 0 && ([existingKey caseInsensitiveCompare:origCraneIDFV] == NSOrderedSame ||
+                                                  [candCraneID caseInsensitiveCompare:origCraneIDFV] == NSOrderedSame ||
+                                                  [candIDFV caseInsensitiveCompare:origCraneIDFV] == NSOrderedSame)) ||
                     (candCraneID.length > 0 && ![candCraneID isEqualToString:@"Default"] && [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame) ||
                     (craneName.length > 0 && ![craneName isEqualToString:@"Default"] && [candName caseInsensitiveCompare:craneName] == NSOrderedSame)) {
                     settingsEntry = cand;
@@ -551,8 +559,9 @@ static void ensureProfileLoaded(void) {
     NSString *existingIDFV = ([profile[@"idfv"] isKindOfClass:[NSString class]] && [profile[@"idfv"] length] >= 32)
         ? [profile[@"idfv"] uppercaseString]
         : nil;
-    NSString *nativeCraneUUID = existingIDFV
-        ?: (([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString]);
+    NSString *nativeCraneUUID = (origCraneIDFV && origCraneIDFV.length >= 32)
+        ? origCraneIDFV
+        : (existingIDFV ?: (([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString]));
 
     if (!profile || !profile[@"bootSessionUUID"]) {
         uint64_t seed = randomSeed64(keyUUID);
@@ -668,7 +677,6 @@ static void ensureProfileLoaded(void) {
     s_spoofedBootSec = (time_t)savedBootSec;
     s_spoofedBootUsec = (suseconds_t)savedBootUsec;
 
-    // Calcula el tiempo despierto (CLOCK_UPTIME_RAW / systemUptime) siempre menor o igual que (now - kern.boottime)
     double wallSinceBoot = (double)(nowEpoch - s_spoofedBootSec);
     if (wallSinceBoot < 600.0) wallSinceBoot = 600.0;
     uint64_t ratioSeed = deterministicHash64(currentBootUUID);
@@ -767,23 +775,6 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     if (bannerShownThisSession) return;
     ensureProfileLoaded();
     if (!liveContainerProfile) return;
-
-    s_inInternalCall = YES;
-    NSUUID *liveVendorUUID = [[UIDevice currentDevice] identifierForVendor];
-    s_inInternalCall = NO;
-
-    if (liveVendorUUID) {
-        NSString *captured = [[liveVendorUUID UUIDString] uppercaseString];
-        if (captured.length >= 32) {
-            origCraneIDFV = captured;
-            if (!liveContainerProfile[@"idfv"] || [liveContainerProfile[@"idfv"] length] < 32) {
-                NSDictionary *snap = [liveContainerProfile copy];
-                liveContainerProfile[@"idfv"] = captured;
-                liveContainerProfile[@"craneOriginalIDFV"] = captured;
-                persistCurrentProfileToSandboxIfNeeded(snap);
-            }
-        }
-    }
 
     s_inInternalCall = YES;
     UIWindowScene *activeScene = nil;
@@ -1213,7 +1204,7 @@ static CFTimeZoneRef custom_CFTimeZoneCopyDefault(void) {
 %end
 
 // ============================================================================
-// CORTAFUEGOS POSIX: KILL-SWITCH IPV4, BLOQUEO RFC1918 LAN, ANTI-QUIC E IP_BOUND_IF
+// CORTAFUEGOS POSIX: KILL-SWITCH IPV4, DNS PERMITIDO, BLOQUEO LAN Y ANTI-QUIC
 // ============================================================================
 static BOOL isSocketDatagram(int sockfd) {
     int sockType = 0;
@@ -1246,18 +1237,21 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
             return ENETUNREACH;
         }
 
-        // 2. Bloquea salida hacia el router/LAN local (excluida en tun-excluded-routes) y multicast
+        // 2. Permitir consultas DNS (:53) interceptadas por el túnel de Shadowrocket
+        uint16_t dstPort = ntohs(sin.sin_port);
+        if (dstPort == 53) {
+            return 0;
+        }
+
+        // 3. Bloquear acceso a la red LAN física (RFC1918) y multicast fuera de DNS
         // Nota: 198.18.0.0/15 (Fake-IP de Shadowrocket) NO es RFC1918 y pasa limpiamente
         if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
             return EHOSTUNREACH;
         }
 
-        // 3. Bloquea QUIC (UDP 443/80), STUN y todo UDP distinto de DNS enrutado al túnel (:53)
+        // 4. Bloquear QUIC (UDP 443/80), STUN/WebRTC y cualquier otro UDP externo
         if (isSocketDatagram(sockfd)) {
-            uint16_t dstPort = ntohs(sin.sin_port);
-            if (dstPort != 53) {
-                return EHOSTUNREACH;
-            }
+            return EHOSTUNREACH;
         }
         return 0;
     }
@@ -1283,14 +1277,15 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
             if (!hasActiveUtunTunnelCached()) {
                 return ENETUNREACH;
             }
+            uint16_t dstPort = ntohs(sin6.sin6_port);
+            if (dstPort == 53) {
+                return 0;
+            }
             if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
                 return EHOSTUNREACH;
             }
             if (isSocketDatagram(sockfd)) {
-                uint16_t dstPort = ntohs(sin6.sin6_port);
-                if (dstPort != 53) {
-                    return EHOSTUNREACH;
-                }
+                return EHOSTUNREACH;
             }
             return 0;
         }
@@ -1783,27 +1778,6 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 }
 %end
 
-static int custom_clock_gettime(clockid_t clk_id, struct timespec *tp) {
-    int ret = orig_clock_gettime(clk_id, tp);
-    if (ret == 0 && tp && (s_spoofIDs || s_spoofHardware) && s_spoofedBootSec > 0 && s_realMonoAtLaunch > 0.0) {
-        if (clk_id == CLOCK_UPTIME_RAW || clk_id == CLOCK_MONOTONIC || clk_id == CLOCK_MONOTONIC_RAW) {
-            if (isCallerFromTargetAppStrict(__builtin_return_address(0))) {
-                double monoNow = (double)tp->tv_sec + ((double)tp->tv_nsec / 1000000000.0);
-                double delta = monoNow - s_realMonoAtLaunch;
-                if (delta < 0.0) delta = 0.0;
-                double totalSpoofed = s_baseAwakeUptimeSec + delta;
-                time_t secPart = (time_t)totalSpoofed;
-                long nsecPart = (long)((totalSpoofed - (double)secPart) * 1000000000.0);
-                if (nsecPart < 0L) nsecPart = 0L;
-                if (nsecPart >= 1000000000L) nsecPart = 999999999L;
-                tp->tv_sec = secPart;
-                tp->tv_nsec = nsecPart;
-            }
-        }
-    }
-    return ret;
-}
-
 static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     if (ret == 0 && name && oldlenp && liveContainerProfile && isCallerAppOrSwift(__builtin_return_address(0))) {
@@ -1866,6 +1840,15 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     MSHookFunction((void *)getenv, (void *)custom_getenv, (void **)&orig_getenv);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
+    %init;
+
+    s_inInternalCall = YES;
+    NSUUID *rawIDFV = [[UIDevice currentDevice] identifierForVendor];
+    s_inInternalCall = NO;
+    if (rawIDFV) {
+        origCraneIDFV = [[rawIDFV UUIDString] uppercaseString];
+    }
+
     ensureProfileLoaded();
 
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
@@ -1880,9 +1863,6 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
 
     void *symDlopen = dlsym(RTLD_DEFAULT, "dlopen");
     if (symDlopen) MSHookFunction(symDlopen, (void *)custom_dlopen, (void **)&orig_dlopen);
-
-    void *symClockGettime = dlsym(RTLD_DEFAULT, "clock_gettime");
-    if (symClockGettime) MSHookFunction(symClockGettime, (void *)custom_clock_gettime, (void **)&orig_clock_gettime);
 
     void *symCFTimeZoneSys = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
     if (symCFTimeZoneSys) MSHookFunction(symCFTimeZoneSys, (void *)custom_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
@@ -1922,8 +1902,6 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     if (symProxiesForURL) {
         MSHookFunction(symProxiesForURL, (void *)custom_CFNetworkCopyProxiesForURL, (void **)&orig_CFNetworkCopyProxiesForURL);
     }
-
-    %init;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         showStartupBannerAndPersistentIcon(0);
