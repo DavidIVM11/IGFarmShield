@@ -9,9 +9,10 @@ BUNDLE_NAME = IGFarmShieldPrefs
 
 IGFarmShieldPrefs_FILES = IGFarmRootListController.m
 IGFarmShieldPrefs_FRAMEWORKS = UIKit Foundation CoreFoundation CoreGraphics QuartzCore AVFoundation SystemConfiguration
+IGFarmShieldPrefs_PRIVATE_FRAMEWORKS = Preferences
 IGFarmShieldPrefs_INSTALL_PATH = /Library/PreferenceBundles
 IGFarmShieldPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-error
-IGFarmShieldPrefs_LDFLAGS = -Wl,-U,_OBJC_CLASS_$_PSViewController -Wl,-U,_OBJC_METACLASS_$_PSViewController
+IGFarmShieldPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup -Wl,-U,_OBJC_CLASS_$$_PSViewController -Wl,-U,_OBJC_METACLASS_$$_PSViewController
 
 include $(THEOS_MAKE_PATH)/bundle.mk
 
