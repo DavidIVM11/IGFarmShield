@@ -1,4 +1,4 @@
-TARGET := iphone:clang:latest:14.0
+TARGET := iphone:clang:latest:15.0
 ARCHS = arm64
 INSTALL_TARGET_PROCESSES = Instagram Reddit Preferences
 THEOS_PACKAGE_SCHEME = rootless
