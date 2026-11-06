@@ -589,7 +589,7 @@ static void ensureProfileLoaded(void) {
                             2 + (int)((seed >> 16) % 250)];
         unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
         BOOL manualEnabled = (settingsEntry && settingsEntry[@"enabled"] != nil) ? [settingsEntry[@"enabled"] boolValue] : NO;
-        NSString *initialIDFV = nativeCraneUUID ?: @"";
+        NSString *initialIDFV = nativeCraneUUID ?: [[NSUUID UUID] UUIDString];
 
         profile = [@{
             @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
@@ -818,14 +818,16 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     }
     s_inInternalCall = NO;
 
-    if (liveVendorUUID && (!liveContainerProfile[@"idfv"] || [liveContainerProfile[@"idfv"] length] < 32)) {
+    if (liveVendorUUID) {
         NSString *captured = [[liveVendorUUID UUIDString] uppercaseString];
         if (captured.length >= 32) {
-            NSDictionary *snap = [liveContainerProfile copy];
             origCraneIDFV = captured;
-            liveContainerProfile[@"idfv"] = captured;
-            liveContainerProfile[@"craneOriginalIDFV"] = captured;
-            persistCurrentProfileToSandboxIfNeeded(snap);
+            if (!liveContainerProfile[@"idfv"] || [liveContainerProfile[@"idfv"] length] < 32) {
+                NSDictionary *snap = [liveContainerProfile copy];
+                liveContainerProfile[@"idfv"] = captured;
+                liveContainerProfile[@"craneOriginalIDFV"] = captured;
+                persistCurrentProfileToSandboxIfNeeded(snap);
+            }
         }
     }
 
@@ -1228,7 +1230,7 @@ static CFTimeZoneRef custom_CFTimeZoneCopyDefault(void) {
 %end
 
 // ============================================================================
-// CORTAFUEGOS POSIX: KILL-SWITCH IPV4, BLOQUEO LAN RFC1918, DNS TUN Y ANTI-QUIC
+// CORTAFUEGOS POSIX: KILL-SWITCH IPV4, DNS TUN, BLOQUEO LAN RFC1918 Y ANTI-QUIC
 // ============================================================================
 static BOOL isSocketDatagram(int sockfd) {
     int sockType = 0;
@@ -1261,16 +1263,16 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
             return ENETUNREACH;
         }
 
-        // 2. Bloquear acceso al router/LAN física (RFC1918) y multicast incluso en puerto 53
-        // Nota: 198.18.0.0/15 (Fake-IP / DNS TUN de Shadowrocket), 1.1.1.1 y 8.8.8.8 pasan limpios
-        if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
-            return EHOSTUNREACH;
+        // 2. Permitir consultas DNS (:53) interceptadas por el túnel utun (excepto multicast)
+        uint16_t dstPort = ntohs(sin.sin_port);
+        if (dstPort == 53 && ipHost < 0xE0000000U) {
+            return 0;
         }
 
-        // 3. Permitir consultas DNS (:53) hacia IPs no-LAN interceptadas por el túnel utun
-        uint16_t dstPort = ntohs(sin.sin_port);
-        if (dstPort == 53) {
-            return 0;
+        // 3. Bloquear acceso al router/LAN física (RFC1918) y multicast fuera de DNS
+        // Nota: 198.18.0.0/15 (Fake-IP de Shadowrocket) NO es RFC1918 y pasa limpiamente
+        if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
+            return EHOSTUNREACH;
         }
 
         // 4. Bloquear QUIC (UDP 443/80), STUN/WebRTC y cualquier otro UDP externo
@@ -1301,12 +1303,12 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
             if (!hasActiveUtunTunnelCached()) {
                 return ENETUNREACH;
             }
+            uint16_t dstPort = ntohs(sin6.sin6_port);
+            if (dstPort == 53 && ipHost < 0xE0000000U) {
+                return 0;
+            }
             if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
                 return EHOSTUNREACH;
-            }
-            uint16_t dstPort = ntohs(sin6.sin6_port);
-            if (dstPort == 53) {
-                return 0;
             }
             if (isSocketDatagram(sockfd)) {
                 return EHOSTUNREACH;
@@ -1891,6 +1893,15 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     MSHookFunction((void *)getenv, (void *)custom_getenv, (void **)&orig_getenv);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
+    %init;
+
+    s_inInternalCall = YES;
+    NSUUID *rawIDFV = [[UIDevice currentDevice] identifierForVendor];
+    s_inInternalCall = NO;
+    if (rawIDFV) {
+        origCraneIDFV = [[rawIDFV UUIDString] uppercaseString];
+    }
+
     ensureProfileLoaded();
 
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
@@ -1947,8 +1958,6 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     if (symProxiesForURL) {
         MSHookFunction(symProxiesForURL, (void *)custom_CFNetworkCopyProxiesForURL, (void **)&orig_CFNetworkCopyProxiesForURL);
     }
-
-    %init;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         showStartupBannerAndPersistentIcon(0);
