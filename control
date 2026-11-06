@@ -1,8 +1,8 @@
 Package: com.ivm.igfarmshield
 Name: IGFarmShield
-Version: 2.1.0
+Version: 2.2.0
 Architecture: iphoneos-arm64
-Description: Aislamiento de huella digital y red por contenedor Crane para Instagram y Reddit.
+Description: Aislamiento integral de huella digital, CGNAT 4G y Kill-Switch POSIX por contenedor Crane para Instagram y Reddit.
 Maintainer: IVM
 Author: IVM
 Section: Tweaks
