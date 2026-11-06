@@ -1,295 +1,332 @@
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <QuartzCore/QuartzCore.h>
+#import <CFNetwork/CFNetwork.h>
+#import <CoreTelephony/CTCarrier.h>
+#import <CoreTelephony/CTTelephonyNetworkInfo.h>
+#import <SystemConfiguration/SystemConfiguration.h>
+#import <SystemConfiguration/CaptiveNetwork.h>
 #import <AVFoundation/AVFoundation.h>
 #import <sys/types.h>
 #import <sys/socket.h>
 #import <sys/time.h>
 #import <netinet/in.h>
-#import <ifaddrs.h>
 #import <arpa/inet.h>
+#import <ifaddrs.h>
 #import <net/if.h>
 #import <sys/sysctl.h>
+#import <sys/mount.h>
 #import <sys/stat.h>
+#import <dirent.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <errno.h>
+#import <stddef.h>
+#import <mach-o/dyld.h>
+#import <dlfcn.h>
 #import <string.h>
+#import <strings.h>
+#import <stdlib.h>
+#import <stdio.h>
 #import <time.h>
-#import <spawn.h>
 
-extern char **environ;
+#if __has_include(<substrate.h>)
+#import <substrate.h>
+#else
+extern void MSHookFunction(void *symbol, void *replace, void **result);
+#endif
 
-#define STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
+#ifndef IP_BOUND_IF
+#define IP_BOUND_IF 25
+#endif
+
+#ifndef IPV6_BOUND_IF
+#define IPV6_BOUND_IF 125
+#endif
+
+#ifndef CLOCK_UPTIME_RAW
+#define CLOCK_UPTIME_RAW 8
+#endif
+
+#define GLOBAL_STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
+#define MIRROR_STATE_PLIST @"/var/jb/Library/Application Support/IGFarmShield/state_mirror.plist"
 #define CRANE_PREFS_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_PREFS_VAR @"/var/mobile/Library/Preferences/com.opa334.craneprefs.plist"
 #define CRANE_MAIN_JB @"/var/jb/var/mobile/Library/Preferences/com.opa334.crane.plist"
 #define CRANE_MAIN_VAR @"/var/mobile/Library/Preferences/com.opa334.crane.plist"
-#define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
-#define CURRENT_SCHEMA_VERSION 36
+#define CURRENT_SCHEMA_VERSION 37
 
-static NSArray<NSString *> *residualSubdirectoriesToTrack(void) {
-    return @[
-        @"tmp",
-        @"Library/Caches",
-        @"Library/WebKit",
-        @"Library/Saved Application State",
-        @"Library/SplashBoard/Snapshots",
-        @"Library/Logs",
-        @"SystemData/com.apple.SafariViewService"
-    ];
-}
-
-@interface PSViewController : UIViewController
+@interface NSMutableURLRequest (HTTP3Disable)
+- (void)setAssumesHTTP3Capable:(BOOL)capable;
+- (BOOL)assumesHTTP3Capable;
 @end
 
-@class IGFarmRootListController;
+@interface _UIStatusBarLocalOverlayWindow : UIWindow
+@end
 
-static UIImage *settingsBadgeIcon(NSString *symbolName, UIColor *bgColor) {
-    static NSMutableDictionary *iconCache = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ iconCache = [NSMutableDictionary dictionary]; });
+@implementation _UIStatusBarLocalOverlayWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    return nil;
+}
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    return NO;
+}
+@end
 
-    NSString *cacheKey = [NSString stringWithFormat:@"%@_%@", symbolName, bgColor.description];
-    if (iconCache[cacheKey]) return iconCache[cacheKey];
+static NSString *origCraneIDFV = nil;
+static NSMutableDictionary *liveContainerProfile = nil;
+static CTCarrier *s_syntheticCarrier = nil;
+static NSTimeInterval sessionStartTimestamp = 0;
+static double s_realMonoAtLaunch = 0.0;
+static double s_baseAwakeUptimeSec = 3600.0;
+static BOOL bannerShownThisSession = NO;
+static _UIStatusBarLocalOverlayWindow *persistentBadgeWindow = nil;
+static UILabel *persistentBadgePill = nil;
+static dispatch_source_t s_tunnelWatchdogTimer = nil;
+static int s_lastRenderedBadgeState = -1;
 
-    CGSize size = CGSizeMake(29, 29);
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size];
-    UIImage *img = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
-        UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, 29, 29) cornerRadius:6.5];
-        [bgColor setFill];
-        [path fill];
+// Banderas O(1) en RAM para latencia cero con 30+ contenedores
+static BOOL s_profileInitialized = NO;
+static BOOL s_shieldActive = NO;
+static BOOL s_spoofIDs = NO;
+static BOOL s_spoofNetwork = NO;
+static BOOL s_spoofLocation = NO;
+static BOOL s_spoofHardware = NO;
+static BOOL s_spoofSecurity = NO;
+static BOOL s_isCellularMode = YES;
+static in_addr_t s_spoofedLanAddr = 0;
+static in_addr_t s_spoofedLanMask = 0;
+static in_addr_t s_spoofedLanBcast = 0;
+static in_addr_t s_spoofedCellularAddr = 0;
+static time_t s_spoofedBootSec = 0;
+static suseconds_t s_spoofedBootUsec = 0;
+static char s_containerHomePath[PATH_MAX] = {0};
+static size_t s_containerHomeLen = 0;
+static __thread BOOL s_inInternalCall = NO;
 
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15.5 weight:UIImageSymbolWeightSemibold];
-        UIImage *sym = [[UIImage systemImageNamed:symbolName withConfiguration:cfg] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
-        if (sym) {
-            CGRect r = CGRectMake((29.0 - sym.size.width) / 2.0, (29.0 - sym.size.height) / 2.0, sym.size.width, sym.size.height);
-            [sym drawInRect:r];
-        }
-    }];
+static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
+static void *(*orig_dlopen)(const char *, int) = NULL;
+static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
+static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
+static int (*orig_statfs)(const char *, struct statfs *) = NULL;
+static int (*orig_access)(const char *, int) = NULL;
+static int (*orig_faccessat)(int, const char *, int, int) = NULL;
+static int (*orig_stat)(const char *, struct stat *) = NULL;
+static int (*orig_lstat)(const char *, struct stat *) = NULL;
+static FILE *(*orig_fopen)(const char *, const char *) = NULL;
+static DIR *(*orig_opendir)(const char *) = NULL;
+static char *(*orig_getenv)(const char *) = NULL;
+static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
+static int (*orig_bind)(int, const struct sockaddr *, socklen_t) = NULL;
+static int (*orig_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
+static int (*orig_connect)(int, const struct sockaddr *, socklen_t) = NULL;
+static ssize_t (*orig_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t) = NULL;
+static ssize_t (*orig_sendmsg)(int, const struct msghdr *, int) = NULL;
+static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
+static Boolean (*orig_SCNetworkReachabilityGetFlags)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *) = NULL;
+static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
+static CFArrayRef (*orig_CFNetworkCopyProxiesForURL)(CFURLRef, CFDictionaryRef) = NULL;
+static CFTimeZoneRef (*orig_CFTimeZoneCopySystem)(void) = NULL;
+static CFTimeZoneRef (*orig_CFTimeZoneCopyDefault)(void) = NULL;
 
-    if (img) iconCache[cacheKey] = img;
-    return img;
+static BOOL containsIgnoreCaseC(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !*needle) return NO;
+    size_t nLen = strlen(needle);
+    for (const char *p = haystack; *p != '\0'; p++) {
+        if (strncasecmp(p, needle, nLen) == 0) return YES;
+    }
+    return NO;
 }
 
-static void triggerHaptic(void) {
-    UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-    [gen prepare];
-    [gen impactOccurred];
-}
-
-static uint64_t randomSeedPrefs64(NSString *input) {
+static uint64_t deterministicHash64(NSString *salt) {
     uint64_t hash = 14695981039346656037ULL;
-    const char *bytes = [input UTF8String];
+    const char *bytes = [salt UTF8String];
     if (bytes) {
         while (*bytes) {
             hash ^= (uint8_t)(*bytes++);
             hash *= 1099511628211ULL;
         }
     }
+    return hash;
+}
+
+static uint64_t randomSeed64(NSString *salt) {
+    uint64_t hash = deterministicHash64(salt);
     uint64_t r = 0;
     arc4random_buf(&r, sizeof(r));
     return hash ^ r;
 }
 
-static NSString *generateCellularCGNATAddress(NSString *salt) {
-    uint64_t cSeed = randomSeedPrefs64(salt ?: @"cgnat");
-    return [NSString stringWithFormat:@"100.%d.%d.%d",
-            64 + (int)(cSeed % 60),
-            1 + (int)((cSeed >> 8) % 250),
-            2 + (int)((cSeed >> 16) % 250)];
-}
-
-static void assignSpoofedBootTimeToProfile(NSMutableDictionary *prof, BOOL recentReboot) {
-    if (!prof) return;
-    NSString *bootUUID = prof[@"bootSessionUUID"] ?: [[NSUUID UUID] UUIDString];
-    prof[@"bootSessionUUID"] = bootUUID;
-
-    uint64_t bSeed = randomSeedPrefs64(bootUUID);
-    time_t nowEpoch = time(NULL);
-    long long offsetSec = recentReboot
-        ? (900LL + (long long)(bSeed % 9900ULL))
-        : (21600LL + (long long)(bSeed % 669600ULL));
-
-    long long bootSec = (long long)nowEpoch - offsetSec;
-    int bootUsec = (int)((bSeed >> 12) % 999999ULL);
-
-    prof[@"spoofedBootEpoch"] = @(bootSec);
-    prof[@"spoofedBootUsec"] = @(bootUsec);
-    prof[@"lastBootUUIDForTime"] = bootUUID;
-}
-
-static NSString *formatBootUptimeSummary(NSDictionary *prof) {
-    if (!prof) return @"N/A";
-    long long bootSec = [prof[@"spoofedBootEpoch"] longLongValue];
-    time_t nowEpoch = time(NULL);
-    if (bootSec <= 0 || bootSec >= nowEpoch) {
-        return @"Sincronizando al abrir contenedor";
+static void applyLowLevelCTimeZone(NSString *tzName) {
+    if (!tzName || [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "] || tzName.length == 0) return;
+    BOOL prev = s_inInternalCall;
+    s_inInternalCall = YES;
+    setenv("TZ", [tzName UTF8String], 1);
+    tzset();
+    NSTimeZone *tzObj = [NSTimeZone timeZoneWithName:tzName];
+    if (tzObj) {
+        [NSTimeZone setDefaultTimeZone:tzObj];
     }
-    long long diff = (long long)nowEpoch - bootSec;
-    long long days = diff / 86400LL;
-    long long hours = (diff % 86400LL) / 3600LL;
-    long long mins = (diff % 3600LL) / 60LL;
-
-    NSDate *bootDate = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)bootSec];
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    fmt.dateFormat = @"yyyy-MM-dd HH:mm";
-    NSString *dateStr = [fmt stringFromDate:bootDate];
-
-    if (days > 0) {
-        return [NSString stringWithFormat:@"%lldd %lldh %lldm (%@)", days, hours, mins, dateStr];
-    }
-    return [NSString stringWithFormat:@"%lldh %lldm (%@)", hours, mins, dateStr];
+    s_inInternalCall = prev;
 }
 
-static void killAppProcess(NSString *procName) {
-    pid_t pid;
-    const char *args[] = {"/var/jb/usr/bin/killall", "-9", [procName UTF8String], NULL};
-    posix_spawn(&pid, args[0], NULL, NULL, (char *const *)args, environ);
-}
-
-static BOOL isTunnelInterfacePrefsName(NSString *ifName) {
+static BOOL isTunnelInterfaceNameC(const char *ifName) {
     if (!ifName) return NO;
-    NSString *low = [ifName lowercaseString];
-    return ([low hasPrefix:@"utun"] ||
-            [low hasPrefix:@"ppp"] ||
-            [low hasPrefix:@"ipsec"] ||
-            [low hasPrefix:@"tun"] ||
-            [low hasPrefix:@"tap"] ||
-            [low hasPrefix:@"wg"]);
+    return (strncmp(ifName, "utun", 4) == 0 ||
+            strncmp(ifName, "ppp", 3) == 0 ||
+            strncmp(ifName, "ipsec", 5) == 0 ||
+            strncmp(ifName, "tun", 3) == 0 ||
+            strncmp(ifName, "tap", 3) == 0 ||
+            strncmp(ifName, "wg", 2) == 0);
 }
 
-// Escritura diferencial para 30+ contenedores: solo toca disco si el perfil cambió realmente
-static void writeContainerLocalPlistSafely(NSDictionary *prof) {
-    if (!prof) return;
-    NSString *cPath = prof[@"path"];
-    if (![cPath isKindOfClass:[NSString class]] || cPath.length == 0) return;
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:cPath]) return;
-
-    NSString *libDir = [cPath stringByAppendingPathComponent:@"Library"];
-    if (![fm fileExistsAtPath:libDir]) {
-        [fm createDirectoryAtPath:libDir withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-    NSString *localPlist = [libDir stringByAppendingPathComponent:@".igshield_container.plist"];
-    NSDictionary *existing = [NSDictionary dictionaryWithContentsOfFile:localPlist];
-    if ([existing isKindOfClass:[NSDictionary class]] && [existing isEqualToDictionary:prof]) {
-        return;
-    }
-    [prof writeToFile:localPlist atomically:YES];
-    chmod([localPlist fileSystemRepresentation], 0644);
+static BOOL isSecondaryWifiInterfaceNameC(const char *ifName) {
+    if (!ifName) return NO;
+    return (strncmp(ifName, "awdl", 4) == 0 ||
+            strncmp(ifName, "llw", 3) == 0 ||
+            strncmp(ifName, "ap", 2) == 0 ||
+            strncmp(ifName, "bridge", 6) == 0);
 }
 
-static void parseCraneAppSubtree(id node, NSMutableDictionary *outContainers) {
-    if (!node || !outContainers) return;
-    if ([node isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *dict = (NSDictionary *)node;
-
-        for (NSString *ak in @[@"activeContainer", @"selectedContainer", @"currentContainer", @"activeContainerIdentifier", @"active", @"defaultContainer", @"selected"]) {
-            if ([dict[ak] isKindOfClass:[NSString class]] && [dict[ak] length] > 0) {
-                outContainers[@"__ACTIVE_ID__"] = dict[ak];
+// Exige una dirección IPv4 real en utun para ignorar los utun0/1/2 IPv6 link-local permanentes de iOS
+static BOOL hasActiveUtunTunnelLive(void) {
+    struct ifaddrs *interfaces = NULL;
+    int (*fn)(struct ifaddrs **) = orig_getifaddrs ? orig_getifaddrs : getifaddrs;
+    if (fn(&interfaces) != 0 || !interfaces) return NO;
+    BOOL found = NO;
+    for (struct ifaddrs *cur = interfaces; cur != NULL; cur = cur->ifa_next) {
+        if (cur->ifa_name && (cur->ifa_flags & IFF_UP) && isTunnelInterfaceNameC(cur->ifa_name)) {
+            if (cur->ifa_addr && cur->ifa_addr->sa_family == AF_INET) {
+                struct sockaddr_in sin;
+                memcpy(&sin, cur->ifa_addr, sizeof(sin));
+                if (sin.sin_addr.s_addr != 0) {
+                    found = YES;
+                    break;
+                }
             }
         }
+    }
+    freeifaddrs(interfaces);
+    return found;
+}
 
-        NSString *cID = nil;
-        NSString *cName = nil;
-        for (NSString *ik in @[@"identifier", @"id", @"UUID", @"uuid", @"containerIdentifier", @"craneIdentifier"]) {
-            if ([dict[ik] isKindOfClass:[NSString class]] && [dict[ik] length] > 0) { cID = dict[ik]; break; }
-        }
-        for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
-            if ([dict[nk] isKindOfClass:[NSString class]] && [dict[nk] length] > 0) { cName = dict[nk]; break; }
-        }
-        if (cID && cName) {
-            outContainers[[cID lowercaseString]] = @{@"id": cID, @"name": cName};
-        } else if (!cID && cName) {
-            outContainers[[cName lowercaseString]] = @{@"id": cName, @"name": cName};
-        }
+static BOOL hasActiveUtunTunnelCached(void) {
+    static BOOL s_cachedUp = NO;
+    static CFAbsoluteTime s_lastCheck = 0;
 
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if ((now - s_lastCheck) < 0.8) {
+        return s_cachedUp;
+    }
+    s_lastCheck = now;
+    s_cachedUp = hasActiveUtunTunnelLive();
+    return s_cachedUp;
+}
+
+static BOOL isCallerExemptInfrastructure(const void *retAddr) {
+    if (s_inInternalCall) return YES;
+    if (!retAddr || !orig_dladdr) return NO;
+    Dl_info info;
+    if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
+        if (containsIgnoreCaseC(info.dli_fname, "IGFarmShield") ||
+            containsIgnoreCaseC(info.dli_fname, "crane") ||
+            containsIgnoreCaseC(info.dli_fname, "ellekit") ||
+            containsIgnoreCaseC(info.dli_fname, "MobileSubstrate") ||
+            containsIgnoreCaseC(info.dli_fname, "Substitute") ||
+            containsIgnoreCaseC(info.dli_fname, "Choicy") ||
+            strstr(info.dli_fname, "/usr/lib/dyld") != NULL) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL isCallerFromTargetAppStrict(const void *retAddr) {
+    if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
+    Dl_info info;
+    if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
+        if (isCallerExemptInfrastructure(retAddr) ||
+            strstr(info.dli_fname, "CFNetwork") != NULL ||
+            strstr(info.dli_fname, "libnetwork") != NULL ||
+            strstr(info.dli_fname, "libswiftNetwork") != NULL) {
+            return NO;
+        }
+        if (containsIgnoreCaseC(info.dli_fname, "/containers/bundle/application/")) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL isCallerAppOrSwift(const void *retAddr) {
+    if (s_inInternalCall || !retAddr || !orig_dladdr) return NO;
+    Dl_info info;
+    if (orig_dladdr(retAddr, &info) != 0 && info.dli_fname) {
+        if (isCallerExemptInfrastructure(retAddr) ||
+            strstr(info.dli_fname, "CFNetwork") != NULL ||
+            strstr(info.dli_fname, "libnetwork") != NULL ||
+            strstr(info.dli_fname, "libswiftNetwork") != NULL ||
+            strstr(info.dli_fname, "SystemConfiguration") != NULL ||
+            strstr(info.dli_fname, "libsystem_c.dylib") != NULL) {
+            return NO;
+        }
+        if (containsIgnoreCaseC(info.dli_fname, "/containers/bundle/application/") ||
+            strstr(info.dli_fname, "libswift") != NULL) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void persistCurrentProfileToSandboxIfNeeded(NSDictionary *previousDiskSnapshot) {
+    if (!liveContainerProfile || s_containerHomeLen == 0) return;
+    if (previousDiskSnapshot && [previousDiskSnapshot isEqualToDictionary:liveContainerProfile]) return;
+
+    BOOL prev = s_inInternalCall;
+    s_inInternalCall = YES;
+    NSString *homePath = [NSString stringWithUTF8String:s_containerHomePath];
+    if (homePath.length > 0) {
+        NSString *libDir = [homePath stringByAppendingPathComponent:@"Library"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:libDir]) {
+            [fm createDirectoryAtPath:libDir withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+        NSString *localPlist = [libDir stringByAppendingPathComponent:@".igshield_container.plist"];
+        [liveContainerProfile writeToFile:localPlist atomically:YES];
+    }
+    s_inInternalCall = prev;
+}
+
+static void searchNestedMetadata(id node, NSString **outID, NSString **outName, NSString *bundleID) {
+    if (!node) return;
+    if ([node isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)node;
         for (id k in dict) {
-            NSString *kStr = [k description];
+            NSString *kl = [[k description] lowercaseString];
             id val = dict[k];
-            if ([val isKindOfClass:[NSDictionary class]]) {
-                NSDictionary *sub = (NSDictionary *)val;
-                NSString *subName = nil;
-                for (NSString *nk in @[@"name", @"displayName", @"label", @"title", @"containerName"]) {
-                    if ([sub[nk] isKindOfClass:[NSString class]] && [sub[nk] length] > 0) {
-                        subName = sub[nk];
-                        break;
-                    }
-                }
-                if (subName) {
-                    NSString *subID = kStr;
-                    for (NSString *ik in @[@"identifier", @"id", @"UUID", @"uuid", @"containerIdentifier", @"craneIdentifier"]) {
-                        if ([sub[ik] isKindOfClass:[NSString class]] && [sub[ik] length] > 0) {
-                            subID = sub[ik];
-                            break;
-                        }
-                    }
-                    outContainers[[subID lowercaseString]] = @{@"id": subID, @"name": subName};
-                } else {
-                    parseCraneAppSubtree(val, outContainers);
-                }
-            } else if ([val isKindOfClass:[NSArray class]]) {
-                parseCraneAppSubtree(val, outContainers);
-            } else if ([val isKindOfClass:[NSString class]]) {
+            if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
                 NSString *vStr = (NSString *)val;
-                NSString *kLow = [kStr lowercaseString];
-                BOOL isMetaKey = ([kLow containsString:@"active"] ||
-                                  [kLow containsString:@"selected"] ||
-                                  [kLow containsString:@"default"] ||
-                                  [kLow containsString:@"bundle"] ||
-                                  [kLow containsString:@"version"] ||
-                                  [kLow containsString:@"identifier"] ||
-                                  [kLow containsString:@"path"]);
-                if (!isMetaKey && vStr.length > 0 && vStr.length < 50 && ![vStr containsString:@"/"] && ![vStr hasPrefix:@"com."]) {
-                    outContainers[kLow] = @{@"id": kStr, @"name": vStr};
-                }
-            }
-        }
-    } else if ([node isKindOfClass:[NSArray class]]) {
-        for (id item in (NSArray *)node) {
-            if ([item isKindOfClass:[NSString class]]) {
-                NSString *s = (NSString *)item;
-                if (s.length > 0 && s.length < 50 && ![s containsString:@"/"]) {
-                    outContainers[[s lowercaseString]] = @{@"id": s, @"name": s};
-                }
-            } else {
-                parseCraneAppSubtree(item, outContainers);
-            }
-        }
-    }
-}
-
-static void extractCraneConfigForBundle(id node, NSString *bundleID, NSMutableDictionary *outContainers) {
-    if (!node || !bundleID || !outContainers) return;
-    if ([node isKindOfClass:[NSDictionary class]]) {
-        NSDictionary *dict = (NSDictionary *)node;
-        for (NSString *bk in @[@"bundleIdentifier", @"appIdentifier", @"bundleID", @"MCMMetadataIdentifier"]) {
-            if ([dict[bk] isKindOfClass:[NSString class]] && [dict[bk] caseInsensitiveCompare:bundleID] == NSOrderedSame) {
-                parseCraneAppSubtree(dict, outContainers);
-                return;
-            }
-        }
-        for (id k in dict) {
-            NSString *kStr = [k description];
-            id val = dict[k];
-            if ([kStr rangeOfString:bundleID options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                if ([val isKindOfClass:[NSString class]] && [(NSString *)val length] > 0) {
-                    outContainers[@"__ACTIVE_ID__"] = val;
-                } else {
-                    parseCraneAppSubtree(val, outContainers);
+                if ([kl containsString:@"name"] || [kl containsString:@"label"] || [kl containsString:@"title"]) {
+                    if (!*outName) *outName = vStr;
+                } else if (([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"] || [kl containsString:@"uuid"]) &&
+                           ![vStr isEqualToString:bundleID] && ![vStr hasPrefix:@"com."]) {
+                    if (!*outID) *outID = vStr;
                 }
             } else if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
-                extractCraneConfigForBundle(val, bundleID, outContainers);
+                searchNestedMetadata(val, outID, outName, bundleID);
             }
         }
     } else if ([node isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)node) {
-            extractCraneConfigForBundle(item, bundleID, outContainers);
+            searchNestedMetadata(item, outID, outName, bundleID);
         }
     }
 }
 
-static NSString *findCraneNameByID(id node, NSString *targetID) {
+static NSString *findCraneNameInNode(id node, NSString *targetID) {
     if (!node || !targetID || targetID.length == 0) return nil;
     if ([node isKindOfClass:[NSDictionary class]]) {
         NSDictionary *dict = (NSDictionary *)node;
@@ -312,804 +349,213 @@ static NSString *findCraneNameByID(id node, NSString *targetID) {
                 }
             }
             if ([val isKindOfClass:[NSDictionary class]] || [val isKindOfClass:[NSArray class]]) {
-                NSString *found = findCraneNameByID(val, targetID);
+                NSString *found = findCraneNameInNode(val, targetID);
                 if (found) return found;
             }
         }
     } else if ([node isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)node) {
-            NSString *found = findCraneNameByID(item, targetID);
+            NSString *found = findCraneNameInNode(item, targetID);
             if (found) return found;
         }
     }
     return nil;
 }
 
-static void accumulateDirectoryCacheUsage(NSString *dirPath, unsigned long long *outBytes, NSUInteger *outFiles) {
-    if (!dirPath || dirPath.length == 0) return;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    if (![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) return;
+// Prioriza siempre variables vivas de Crane antes de usar el caché local
+static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bundleID, NSDictionary *cachedLocal) {
+    NSString *folderUUID = [homePath lastPathComponent] ?: @"Default";
+    NSString *craneID = nil;
+    NSString *craneName = nil;
 
-    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:dirPath];
-    NSString *relPath = nil;
-    while ((relPath = [enumerator nextObject])) {
-        NSString *fullPath = [dirPath stringByAppendingPathComponent:relPath];
-        struct stat st;
-        if (lstat([fullPath fileSystemRepresentation], &st) == 0) {
-            if (S_ISREG(st.st_mode)) {
-                if (outBytes) *outBytes += (unsigned long long)st.st_size;
-                if (outFiles) (*outFiles)++;
-            }
+    const char *envName = orig_getenv ? orig_getenv("CRANE_CONTAINER_NAME") : getenv("CRANE_CONTAINER_NAME");
+    const char *envID = orig_getenv ? orig_getenv("CRANE_CONTAINER_ID") : getenv("CRANE_CONTAINER_ID");
+    const char *envIdent = orig_getenv ? orig_getenv("CRANE_IDENTIFIER") : getenv("CRANE_IDENTIFIER");
+
+    if (envName && strlen(envName) > 0) craneName = [NSString stringWithUTF8String:envName];
+    if (envID && strlen(envID) > 0) craneID = [NSString stringWithUTF8String:envID];
+    if (envIdent && strlen(envIdent) > 0 && !craneID) craneID = [NSString stringWithUTF8String:envIdent];
+
+    if (craneID.length > 0 && craneName.length > 0) {
+        return @{
+            @"keyUUID": folderUUID,
+            @"craneID": craneID,
+            @"craneName": craneName
+        };
+    }
+
+    if ([cachedLocal isKindOfClass:[NSDictionary class]]) {
+        NSString *savedCID = cachedLocal[@"craneIdentifier"];
+        NSString *savedCName = cachedLocal[@"containerName"];
+        if (!craneID && [savedCID isKindOfClass:[NSString class]] && savedCID.length > 0) {
+            craneID = savedCID;
         }
-    }
-}
-
-static void purgeDirectoryCacheContents(NSString *dirPath, unsigned long long *freedBytes, NSUInteger *freedFiles) {
-    if (!dirPath || dirPath.length == 0) return;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    if (![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) return;
-
-    accumulateDirectoryCacheUsage(dirPath, freedBytes, freedFiles);
-    NSArray *topItems = [fm contentsOfDirectoryAtPath:dirPath error:nil];
-    for (NSString *item in topItems) {
-        NSString *full = [dirPath stringByAppendingPathComponent:item];
-        [fm removeItemAtPath:full error:nil];
-    }
-}
-
-static NSArray<NSString *> *collectAllPhysicalContainerPaths(NSArray *igList, NSArray *rdList, NSArray *hiddenIDs) {
-    NSMutableSet<NSString *> *uniquePaths = [NSMutableSet set];
-    NSMutableSet<NSString *> *hiddenSet = [NSMutableSet set];
-    for (NSString *h in hiddenIDs ?: @[]) {
-        if ([h isKindOfClass:[NSString class]]) [hiddenSet addObject:[h lowercaseString]];
-    }
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    for (NSArray *list in @[igList ?: @[], rdList ?: @[]]) {
-        for (NSDictionary *prof in list) {
-            NSString *cPath = prof[@"path"];
-            if ([cPath isKindOfClass:[NSString class]] && cPath.length > 0 && [fm fileExistsAtPath:cPath]) {
-                [uniquePaths addObject:cPath];
-            }
+        if (!craneName && [savedCName isKindOfClass:[NSString class]] && savedCName.length > 0 &&
+            ![savedCName isEqualToString:folderUUID]) {
+            craneName = savedCName;
+        }
+        if (craneID.length > 0 && craneName.length > 0) {
+            return @{
+                @"keyUUID": folderUUID,
+                @"craneID": craneID,
+                @"craneName": craneName
+            };
         }
     }
 
-    NSString *appsDir = @"/var/mobile/Containers/Data/Application";
-    NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
-    for (NSString *folderUUID in uuids) {
-        if ([hiddenSet containsObject:[folderUUID lowercaseString]]) continue;
-        NSString *fullPath = [appsDir stringByAppendingPathComponent:folderUUID];
-        NSString *metaPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-        NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
-        if (![meta isKindOfClass:[NSDictionary class]]) continue;
-        NSString *mcmID = meta[@"MCMMetadataIdentifier"] ?: @"";
-        if ([mcmID caseInsensitiveCompare:@"com.burbn.instagram"] == NSOrderedSame ||
-            [mcmID caseInsensitiveCompare:@"com.reddit.Reddit"] == NSOrderedSame) {
-            [uniquePaths addObject:fullPath];
+    NSString *metaPath = [homePath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+    NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
+    if ([meta isKindOfClass:[NSDictionary class]]) {
+        for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
+            if (!craneName && [meta[rk] isKindOfClass:[NSString class]] && [meta[rk] length] > 0) craneName = meta[rk];
         }
+        for (NSString *ik in @[@"com.opa334.crane.container.identifier", @"com.opa334.crane.container.id", @"craneContainerIdentifier"]) {
+            if (!craneID && [meta[ik] isKindOfClass:[NSString class]] && [meta[ik] length] > 0) craneID = meta[ik];
+        }
+        NSDictionary *userInfo = meta[@"MCMMetadataUserInfo"];
+        if (userInfo) searchNestedMetadata(userInfo, &craneID, &craneName, bundleID);
     }
 
-    return [uniquePaths allObjects];
-}
-
-static void inspectPasteboardUsage(NSUInteger *outItemCount, unsigned long long *outBytes) {
-    UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    NSArray *items = pb.items;
-    NSUInteger count = items.count;
-    unsigned long long bytes = 0;
-
-    for (NSDictionary<NSString *, id> *dict in items) {
-        if (![dict isKindOfClass:[NSDictionary class]]) continue;
-        for (NSString *typeKey in dict) {
-            id val = dict[typeKey];
-            if ([val isKindOfClass:[NSData class]]) {
-                bytes += [(NSData *)val length];
-            } else if ([val isKindOfClass:[NSString class]]) {
-                bytes += [(NSString *)val lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-            } else if ([val isKindOfClass:[NSURL class]]) {
-                bytes += [[(NSURL *)val absoluteString] lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-            } else if ([val isKindOfClass:[UIImage class]]) {
-                UIImage *img = (UIImage *)val;
-                if (img.CGImage) {
-                    bytes += (unsigned long long)(CGImageGetHeight(img.CGImage) * CGImageGetBytesPerRow(img.CGImage));
-                } else {
-                    NSData *imgData = UIImagePNGRepresentation(img);
-                    bytes += imgData.length;
-                }
+    if (!craneName) {
+        for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_MAIN_JB, CRANE_PREFS_VAR, CRANE_MAIN_VAR]) {
+            NSDictionary *cPrefs = [NSDictionary dictionaryWithContentsOfFile:pPath];
+            if ([cPrefs isKindOfClass:[NSDictionary class]] && [cPrefs count] > 0) {
+                if (!craneName && craneID) craneName = findCraneNameInNode(cPrefs, craneID);
+                if (!craneName) craneName = findCraneNameInNode(cPrefs, folderUUID);
             }
         }
     }
 
-    if (bytes == 0 && (pb.hasStrings || pb.hasURLs || pb.hasImages)) {
-        if (pb.string.length > 0) {
-            if (count == 0) count = 1;
-            bytes += [pb.string lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
-        }
-        if (pb.image && pb.image.CGImage) {
-            if (count == 0) count = 1;
-            bytes += (unsigned long long)(CGImageGetHeight(pb.image.CGImage) * CGImageGetBytesPerRow(pb.image.CGImage));
-        }
-    }
-
-    if (outItemCount) *outItemCount = count;
-    if (outBytes) *outBytes = bytes;
-}
-
-static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip, NSString *ispRaw, NSString *cc, NSString *city, NSString *region, NSString *tz, BOOL isMobileFlag) {
-    if (!prof) return;
-    NSString *ispUp = [ispRaw ?: @"" uppercaseString];
-    NSString *ccLow = [cc ?: @"us" lowercaseString];
-
-    prof[@"locationAnchored"] = @YES;
-    prof[@"lastSyncedIP"] = ip ?: @"";
-    prof[@"ispName"] = ispRaw ?: @"ISP";
-    prof[@"cityCountry"] = [NSString stringWithFormat:@"%@, %@ (%@)", city ?: @"", region ?: @"", [ccLow uppercaseString]];
-    prof[@"timeZone"] = tz ?: @"America/New_York";
-    prof[@"localeID"] = [NSString stringWithFormat:@"en_%@", [ccLow uppercaseString]];
-
-    BOOL isMobileCarrier = isMobileFlag ||
-                           [ispUp containsString:@"T-MOBILE"] ||
-                           [ispUp containsString:@"AT&T"] ||
-                           [ispUp containsString:@"VERIZON"] ||
-                           [ispUp containsString:@"METRO"] ||
-                           [ispUp containsString:@"MINT"] ||
-                           [ispUp containsString:@"CRICKET"] ||
-                           [ispUp containsString:@"VISIBLE"] ||
-                           [ispUp containsString:@"VODAFONE"] ||
-                           [ispUp containsString:@"MOVISTAR"] ||
-                           [ispUp containsString:@"ORANGE"] ||
-                           [ispUp containsString:@"O2"] ||
-                           [ispUp containsString:@"THREE"] ||
-                           [ispUp containsString:@"TELCEL"] ||
-                           [ispUp containsString:@"ROGERS"] ||
-                           [ispUp containsString:@"BELL"] ||
-                           [ispUp containsString:@"CELL"] ||
-                           [ispUp containsString:@"MOBILE"] ||
-                           [ispUp containsString:@"WIRELESS"];
-
-    if ([ispUp containsString:@"T-MOBILE"] || [ispUp containsString:@"METRO"] || [ispUp containsString:@"MINT"]) {
-        prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"T-Mobile";
-        prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"260"; prof[@"CarrierISO"] = ccLow;
-    } else if ([ispUp containsString:@"AT&T"] || [ispUp containsString:@"CRICKET"]) {
-        prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"AT&T";
-        prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"410"; prof[@"CarrierISO"] = ccLow;
-    } else if ([ispUp containsString:@"VERIZON"] || [ispUp containsString:@"VISIBLE"]) {
-        prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = @"Verizon";
-        prof[@"CarrierMCC"] = @"311"; prof[@"CarrierMNC"] = @"480"; prof[@"CarrierISO"] = ccLow;
-    } else if (isMobileCarrier) {
-        prof[@"CarrierMode"] = @"CELLULAR"; prof[@"CarrierName"] = ispRaw ?: @"LTE";
-        prof[@"CarrierMCC"] = @"310"; prof[@"CarrierMNC"] = @"260"; prof[@"CarrierISO"] = ccLow;
-    } else {
-        prof[@"CarrierMode"] = @"WIFI_ONLY"; prof[@"CarrierName"] = ispRaw ?: @"Wi-Fi";
-        prof[@"CarrierMCC"] = @""; prof[@"CarrierMNC"] = @""; prof[@"CarrierISO"] = ccLow;
-    }
-}
-
-static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index, void (^completion)(NSDictionary *parsed, NSError *error)) {
-    if (index >= urls.count) {
-        if (completion) completion(nil, [NSError errorWithDomain:@"IGFarmShield" code:-1 userInfo:nil]);
-        return;
-    }
-
-    NSURL *url = [NSURL URLWithString:urls[index]];
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    cfg.URLCache = nil;
-    cfg.HTTPCookieStorage = nil;
-    cfg.timeoutIntervalForRequest = 10.0;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X)" forHTTPHeaderField:@"User-Agent"];
-
-    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if (!data || err) {
-            fetchLiveIPFromEndpoints(urls, index + 1, completion);
-            return;
-        }
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (![json isKindOfClass:[NSDictionary class]]) {
-            fetchLiveIPFromEndpoints(urls, index + 1, completion);
-            return;
-        }
-
-        NSString *ip = nil;
-        NSString *isp = nil;
-        NSString *cc = nil;
-        NSString *city = nil;
-        NSString *region = nil;
-        NSString *tz = nil;
-        BOOL isMobile = NO;
-
-        if (json[@"ip"] && [json[@"success"] boolValue]) {
-            ip = json[@"ip"];
-            NSDictionary *conn = [json[@"connection"] isKindOfClass:[NSDictionary class]] ? json[@"connection"] : @{};
-            NSDictionary *tzD = [json[@"timezone"] isKindOfClass:[NSDictionary class]] ? json[@"timezone"] : @{};
-            isp = conn[@"isp"] ?: (conn[@"org"] ?: @"ISP");
-            cc = json[@"country_code"];
-            city = json[@"city"];
-            region = json[@"region"];
-            tz = tzD[@"id"];
-        } else if (json[@"ip"] && json[@"country_code"] && !json[@"error"]) {
-            ip = json[@"ip"];
-            isp = json[@"org"] ?: @"ISP";
-            cc = json[@"country_code"];
-            city = json[@"city"];
-            region = json[@"region"];
-            tz = json[@"timezone"];
-        } else if (json[@"ip"] && json[@"country"] && json[@"timezone"]) {
-            ip = json[@"ip"];
-            isp = json[@"org"] ?: @"ISP";
-            cc = json[@"country"];
-            city = json[@"city"];
-            region = json[@"region"];
-            tz = json[@"timezone"];
-        } else if (json[@"ipAddress"] && json[@"countryCode"]) {
-            ip = json[@"ipAddress"];
-            isp = json[@"asnOrganization"] ?: @"ISP";
-            cc = json[@"countryCode"];
-            city = json[@"cityName"];
-            region = json[@"regionName"];
-            NSArray *tzArr = [json[@"timeZones"] isKindOfClass:[NSArray class]] ? json[@"timeZones"] : nil;
-            tz = (tzArr && tzArr.count > 0) ? tzArr.firstObject : @"America/New_York";
-        } else if ([json[@"status"] isEqualToString:@"success"] && json[@"query"]) {
-            ip = json[@"query"];
-            isp = json[@"isp"] ?: @"ISP";
-            cc = json[@"countryCode"];
-            city = json[@"city"];
-            region = json[@"regionName"];
-            tz = json[@"timezone"];
-            isMobile = [json[@"mobile"] boolValue];
-        }
-
-        if (ip && ip.length > 0 && tz && tz.length > 0) {
-            if (completion) {
-                completion(@{
-                    @"ip": ip,
-                    @"isp": isp ?: @"ISP",
-                    @"cc": [cc ?: @"us" lowercaseString],
-                    @"city": city ?: @"",
-                    @"region": region ?: @"",
-                    @"tz": tz ?: @"America/New_York",
-                    @"mobile": @(isMobile)
-                }, nil);
-            }
+    if (!craneID) craneID = meta[@"MCMMetadataUUID"] ?: folderUUID;
+    if (!craneName || craneName.length == 0) {
+        NSDictionary *userInfo = [meta isKindOfClass:[NSDictionary class]] ? meta[@"MCMMetadataUserInfo"] : nil;
+        if ((!userInfo || [userInfo count] == 0) || [craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
+            craneName = @"Default";
         } else {
-            fetchLiveIPFromEndpoints(urls, index + 1, completion);
-        }
-    }] resume];
-}
-
-@interface IGFarmRootListController : PSViewController <UITableViewDelegate, UITableViewDataSource>
-@property (nonatomic, strong) UITableView *tableView;
-@property (nonatomic, strong) NSMutableDictionary *state;
-@property (nonatomic, strong) NSMutableArray *igContainersList;
-@property (nonatomic, strong) NSMutableArray *redditContainersList;
-@property (nonatomic, assign) BOOL vpnActive;
-@property (nonatomic, strong) NSString *vpnInterfaceName;
-@property (nonatomic, strong) NSString *realLocalIP;
-@property (nonatomic, strong) NSString *realFreeDisk;
-@property (nonatomic, assign) int realBatteryPct;
-@property (nonatomic, assign) int realVolumePct;
-@property (nonatomic, assign) BOOL stealthCurrentlyActive;
-@property (nonatomic, strong) NSString *stealthSummary;
-@property (nonatomic, strong) NSString *stealthDetailReport;
-@property (nonatomic, strong) NSString *residualSummary;
-- (void)saveState;
-- (void)syncAllContainerLocalPlists;
-- (UIView *)buildHeaderBannerView;
-- (void)auditStealthEngineStatus;
-- (void)scanAndSyncAllContainers;
-- (void)calculateResidualTraces;
-- (void)cleanResidualTracesAndKillApps:(BOOL)showPopup;
-- (void)toggleRootSwitch:(UISwitch *)sender;
-- (NSString *)enforceExclusiveModeWhenToggledOn;
-- (void)deduplicateActiveIfMultiple;
-- (NSMutableDictionary *)profileForUUID:(NSString *)uuid;
-- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path allowEnableDefault:(BOOL)allowEnable saveNow:(BOOL)saveNow;
-- (void)saveProfile:(NSMutableDictionary *)profile forUUID:(NSString *)uuid saveNow:(BOOL)saveNow;
-- (void)setContainer:(NSString *)targetUUID enabled:(BOOL)enabled inBundle:(NSString *)bundleID;
-- (void)purgeGhostContainerFromTweak:(NSDictionary *)prof;
-@end
-
-@interface IGFarmAppContainersController : PSViewController <UITableViewDelegate, UITableViewDataSource>
-@property (nonatomic, strong) NSString *bundleID;
-@property (nonatomic, strong) NSString *appTitle;
-@property (nonatomic, strong) NSString *appStateKey;
-@property (nonatomic, strong) NSMutableArray *containers;
-@property (nonatomic, weak) IGFarmRootListController *parentRoot;
-@property (nonatomic, strong) UITableView *tableView;
-- (void)refreshFromCrane:(UIRefreshControl *)rc;
-- (void)toggleAppMaster:(UISwitch *)sender;
-- (void)toggleContainerRowSwitch:(UISwitch *)sender;
-@end
-
-@interface IGFarmContainerDetailController : PSViewController <UITableViewDelegate, UITableViewDataSource>
-@property (nonatomic, strong) NSString *bundleID;
-@property (nonatomic, strong) NSString *containerUUID;
-@property (nonatomic, strong) NSMutableDictionary *profile;
-@property (nonatomic, weak) IGFarmRootListController *parentRoot;
-@property (nonatomic, strong) UITableView *tableView;
-- (void)saveCurrentProfile;
-- (BOOL)isModOn:(NSString *)key;
-- (void)toggleSwitch:(UISwitch *)sender;
-- (void)refreshPurePhoneTelemetryValuesOnly;
-- (void)refreshPurePhoneTelemetryWithPopup;
-- (void)rotateBootUUIDWithPopup;
-- (void)syncWithLiveIPAndAuditVPS:(BOOL)sendToVPS;
-@end
-
-@implementation IGFarmRootListController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"IGFarmShield";
-
-    NSDictionary *loaded = [NSDictionary dictionaryWithContentsOfFile:STATE_PLIST];
-    self.state = loaded ? [loaded mutableCopy] : [NSMutableDictionary dictionary];
-
-    if (!self.state[@"schemaVersion"]) {
-        self.state[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
-        self.state[@"masterEnabled"] = @NO;
-        self.state[@"exclusiveMode"] = @NO;
-        self.state[@"enableIG"] = @NO;
-        self.state[@"enableReddit"] = @NO;
-    }
-
-    if (!self.state[@"masterEnabled"]) self.state[@"masterEnabled"] = @NO;
-    if (!self.state[@"exclusiveMode"]) self.state[@"exclusiveMode"] = @NO;
-    if (!self.state[@"enableIG"]) self.state[@"enableIG"] = @NO;
-    if (!self.state[@"enableReddit"]) self.state[@"enableReddit"] = @NO;
-    if (![self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]) {
-        self.state[@"containersByUUID"] = [NSMutableDictionary dictionary];
-    }
-    if (![self.state[@"hiddenContainerIDs"] isKindOfClass:[NSArray class]]) {
-        self.state[@"hiddenContainerIDs"] = @[];
-    }
-
-    self.igContainersList = [NSMutableArray array];
-    self.redditContainersList = [NSMutableArray array];
-    [self saveState];
-
-    self.residualSummary = @"Calculando caché acumulada y portapapeles...";
-
-    self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
-    self.tableView.delegate = self;
-    self.tableView.dataSource = self;
-    self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 64.0;
-    self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.tableView.tableHeaderView = [self buildHeaderBannerView];
-    [self.view addSubview:self.tableView];
-}
-
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    NSDictionary *loaded = [NSDictionary dictionaryWithContentsOfFile:STATE_PLIST];
-    if (loaded) self.state = [loaded mutableCopy];
-    [self calculateResidualTraces];
-    [self scanAndSyncAllContainers];
-    [self auditStealthEngineStatus];
-    self.tableView.tableHeaderView = [self buildHeaderBannerView];
-    [self.tableView reloadData];
-}
-
-- (UIView *)buildHeaderBannerView {
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 108)];
-    header.backgroundColor = [UIColor clearColor];
-
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(16, 12, self.view.bounds.size.width - 32, 86)];
-    card.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    card.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-    card.layer.cornerRadius = 14.0;
-    card.clipsToBounds = YES;
-
-    BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
-    BOOL ksAlert = (masterOn && self.stealthCurrentlyActive && !self.vpnActive);
-
-    UIImageView *shieldView = [[UIImageView alloc] initWithFrame:CGRectMake(16, 18, 50, 50)];
-    shieldView.backgroundColor = ksAlert
-        ? [UIColor systemRedColor]
-        : ((masterOn && self.stealthCurrentlyActive) ? [UIColor systemBlueColor] : [UIColor systemGrayColor]);
-    shieldView.layer.cornerRadius = 12.0;
-    shieldView.contentMode = UIViewContentModeCenter;
-    UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:26 weight:UIImageSymbolWeightBold];
-    NSString *iconName = ksAlert ? @"xmark.shield.fill" : @"checkmark.shield.fill";
-    shieldView.image = [[UIImage systemImageNamed:iconName withConfiguration:symCfg] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
-    [card addSubview:shieldView];
-
-    UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(78, 16, card.bounds.size.width - 90, 22)];
-    titleLbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    titleLbl.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
-    titleLbl.text = @"IGFarmShield";
-    [card addSubview:titleLbl];
-
-    UILabel *subLbl = [[UILabel alloc] initWithFrame:CGRectMake(78, 38, card.bounds.size.width - 90, 16)];
-    subLbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    subLbl.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
-    subLbl.textColor = [UIColor secondaryLabelColor];
-    subLbl.text = @"Escalable 30+ Contenedores • CGNAT 4G • TCP Puro";
-    [card addSubview:subLbl];
-
-    UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 260, 18)];
-    pill.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
-    if (ksAlert) {
-        pill.textColor = [UIColor systemRedColor];
-        pill.text = @"⛔ KILL-SWITCH ACTIVO (ENCIENDE SHADOWROCKET)";
-    } else if (masterOn && self.stealthCurrentlyActive) {
-        pill.textColor = [UIColor systemGreenColor];
-        pill.text = [NSString stringWithFormat:@"● ESCUDO ACTIVO • TÚNEL: %@", [self.vpnInterfaceName uppercaseString]];
-    } else {
-        pill.textColor = [UIColor secondaryLabelColor];
-        pill.text = @"○ EN PAUSA (ACTIVA UN CONTENEDOR)";
-    }
-    [card addSubview:pill];
-
-    [header addSubview:card];
-    return header;
-}
-
-- (void)saveState {
-    self.state[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
-    [self.state writeToFile:STATE_PLIST atomically:YES];
-    chmod([STATE_PLIST fileSystemRepresentation], 0644);
-}
-
-- (void)syncAllContainerLocalPlists {
-    BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
-    BOOL igOn = [self.state[@"enableIG"] boolValue];
-    BOOL rdOn = [self.state[@"enableReddit"] boolValue];
-
-    NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
-        ? [self.state[@"containersByUUID"] mutableCopy]
-        : [NSMutableDictionary dictionary];
-
-    NSArray *groups = @[
-        @[@(igOn), self.igContainersList ?: @[]],
-        @[@(rdOn), self.redditContainersList ?: @[]]
-    ];
-
-    for (NSArray *grp in groups) {
-        BOOL appOn = [grp[0] boolValue];
-        NSMutableArray *list = grp[1];
-        if (![list isKindOfClass:[NSMutableArray class]]) continue;
-        for (NSUInteger i = 0; i < list.count; i++) {
-            NSMutableDictionary *prof = [list[i] isKindOfClass:[NSMutableDictionary class]]
-                ? list[i]
-                : [list[i] mutableCopy];
-            if (!prof) continue;
-
-            NSString *u = prof[@"containerUUID"];
-            if (u.length > 0 && [byUUID[u] isKindOfClass:[NSDictionary class]]) {
-                NSMutableDictionary *merged = [byUUID[u] mutableCopy];
-                for (NSString *k in prof) {
-                    merged[k] = prof[k];
-                }
-                prof = merged;
-            }
-
-            BOOL contOn = [prof[@"enabled"] boolValue];
-            prof[@"masterEnabled"] = @(masterOn);
-            prof[@"appEnabled"] = @(appOn);
-            prof[@"effectiveShieldActive"] = @(masterOn && appOn && contOn);
-            prof[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
-            list[i] = prof;
-            if (u.length > 0) {
-                byUUID[u] = prof;
-            }
-            writeContainerLocalPlistSafely(prof);
+            craneName = craneID;
         }
     }
 
-    self.state[@"containersByUUID"] = byUUID;
-    [self saveState];
+    return @{
+        @"keyUUID": folderUUID,
+        @"craneID": craneID ?: @"Default",
+        @"craneName": craneName ?: @"Default"
+    };
 }
 
-- (void)purgeGhostContainerFromTweak:(NSDictionary *)prof {
-    if (!prof) return;
-    NSString *uuid = prof[@"containerUUID"] ?: @"";
-    NSString *craneID = prof[@"craneIdentifier"] ?: @"";
-    NSString *cName = prof[@"containerName"] ?: @"";
-    NSString *cPath = prof[@"path"] ?: @"";
-    NSString *bundleID = prof[@"bundleID"] ?: @"";
-
-    killAppProcess([bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (cPath.length > 0 && [fm fileExistsAtPath:cPath]) {
-        NSString *localPlist = [cPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
-        [fm removeItemAtPath:localPlist error:nil];
-        for (NSString *sub in residualSubdirectoriesToTrack()) {
-            purgeDirectoryCacheContents([cPath stringByAppendingPathComponent:sub], NULL, NULL);
-        }
+static NSTimeInterval spoofedSystemUptime(void) {
+    struct timespec tsNow;
+    int (*clkFn)(clockid_t, struct timespec *) = orig_clock_gettime ? orig_clock_gettime : clock_gettime;
+    if (clkFn(CLOCK_UPTIME_RAW, &tsNow) == 0 && s_realMonoAtLaunch > 0.0) {
+        double monoNow = (double)tsNow.tv_sec + ((double)tsNow.tv_nsec / 1000000000.0);
+        double delta = monoNow - s_realMonoAtLaunch;
+        if (delta < 0.0) delta = 0.0;
+        return s_baseAwakeUptimeSec + delta;
     }
-
-    NSMutableArray *hidden = [self.state[@"hiddenContainerIDs"] isKindOfClass:[NSArray class]]
-        ? [self.state[@"hiddenContainerIDs"] mutableCopy]
-        : [NSMutableArray array];
-    if (uuid.length > 0 && ![hidden containsObject:[uuid lowercaseString]]) [hidden addObject:[uuid lowercaseString]];
-    if (craneID.length > 0 && ![hidden containsObject:[craneID lowercaseString]]) [hidden addObject:[craneID lowercaseString]];
-    if (cName.length > 0 && [cName caseInsensitiveCompare:@"Default"] != NSOrderedSame && ![hidden containsObject:[cName lowercaseString]]) {
-        [hidden addObject:[cName lowercaseString]];
-    }
-    self.state[@"hiddenContainerIDs"] = hidden;
-
-    NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
-        ? [self.state[@"containersByUUID"] mutableCopy]
-        : [NSMutableDictionary dictionary];
-    if (uuid.length > 0) [byUUID removeObjectForKey:uuid];
-    if (craneID.length > 0) [byUUID removeObjectForKey:craneID];
-    self.state[@"containersByUUID"] = byUUID;
-    [self saveState];
+    return s_baseAwakeUptimeSec;
 }
 
-- (void)auditStealthEngineStatus {
-    BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
-    BOOL igOn = [self.state[@"enableIG"] boolValue];
-    BOOL rdOn = [self.state[@"enableReddit"] boolValue];
+static void ensureProfileLoaded(void) {
+    if (s_profileInitialized || s_inInternalCall) return;
+    s_inInternalCall = YES;
+    s_profileInitialized = YES;
 
-    NSUInteger activeStealthCount = 0;
-    if (masterOn && igOn) {
-        for (NSDictionary *p in self.igContainersList) {
-            BOOL contEnabled = [p[@"enabled"] boolValue];
-            BOOL secEnabled = (p[@"spoofSecurity"] == nil) ? YES : [p[@"spoofSecurity"] boolValue];
-            if (contEnabled && secEnabled) activeStealthCount++;
-        }
-    }
-    if (masterOn && rdOn) {
-        for (NSDictionary *p in self.redditContainersList) {
-            BOOL contEnabled = [p[@"enabled"] boolValue];
-            BOOL secEnabled = (p[@"spoofSecurity"] == nil) ? YES : [p[@"spoofSecurity"] boolValue];
-            if (contEnabled && secEnabled) activeStealthCount++;
-        }
+    sessionStartTimestamp = [[NSDate date] timeIntervalSince1970];
+    struct timespec tsInit;
+    if (clock_gettime(CLOCK_UPTIME_RAW, &tsInit) == 0) {
+        s_realMonoAtLaunch = (double)tsInit.tv_sec + ((double)tsInit.tv_nsec / 1000000000.0);
     }
 
-    self.stealthCurrentlyActive = (activeStealthCount > 0);
-
-    if (self.stealthCurrentlyActive) {
-        self.stealthSummary = [NSString stringWithFormat:@"🟢 Activo en %lu contenedor(es) — Carga O(1) en Sandbox", (unsigned long)activeStealthCount];
-    } else {
-        self.stealthSummary = @"⚪ En pausa — Activa un contenedor para iniciar el aislamiento";
+    NSString *homePath = NSHomeDirectory();
+    if (homePath.length > 0) {
+        strncpy(s_containerHomePath, [homePath UTF8String], sizeof(s_containerHomePath) - 1);
+        s_containerHomePath[sizeof(s_containerHomePath) - 1] = '\0';
+        s_containerHomeLen = strlen(s_containerHomePath);
     }
 
-    self.stealthDetailReport =
-        @"Arquitectura Optimizada (30+ Contenedores):\n\n"
-        @"1. Sincronización Autónoma O(1): Guarda el estado efectivo dentro de Library/.igshield_container.plist de cada contenedor para lectura instantánea sin bloqueos de Sandbox.\n\n"
-        @"2. Login Limpio sobre socks5h: Rechaza QUIC/UDP externo e IPv6 en 0ms a nivel POSIX y presenta interfaz pdp_ip0 (CGNAT 100.x.y.z) + WWAN coherente con tu proxy móvil.\n\n"
-        @"3. Kill-Switch + BootTime Aislado: Bloquea salidas si cae Shadowrocket y asigna un kern.boottime / systemUptime independiente a cada cuenta.";
-}
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.burbn.instagram";
+    NSString *localPlist = [homePath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
+    NSDictionary *diskLoaded = [NSDictionary dictionaryWithContentsOfFile:localPlist];
 
-- (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
-    if (!uuid) return nil;
-    NSDictionary *byUUID = self.state[@"containersByUUID"];
-    if ([byUUID isKindOfClass:[NSDictionary class]] && [byUUID[uuid] isKindOfClass:[NSDictionary class]]) {
-        return [byUUID[uuid] mutableCopy];
+    NSDictionary *ident = resolveCraneIdentityDict(homePath, bundleID, diskLoaded);
+    NSString *keyUUID = ident[@"keyUUID"];
+    NSString *craneID = ident[@"craneID"];
+    NSString *craneName = ident[@"craneName"];
+
+    // Intenta leer GLOBAL_STATE_PLIST y cae en MIRROR_STATE_PLIST (/var/jb/Library/Application Support/...) inmune al Sandbox
+    NSDictionary *loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST];
+    if (![loadedGlobal isKindOfClass:[NSDictionary class]] || loadedGlobal.count == 0) {
+        loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:MIRROR_STATE_PLIST];
     }
-    return nil;
-}
+    BOOL canReadGlobalPlist = ([loadedGlobal isKindOfClass:[NSDictionary class]] && loadedGlobal.count > 0);
+    NSDictionary *byUUID = (canReadGlobalPlist && [loadedGlobal[@"containersByUUID"] isKindOfClass:[NSDictionary class]])
+        ? loadedGlobal[@"containersByUUID"]
+        : nil;
 
-- (void)saveProfile:(NSMutableDictionary *)profile forUUID:(NSString *)uuid saveNow:(BOOL)saveNow {
-    if (!uuid || uuid.length == 0 || !profile) return;
-    profile[@"containerUUID"] = uuid;
-    profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
+    NSDictionary *activeMap = (canReadGlobalPlist && [loadedGlobal[@"activeInCrane"] isKindOfClass:[NSDictionary class]])
+        ? loadedGlobal[@"activeInCrane"]
+        : @{};
+    NSString *craneActiveIDForApp = activeMap[bundleID];
 
-    BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
-    NSString *bID = profile[@"bundleID"] ?: @"com.burbn.instagram";
-    BOOL appOn = [bID isEqualToString:@"com.burbn.instagram"]
-        ? [self.state[@"enableIG"] boolValue]
-        : [self.state[@"enableReddit"] boolValue];
-    BOOL contOn = [profile[@"enabled"] boolValue];
-    profile[@"masterEnabled"] = @(masterOn);
-    profile[@"appEnabled"] = @(appOn);
-    profile[@"effectiveShieldActive"] = @(masterOn && appOn && contOn);
-
-    for (NSMutableArray *list in @[self.igContainersList ?: @[], self.redditContainersList ?: @[]]) {
-        if (![list isKindOfClass:[NSMutableArray class]]) continue;
-        for (NSUInteger i = 0; i < list.count; i++) {
-            NSDictionary *item = list[i];
-            if ([item[@"containerUUID"] isEqualToString:uuid]) {
-                list[i] = profile;
-                break;
-            }
-        }
-    }
-
-    NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
-        ? [self.state[@"containersByUUID"] mutableCopy]
-        : [NSMutableDictionary dictionary];
-    byUUID[uuid] = profile;
-    self.state[@"containersByUUID"] = byUUID;
-
-    if (saveNow) {
-        [self saveState];
-        writeContainerLocalPlistSafely(profile);
-    }
-}
-
-- (void)deduplicateActiveIfMultiple {
-    NSDictionary *activeMap = self.state[@"activeInCrane"];
-    for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
-        BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
-        NSMutableArray *list = isIG ? self.igContainersList : self.redditContainersList;
-
-        NSMutableArray *enabledList = [NSMutableArray array];
-        for (NSMutableDictionary *p in list) {
-            if ([p[@"enabled"] boolValue]) [enabledList addObject:p];
-        }
-        if (enabledList.count <= 1) continue;
-
-        NSString *preferredID = activeMap[bID];
-        NSString *chosenUUID = nil;
-        for (NSMutableDictionary *p in enabledList) {
-            if (preferredID &&
-                ([p[@"containerUUID"] caseInsensitiveCompare:preferredID] == NSOrderedSame ||
-                 [p[@"craneIdentifier"] caseInsensitiveCompare:preferredID] == NSOrderedSame ||
-                 [p[@"containerName"] caseInsensitiveCompare:preferredID] == NSOrderedSame)) {
-                chosenUUID = p[@"containerUUID"];
-                break;
-            }
-        }
-        if (!chosenUUID) {
-            chosenUUID = enabledList.firstObject[@"containerUUID"];
-        }
-
-        for (NSMutableDictionary *p in list) {
-            NSString *u = p[@"containerUUID"];
-            BOOL keepOn = [u isEqualToString:chosenUUID];
-            p[@"enabled"] = @(keepOn);
-            [self saveProfile:p forUUID:u saveNow:NO];
-        }
-    }
-}
-
-- (NSString *)enforceExclusiveModeWhenToggledOn {
-    NSDictionary *activeMap = self.state[@"activeInCrane"];
-    NSMutableArray *keptNames = [NSMutableArray array];
-
-    for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
-        BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
-        NSMutableArray *list = isIG ? self.igContainersList : self.redditContainersList;
-        if (list.count == 0) continue;
-
-        NSString *preferredID = activeMap[bID];
-        NSString *chosenUUID = nil;
-
-        for (NSMutableDictionary *p in list) {
-            if ([p[@"enabled"] boolValue] && preferredID &&
-                ([p[@"containerUUID"] caseInsensitiveCompare:preferredID] == NSOrderedSame ||
-                 [p[@"craneIdentifier"] caseInsensitiveCompare:preferredID] == NSOrderedSame ||
-                 [p[@"containerName"] caseInsensitiveCompare:preferredID] == NSOrderedSame)) {
-                chosenUUID = p[@"containerUUID"];
-                break;
-            }
-        }
-        if (!chosenUUID) {
-            for (NSMutableDictionary *p in list) {
-                if ([p[@"enabled"] boolValue]) {
-                    chosenUUID = p[@"containerUUID"];
+    NSDictionary *settingsEntry = nil;
+    if (byUUID) {
+        if ([byUUID[keyUUID] isKindOfClass:[NSDictionary class]]) {
+            settingsEntry = byUUID[keyUUID];
+        } else {
+            for (NSString *existingKey in byUUID) {
+                NSDictionary *cand = byUUID[existingKey];
+                if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
+                NSString *candPath = cand[@"path"] ?: @"";
+                NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
+                NSString *candName = cand[@"containerName"] ?: @"";
+                if ([candPath isEqualToString:homePath] ||
+                    (candCraneID.length > 0 && ![candCraneID isEqualToString:@"Default"] && [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame) ||
+                    (craneName.length > 0 && ![craneName isEqualToString:@"Default"] && [candName caseInsensitiveCompare:craneName] == NSOrderedSame)) {
+                    settingsEntry = cand;
                     break;
                 }
             }
-        }
-        if (!chosenUUID) {
-            [keptNames addObject:[NSString stringWithFormat:@"%@: Ninguno (En pausa)", isIG ? @"IG" : @"Reddit"]];
-            continue;
-        }
-
-        for (NSMutableDictionary *p in list) {
-            NSString *u = p[@"containerUUID"];
-            BOOL keepOn = [u isEqualToString:chosenUUID];
-            p[@"enabled"] = @(keepOn);
-            [self saveProfile:p forUUID:u saveNow:NO];
-            if (keepOn) {
-                [keptNames addObject:[NSString stringWithFormat:@"%@: %@", isIG ? @"IG" : @"Reddit", p[@"containerName"] ?: @"Default"]];
+            if (!settingsEntry && craneActiveIDForApp.length > 0) {
+                for (NSString *existingKey in byUUID) {
+                    NSDictionary *cand = byUUID[existingKey];
+                    if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID]) continue;
+                    NSString *candPath = cand[@"path"] ?: @"";
+                    if (candPath.length > 0 && ![candPath isEqualToString:homePath]) continue;
+                    NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
+                    NSString *candName = cand[@"containerName"] ?: @"";
+                    if ([existingKey caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame ||
+                        [candCraneID caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame ||
+                        [candName caseInsensitiveCompare:craneActiveIDForApp] == NSOrderedSame) {
+                        settingsEntry = cand;
+                        break;
+                    }
+                }
             }
         }
     }
-
-    [self syncAllContainerLocalPlists];
-    return [keptNames componentsJoinedByString:@"\n• "];
-}
-
-- (void)setContainer:(NSString *)targetUUID enabled:(BOOL)enabled inBundle:(NSString *)bundleID {
-    if (!targetUUID || !bundleID) return;
-    BOOL exclusive = [self.state[@"exclusiveMode"] boolValue];
-    NSMutableArray *list = [bundleID isEqualToString:@"com.burbn.instagram"] ? self.igContainersList : self.redditContainersList;
-
-    for (NSMutableDictionary *p in list) {
-        NSString *u = p[@"containerUUID"];
-        if (!u) continue;
-        if ([u isEqualToString:targetUUID]) {
-            p[@"enabled"] = @(enabled);
-            [self saveProfile:p forUUID:u saveNow:NO];
-        } else if (enabled && exclusive && [p[@"enabled"] boolValue]) {
-            p[@"enabled"] = @NO;
-            [self saveProfile:p forUUID:u saveNow:NO];
-        }
-    }
-
-    [self syncAllContainerLocalPlists];
-    [self auditStealthEngineStatus];
-    killAppProcess([bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
-}
-
-- (NSMutableDictionary *)ensureProfileForBundle:(NSString *)bundleID uuid:(NSString *)uuid craneID:(NSString *)craneID defaultName:(NSString *)dName path:(NSString *)path allowEnableDefault:(BOOL)allowEnable saveNow:(BOOL)saveNow {
-    if (!bundleID) bundleID = @"com.burbn.instagram";
-    if (!uuid || uuid.length == 0) uuid = craneID ?: @"Default";
-    if (!craneID || craneID.length == 0) craneID = uuid;
-
-    NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
-        ? [self.state[@"containersByUUID"] mutableCopy]
-        : [NSMutableDictionary dictionary];
 
     NSMutableDictionary *profile = nil;
-    NSString *preservedPath = (path && path.length > 0) ? path : nil;
-
-    if ([byUUID[uuid] isKindOfClass:[NSDictionary class]] && byUUID[uuid][@"bootSessionUUID"]) {
-        profile = [byUUID[uuid] mutableCopy];
-        if (!preservedPath && [profile[@"path"] isKindOfClass:[NSString class]] && [profile[@"path"] length] > 0) {
-            preservedPath = profile[@"path"];
-        }
+    if ([diskLoaded isKindOfClass:[NSDictionary class]] && diskLoaded[@"bootSessionUUID"]) {
+        profile = [diskLoaded mutableCopy];
     }
-    if (!profile) {
-        for (NSString *existingKey in [byUUID allKeys]) {
-            NSDictionary *cand = byUUID[existingKey];
-            if (![cand isKindOfClass:[NSDictionary class]] || ![cand[@"bundleID"] isEqualToString:bundleID] || !cand[@"bootSessionUUID"]) continue;
-            NSString *candCraneID = cand[@"craneIdentifier"] ?: @"";
-            NSString *candIDFV = cand[@"idfv"] ?: @"";
-            NSString *candName = cand[@"containerName"] ?: @"";
-            NSString *candPath = cand[@"path"] ?: @"";
-            if ([existingKey caseInsensitiveCompare:uuid] == NSOrderedSame ||
-                (![craneID isEqualToString:@"Default"] && ([existingKey caseInsensitiveCompare:craneID] == NSOrderedSame ||
-                                                           [candCraneID caseInsensitiveCompare:craneID] == NSOrderedSame ||
-                                                           [candIDFV caseInsensitiveCompare:craneID] == NSOrderedSame)) ||
-                (path.length > 0 && [candPath isEqualToString:path]) ||
-                (dName.length > 0 && ![dName isEqualToString:@"Default"] && [candName caseInsensitiveCompare:dName] == NSOrderedSame)) {
-                profile = [cand mutableCopy];
-                if (!preservedPath && candPath.length > 0) preservedPath = candPath;
-                if (![existingKey isEqualToString:uuid]) {
-                    [byUUID removeObjectForKey:existingKey];
-                    self.state[@"containersByUUID"] = byUUID;
-                }
-                break;
+    if (settingsEntry && settingsEntry[@"bootSessionUUID"]) {
+        if (!profile) {
+            profile = [settingsEntry mutableCopy];
+        } else {
+            for (NSString *k in @[@"enabled", @"masterEnabled", @"appEnabled", @"effectiveShieldActive", @"containerName", @"craneIdentifier", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"cellularLocalIP", @"ssid", @"bssid", @"bootSessionUUID", @"spoofedBootEpoch", @"spoofedBootUsec", @"lastBootUUIDForTime", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"pasteboardCount"]) {
+                if (settingsEntry[k] != nil) profile[k] = settingsEntry[k];
             }
         }
     }
 
-    NSDictionary *disk = nil;
-    if (preservedPath.length > 0) {
-        disk = [NSDictionary dictionaryWithContentsOfFile:[preservedPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"]];
-        if (!profile && [disk isKindOfClass:[NSDictionary class]] && disk[@"bootSessionUUID"]) {
-            profile = [disk mutableCopy];
-        }
-    }
-
-    if (profile && [disk isKindOfClass:[NSDictionary class]]) {
-        for (NSString *runtimeKey in @[@"cellularLocalIP", @"spoofedBootEpoch", @"spoofedBootUsec", @"lastBootUUIDForTime"]) {
-            if (!profile[runtimeKey] && disk[runtimeKey]) {
-                profile[runtimeKey] = disk[runtimeKey];
-            }
-        }
-    }
-
-    NSString *cleanCraneName = (dName && dName.length > 0) ? dName : @"Default";
-    BOOL hasValidCraneUUID = ([craneID containsString:@"-"] && craneID.length >= 32);
-    NSString *diskCapturedIDFV = ([disk isKindOfClass:[NSDictionary class]] && [disk[@"craneOriginalIDFV"] isKindOfClass:[NSString class]] && [disk[@"craneOriginalIDFV"] length] >= 32)
-        ? [disk[@"craneOriginalIDFV"] uppercaseString]
+    NSString *existingIDFV = ([profile[@"idfv"] isKindOfClass:[NSString class]] && [profile[@"idfv"] length] >= 32)
+        ? [profile[@"idfv"] uppercaseString]
         : nil;
-    NSString *nativeCraneIDFV = hasValidCraneUUID
-        ? [craneID uppercaseString]
-        : (diskCapturedIDFV ?: (profile[@"idfv"] ?: [[NSUUID UUID] UUIDString]));
+    NSString *nativeCraneUUID = existingIDFV
+        ?: (([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString]);
 
-    BOOL isNewProfile = (!profile || !profile[@"bootSessionUUID"]);
-
-    if (isNewProfile) {
-        BOOL wasEnabled = (profile && profile[@"enabled"] != nil) ? [profile[@"enabled"] boolValue] : NO;
-
-        uint64_t seed = randomSeedPrefs64(uuid);
+    if (!profile || !profile[@"bootSessionUUID"]) {
+        uint64_t seed = randomSeed64(keyUUID);
         NSArray *ouis = @[@"a4:83:e7", @"28:80:88", @"00:1d:7e", @"c0:56:27", @"ec:1a:59", @"f0:9f:c2", @"04:d6:aa"];
         NSArray *ssidPrefixes = @[@"HomeWiFi", @"ATT-Fiber", @"Xfinity-WiFi", @"SpectrumSetup", @"NETGEAR", @"TP-Link"];
 
@@ -1118,1300 +564,1368 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *bssid = [NSString stringWithFormat:@"%@:%02x:%02x:%02x",
                            oui, (unsigned int)((seed >> 8) & 0xFF), (unsigned int)((seed >> 16) & 0xFF), (unsigned int)((seed >> 24) & 0xFF)];
         NSString *ssid = [NSString stringWithFormat:@"%@-%02X-5G", ssidPref, (unsigned int)(seed & 0xFF)];
-        NSString *localIP = [NSString stringWithFormat:@"192.168.1.%d", 12 + (int)(seed % 230)];
-        NSString *newBootUUID = [[NSUUID UUID] UUIDString];
-        NSString *cellIP = generateCellularCGNATAddress(newBootUUID);
-        unsigned long long freeBytes = ((14200ULL + (seed % 32000ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
+        NSString *localIP = [NSString stringWithFormat:@"192.168.1.%d", 15 + (int)(seed % 220)];
+        NSString *cellIP = [NSString stringWithFormat:@"100.%d.%d.%d",
+                            64 + (int)(seed % 60),
+                            1 + (int)((seed >> 8) % 250),
+                            2 + (int)((seed >> 16) % 250)];
+        unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
+        BOOL manualEnabled = (settingsEntry && settingsEntry[@"enabled"] != nil) ? [settingsEntry[@"enabled"] boolValue] : NO;
 
         profile = [@{
             @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
-            @"containerUUID": uuid,
+            @"containerUUID": keyUUID,
             @"craneIdentifier": craneID,
-            @"containerName": cleanCraneName,
+            @"containerName": craneName,
             @"bundleID": bundleID,
-            @"path": preservedPath ?: @"",
-            @"enabled": @(wasEnabled),
-            @"masterEnabled": self.state[@"masterEnabled"] ?: @NO,
-            @"appEnabled": @NO,
-            @"effectiveShieldActive": @NO,
-            @"spoofIDs": profile[@"spoofIDs"] ?: @YES,
-            @"spoofNetwork": profile[@"spoofNetwork"] ?: @YES,
-            @"spoofLocation": profile[@"spoofLocation"] ?: @YES,
-            @"spoofHardware": profile[@"spoofHardware"] ?: @YES,
-            @"spoofSecurity": profile[@"spoofSecurity"] ?: @YES,
-            @"locationAnchored": profile[@"locationAnchored"] ?: @NO,
+            @"path": homePath,
+            @"enabled": @(manualEnabled),
+            @"effectiveShieldActive": @(manualEnabled),
+            @"spoofIDs": @YES,
+            @"spoofNetwork": @YES,
+            @"spoofLocation": @YES,
+            @"spoofHardware": @YES,
+            @"spoofSecurity": @YES,
+            @"locationAnchored": @NO,
             @"deviceModel": @"iPhone10,4",
-            @"craneOriginalIDFV": nativeCraneIDFV,
-            @"idfv": nativeCraneIDFV,
-            @"bootSessionUUID": newBootUUID,
+            @"craneOriginalIDFV": nativeCraneUUID,
+            @"idfv": nativeCraneUUID,
+            @"bootSessionUUID": [[NSUUID UUID] UUIDString],
             @"bssid": bssid,
             @"ssid": ssid,
             @"localIP": localIP,
             @"cellularLocalIP": cellIP,
             @"freeBytes": @(freeBytes),
-            @"batteryLevel": @(0.28f + ((seed % 64) / 100.0f)),
-            @"brightness": @(0.25f + (((seed >> 4) % 65) / 100.0f)),
-            @"audioVolume": @(0.18f + (((seed >> 6) % 72) / 100.0f)),
-            @"pasteboardCount": @(4 + (seed % 95)),
-            @"lastSyncedIP": profile[@"lastSyncedIP"] ?: @"Sin sincronizar",
-            @"ispName": profile[@"ispName"] ?: @"Pendiente",
-            @"cityCountry": profile[@"cityCountry"] ?: @"Sincroniza dentro del contenedor",
-            @"timeZone": profile[@"timeZone"] ?: @"America/New_York",
-            @"localeID": profile[@"localeID"] ?: @"en_US",
-            @"CarrierMode": profile[@"CarrierMode"] ?: @"CELLULAR",
-            @"CarrierName": profile[@"CarrierName"] ?: @"T-Mobile",
-            @"CarrierMCC": profile[@"CarrierMCC"] ?: @"310",
-            @"CarrierMNC": profile[@"CarrierMNC"] ?: @"260",
-            @"CarrierISO": profile[@"CarrierISO"] ?: @"us"
+            @"batteryLevel": @(0.32f + ((seed % 60) / 100.0f)),
+            @"brightness": @(0.30f + (((seed >> 4) % 60) / 100.0f)),
+            @"audioVolume": @(0.20f + (((seed >> 6) % 70) / 100.0f)),
+            @"pasteboardCount": @(5 + (seed % 90)),
+            @"lastSyncedIP": @"Sin sincronizar",
+            @"ispName": @"Pendiente",
+            @"cityCountry": @"Sincroniza en el contenedor",
+            @"timeZone": @"America/New_York",
+            @"localeID": @"en_US",
+            @"CarrierMode": @"CELLULAR",
+            @"CarrierName": @"T-Mobile",
+            @"CarrierMCC": @"310",
+            @"CarrierMNC": @"260",
+            @"CarrierISO": @"us"
         } mutableCopy];
-        assignSpoofedBootTimeToProfile(profile, NO);
     } else {
-        [profile removeObjectForKey:@"uptimeOffset"];
-        [profile removeObjectForKey:@"customRotatedIDFV"];
-        profile[@"idfv"] = nativeCraneIDFV;
-        profile[@"craneOriginalIDFV"] = nativeCraneIDFV;
+        profile[@"idfv"] = nativeCraneUUID;
+        profile[@"craneOriginalIDFV"] = nativeCraneUUID;
         profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
-        profile[@"containerUUID"] = uuid;
-        profile[@"craneIdentifier"] = craneID;
-        profile[@"containerName"] = cleanCraneName;
         profile[@"bundleID"] = bundleID;
-        if (preservedPath.length > 0) profile[@"path"] = preservedPath;
+        profile[@"path"] = homePath;
+        if (craneName.length > 0 && ![craneName isEqualToString:keyUUID] &&
+            ![profile[@"containerName"] isEqualToString:craneName]) {
+            profile[@"containerName"] = craneName;
+        }
     }
 
     NSString *lanIP = profile[@"localIP"] ?: @"192.168.1.45";
     if (![lanIP hasPrefix:@"192.168.1."]) {
-        uint64_t fixSeed = randomSeedPrefs64(uuid);
+        uint64_t fixSeed = randomSeed64(keyUUID);
         lanIP = [NSString stringWithFormat:@"192.168.1.%d", 15 + (int)(fixSeed % 220)];
         profile[@"localIP"] = lanIP;
     }
+    s_spoofedLanAddr = inet_addr([lanIP UTF8String]);
+    s_spoofedLanMask = htonl(0xFFFFFF00U);
+    s_spoofedLanBcast = (s_spoofedLanAddr & s_spoofedLanMask) | htonl(0x000000FFU);
 
     NSString *cellIP = profile[@"cellularLocalIP"];
     if (![cellIP isKindOfClass:[NSString class]] || ![cellIP hasPrefix:@"100."]) {
-        profile[@"cellularLocalIP"] = generateCellularCGNATAddress(profile[@"bootSessionUUID"] ?: uuid);
+        uint64_t cellSeed = randomSeed64(profile[@"bootSessionUUID"] ?: keyUUID);
+        cellIP = [NSString stringWithFormat:@"100.%d.%d.%d",
+                  64 + (int)(cellSeed % 60),
+                  1 + (int)((cellSeed >> 8) % 250),
+                  2 + (int)((cellSeed >> 16) % 250)];
+        profile[@"cellularLocalIP"] = cellIP;
     }
+    s_spoofedCellularAddr = inet_addr([cellIP UTF8String]);
 
+    NSString *currentBootUUID = profile[@"bootSessionUUID"] ?: @"";
+    NSString *savedBootUUIDRef = profile[@"lastBootUUIDForTime"] ?: @"";
     long long savedBootSec = [profile[@"spoofedBootEpoch"] longLongValue];
-    NSString *savedBootRef = profile[@"lastBootUUIDForTime"] ?: @"";
+    int savedBootUsec = [profile[@"spoofedBootUsec"] intValue];
     time_t nowEpoch = time(NULL);
-    if (savedBootSec <= 0 || savedBootSec >= (nowEpoch - 60) || (nowEpoch - savedBootSec) > (30 * 86400) ||
-        ![savedBootRef isEqualToString:(profile[@"bootSessionUUID"] ?: @"")]) {
-        assignSpoofedBootTimeToProfile(profile, NO);
+
+    BOOL hadPreviousBootRecord = (savedBootUUIDRef.length > 0);
+    BOOL bootUUIDRotated = ![savedBootUUIDRef isEqualToString:currentBootUUID];
+    BOOL bootOutOfRange = (savedBootSec <= 0 || savedBootSec >= (nowEpoch - 600) || (nowEpoch - savedBootSec) > (30 * 86400));
+
+    if (bootUUIDRotated || bootOutOfRange) {
+        uint64_t bSeed = randomSeed64(currentBootUUID);
+        long long offsetSec = (hadPreviousBootRecord && bootUUIDRotated)
+            ? (1800LL + (long long)(bSeed % 9000ULL))
+            : (21600LL + (long long)(bSeed % 669600ULL));
+        savedBootSec = (long long)nowEpoch - offsetSec;
+        savedBootUsec = (int)((bSeed >> 12) % 999999ULL);
+        profile[@"spoofedBootEpoch"] = @(savedBootSec);
+        profile[@"spoofedBootUsec"] = @(savedBootUsec);
+        profile[@"lastBootUUIDForTime"] = currentBootUUID;
+    }
+    s_spoofedBootSec = (time_t)savedBootSec;
+    s_spoofedBootUsec = (suseconds_t)savedBootUsec;
+
+    // Calcula el tiempo despierto (CLOCK_UPTIME_RAW / systemUptime) siempre menor o igual que (now - kern.boottime)
+    double wallSinceBoot = (double)(nowEpoch - s_spoofedBootSec);
+    if (wallSinceBoot < 600.0) wallSinceBoot = 600.0;
+    uint64_t ratioSeed = deterministicHash64(currentBootUUID);
+    double awakeRatio = 0.72 + ((double)(ratioSeed % 17ULL) / 100.0);
+    s_baseAwakeUptimeSec = wallSinceBoot * awakeRatio;
+
+    BOOL contOn = [profile[@"enabled"] boolValue];
+    if (canReadGlobalPlist) {
+        BOOL masterOn = [loadedGlobal[@"masterEnabled"] boolValue];
+        BOOL appOn = [bundleID isEqualToString:@"com.burbn.instagram"]
+            ? [loadedGlobal[@"enableIG"] boolValue]
+            : [loadedGlobal[@"enableReddit"] boolValue];
+        s_shieldActive = (masterOn && appOn && contOn);
+        profile[@"masterEnabled"] = @(masterOn);
+        profile[@"appEnabled"] = @(appOn);
+        profile[@"effectiveShieldActive"] = @(s_shieldActive);
+    } else if (profile[@"effectiveShieldActive"] != nil) {
+        s_shieldActive = [profile[@"effectiveShieldActive"] boolValue];
+    } else {
+        BOOL localMaster = (profile[@"masterEnabled"] == nil) ? NO : [profile[@"masterEnabled"] boolValue];
+        BOOL localApp = (profile[@"appEnabled"] == nil) ? NO : [profile[@"appEnabled"] boolValue];
+        s_shieldActive = (localMaster && localApp && contOn);
     }
 
-    [self saveProfile:profile forUUID:uuid saveNow:(saveNow || isNewProfile)];
-    return profile;
+    liveContainerProfile = profile;
+    persistCurrentProfileToSandboxIfNeeded(diskLoaded);
+
+    s_spoofIDs = s_shieldActive && (profile[@"spoofIDs"] == nil ? YES : [profile[@"spoofIDs"] boolValue]);
+    s_spoofNetwork = s_shieldActive && (profile[@"spoofNetwork"] == nil ? YES : [profile[@"spoofNetwork"] boolValue]);
+    s_spoofLocation = s_shieldActive && (profile[@"spoofLocation"] == nil ? YES : [profile[@"spoofLocation"] boolValue]);
+    s_spoofHardware = s_shieldActive && (profile[@"spoofHardware"] == nil ? YES : [profile[@"spoofHardware"] boolValue]);
+    s_spoofSecurity = s_shieldActive && (profile[@"spoofSecurity"] == nil ? YES : [profile[@"spoofSecurity"] boolValue]);
+    s_isCellularMode = ![profile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
+
+    if (s_spoofLocation && profile[@"timeZone"]) {
+        applyLowLevelCTimeZone(profile[@"timeZone"]);
+    }
+
+    s_inInternalCall = NO;
 }
 
-- (void)scanAndSyncAllContainers {
-    self.igContainersList = [NSMutableArray array];
-    self.redditContainersList = [NSMutableArray array];
-    NSMutableSet *seenIGKeys = [NSMutableSet set];
-    NSMutableSet *seenRDKeys = [NSMutableSet set];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL exclusive = [self.state[@"exclusiveMode"] boolValue];
-
-    NSMutableSet *hiddenSet = [NSMutableSet set];
-    if ([self.state[@"hiddenContainerIDs"] isKindOfClass:[NSArray class]]) {
-        for (NSString *h in self.state[@"hiddenContainerIDs"]) {
-            [hiddenSet addObject:[h lowercaseString]];
-        }
+// ============================================================================
+// CÁPSULA SUPERIOR CON MONITOR EN VIVO DEL TÚNEL IPV4 SHADOWROCKET
+// ============================================================================
+static void refreshBadgePillStateOnMain(void) {
+    if (!persistentBadgePill || !liveContainerProfile) return;
+    BOOL tunnelUp = hasActiveUtunTunnelLive();
+    int desiredState = 0;
+    if (s_shieldActive && s_spoofNetwork && !tunnelUp) {
+        desiredState = 2;
+    } else if (s_shieldActive) {
+        desiredState = 1;
+    } else {
+        desiredState = 0;
     }
 
-    NSMutableArray *craneSources = [NSMutableArray array];
-    for (NSString *pPath in @[CRANE_PREFS_JB, CRANE_MAIN_JB, CRANE_PREFS_VAR, CRANE_MAIN_VAR]) {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:pPath];
-        if ([d isKindOfClass:[NSDictionary class]] && [d count] > 0) [craneSources addObject:d];
+    if (desiredState == s_lastRenderedBadgeState) return;
+    s_lastRenderedBadgeState = desiredState;
+
+    NSString *cName = liveContainerProfile[@"containerName"] ?: @"Default";
+    CGRect screenBounds = [UIScreen mainScreen].bounds;
+
+    if (desiredState == 2) {
+        persistentBadgePill.backgroundColor = [UIColor colorWithRed:0.80 green:0.12 blue:0.12 alpha:0.96];
+        persistentBadgePill.text = [NSString stringWithFormat:@" ⛔ %@ (SIN TÚNEL) ", cName];
+    } else if (desiredState == 1) {
+        persistentBadgePill.backgroundColor = [UIColor colorWithRed:0.04 green:0.52 blue:0.24 alpha:0.94];
+        persistentBadgePill.text = [NSString stringWithFormat:@" 🛡️ %@ ", cName];
+    } else {
+        persistentBadgePill.backgroundColor = [UIColor colorWithRed:0.38 green:0.38 blue:0.42 alpha:0.90];
+        persistentBadgePill.text = [NSString stringWithFormat:@" ⚪ %@ ", cName];
     }
 
-    NSArray *craneDirs = @[
-        @"/var/jb/var/mobile/Library/Application Support/Crane",
-        @"/var/mobile/Library/Application Support/Crane",
-        @"/var/jb/var/mobile/Library/Crane",
-        @"/var/mobile/Library/Crane"
-    ];
-    for (NSString *cDir in craneDirs) {
-        if (![fm fileExistsAtPath:cDir]) continue;
-        NSArray *files = [fm subpathsOfDirectoryAtPath:cDir error:nil];
-        for (NSString *f in files) {
-            if ([f hasSuffix:@".plist"]) {
-                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:[cDir stringByAppendingPathComponent:f]];
-                if ([d isKindOfClass:[NSDictionary class]] && [d count] > 0) {
-                    [craneSources addObject:d];
-                }
-            }
-        }
-    }
-
-    for (NSString *domain in @[@"com.opa334.crane", @"com.opa334.craneprefs"]) {
-        CFPreferencesAppSynchronize((__bridge CFStringRef)domain);
-        for (NSString *user in @[@"mobile", @"root"]) {
-            CFDictionaryRef cfDict = CFPreferencesCopyMultiple(NULL, (__bridge CFStringRef)domain, (__bridge CFStringRef)user, kCFPreferencesAnyHost);
-            if (cfDict) {
-                NSDictionary *d = CFBridgingRelease(cfDict);
-                if ([d count] > 0) [craneSources addObject:d];
-            }
-        }
-        NSDictionary *ud = [[[NSUserDefaults alloc] initWithSuiteName:domain] dictionaryRepresentation];
-        if ([ud count] > 0) [craneSources addObject:ud];
-    }
-
-    NSMutableDictionary *igCraneMap = [NSMutableDictionary dictionary];
-    NSMutableDictionary *rdCraneMap = [NSMutableDictionary dictionary];
-
-    for (NSDictionary *src in craneSources) {
-        extractCraneConfigForBundle(src, @"com.burbn.instagram", igCraneMap);
-        extractCraneConfigForBundle(src, @"com.reddit.Reddit", rdCraneMap);
-    }
-
-    NSString *igActiveCraneID = igCraneMap[@"__ACTIVE_ID__"];
-    NSString *rdActiveCraneID = rdCraneMap[@"__ACTIVE_ID__"];
-    [igCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
-    [rdCraneMap removeObjectForKey:@"__ACTIVE_ID__"];
-
-    BOOL igHasCraneConfigured = (igCraneMap.count > 0 || (igActiveCraneID && igActiveCraneID.length > 0));
-    BOOL rdHasCraneConfigured = (rdCraneMap.count > 0 || (rdActiveCraneID && rdActiveCraneID.length > 0));
-
-    NSString *appsDir = @"/var/mobile/Containers/Data/Application";
-    NSArray *uuids = [fm contentsOfDirectoryAtPath:appsDir error:nil];
-
-    for (NSString *folderUUID in uuids) {
-        if ([hiddenSet containsObject:[folderUUID lowercaseString]]) continue;
-
-        NSString *fullPath = [appsDir stringByAppendingPathComponent:folderUUID];
-        NSString *metaPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-        NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
-        if (![meta isKindOfClass:[NSDictionary class]]) continue;
-
-        NSString *mcmID = meta[@"MCMMetadataIdentifier"] ?: @"";
-        BOOL isIG = ([mcmID caseInsensitiveCompare:@"com.burbn.instagram"] == NSOrderedSame);
-        BOOL isRD = ([mcmID caseInsensitiveCompare:@"com.reddit.Reddit"] == NSOrderedSame);
-        if (!isIG && !isRD) continue;
-
-        NSString *bundleID = isIG ? @"com.burbn.instagram" : @"com.reddit.Reddit";
-        NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
-        NSMutableArray *targetList = isIG ? self.igContainersList : self.redditContainersList;
-        NSMutableSet *seenKeys = isIG ? seenIGKeys : seenRDKeys;
-
-        NSString *craneID = nil;
-        NSString *detectedName = nil;
-        NSString *mcmUUID = [meta[@"MCMMetadataUUID"] isKindOfClass:[NSString class]] ? meta[@"MCMMetadataUUID"] : nil;
-
-        for (NSString *rk in @[@"com.opa334.crane.container.name", @"craneContainerName"]) {
-            if ([meta[rk] isKindOfClass:[NSString class]] && [meta[rk] length] > 0) detectedName = meta[rk];
-        }
-        for (NSString *ik in @[@"com.opa334.crane.container.identifier", @"com.opa334.crane.container.id", @"craneContainerIdentifier"]) {
-            if ([meta[ik] isKindOfClass:[NSString class]] && [meta[ik] length] > 0) craneID = meta[ik];
-        }
-        NSDictionary *userInfo = meta[@"MCMMetadataUserInfo"];
-        if ([userInfo isKindOfClass:[NSDictionary class]] && [userInfo count] > 0) {
-            for (NSString *k in userInfo) {
-                NSString *kl = [k lowercaseString];
-                id val = userInfo[k];
-                if ([val isKindOfClass:[NSString class]] && [val length] > 0) {
-                    if ([kl containsString:@"name"] || [kl containsString:@"label"] || [kl containsString:@"title"]) {
-                        detectedName = val;
-                    } else if (([kl containsString:@"id"] || [kl containsString:@"crane"] || [kl containsString:@"container"] || [kl containsString:@"uuid"]) && ![val isEqualToString:bundleID]) {
-                        craneID = val;
-                    }
-                }
-            }
-        }
-
-        NSDictionary *localSaved = [NSDictionary dictionaryWithContentsOfFile:[fullPath stringByAppendingPathComponent:@"Library/.igshield_container.plist"]];
-        NSString *savedIDFV = nil;
-        if ([localSaved isKindOfClass:[NSDictionary class]]) {
-            NSString *savedCID = localSaved[@"craneIdentifier"];
-            if (!craneID && [savedCID isKindOfClass:[NSString class]] && savedCID.length > 0 && [savedCID caseInsensitiveCompare:@"Default"] != NSOrderedSame) {
-                craneID = savedCID;
-            }
-            NSString *savedName = localSaved[@"containerName"];
-            if (!detectedName && [savedName isKindOfClass:[NSString class]] && savedName.length > 0 && [savedName caseInsensitiveCompare:@"Default"] != NSOrderedSame) {
-                detectedName = savedName;
-            }
-            if ([localSaved[@"idfv"] isKindOfClass:[NSString class]] && [localSaved[@"idfv"] length] >= 32) {
-                savedIDFV = localSaved[@"idfv"];
-            }
-        }
-
-        BOOL folderHasCraneMeta = (craneID != nil || detectedName != nil || savedIDFV != nil || ([userInfo isKindOfClass:[NSDictionary class]] && [userInfo count] > 0));
-        BOOL appUsesCrane = isIG ? (igHasCraneConfigured || folderHasCraneMeta) : (rdHasCraneConfigured || folderHasCraneMeta);
-        if (!appUsesCrane) continue;
-
-        NSDictionary *cEntry = nil;
-        if (craneID.length > 0) cEntry = craneMap[[craneID lowercaseString]];
-        if (!cEntry && savedIDFV.length > 0) cEntry = craneMap[[savedIDFV lowercaseString]];
-        if (!cEntry && mcmUUID.length > 0) cEntry = craneMap[[mcmUUID lowercaseString]];
-        if (!cEntry) cEntry = craneMap[[folderUUID lowercaseString]];
-        if (!cEntry && detectedName.length > 0) cEntry = craneMap[[detectedName lowercaseString]];
-
-        if ([cEntry isKindOfClass:[NSDictionary class]]) {
-            if ([cEntry[@"name"] length] > 0) detectedName = cEntry[@"name"];
-            if ([cEntry[@"id"] length] > 0) craneID = cEntry[@"id"];
-        }
-
-        if (!detectedName) {
-            for (NSDictionary *src in craneSources) {
-                if (craneID.length > 0) detectedName = findCraneNameByID(src, craneID);
-                if (detectedName) break;
-                if (savedIDFV.length > 0) detectedName = findCraneNameByID(src, savedIDFV);
-                if (detectedName) break;
-                if (mcmUUID.length > 0) detectedName = findCraneNameByID(src, mcmUUID);
-                if (detectedName) break;
-                detectedName = findCraneNameByID(src, folderUUID);
-                if (detectedName) break;
-            }
-        }
-
-        if (!craneID || craneID.length == 0) {
-            if ((!userInfo || [userInfo count] == 0) && ![seenKeys containsObject:@"default"]) {
-                craneID = @"Default";
-            } else if (savedIDFV.length > 0) {
-                craneID = savedIDFV;
-            } else if (mcmUUID.length > 0) {
-                craneID = mcmUUID;
-            } else {
-                craneID = folderUUID;
-            }
-        }
-
-        if ([hiddenSet containsObject:[craneID lowercaseString]]) continue;
-
-        if (!detectedName || detectedName.length == 0) {
-            if ([craneID caseInsensitiveCompare:@"default"] == NSOrderedSame) {
-                detectedName = @"Default";
-            } else {
-                detectedName = craneID;
-            }
-        }
-
-        if ([hiddenSet containsObject:[detectedName lowercaseString]]) continue;
-        if ([seenKeys containsObject:[folderUUID lowercaseString]] ||
-            [seenKeys containsObject:[craneID lowercaseString]]) {
-            continue;
-        }
-
-        NSMutableDictionary *prof = [self ensureProfileForBundle:bundleID
-                                                            uuid:folderUUID
-                                                         craneID:craneID
-                                                     defaultName:detectedName
-                                                            path:fullPath
-                                              allowEnableDefault:NO
-                                                         saveNow:NO];
-        [seenKeys addObject:[folderUUID lowercaseString]];
-        [seenKeys addObject:[craneID lowercaseString]];
-        if (mcmUUID.length > 0) [seenKeys addObject:[mcmUUID lowercaseString]];
-        if (detectedName.length > 0) [seenKeys addObject:[detectedName lowercaseString]];
-        [targetList addObject:prof];
-    }
-
-    for (NSString *bID in @[@"com.burbn.instagram", @"com.reddit.Reddit"]) {
-        BOOL isIG = [bID isEqualToString:@"com.burbn.instagram"];
-        BOOL appUsesCrane = isIG ? igHasCraneConfigured : rdHasCraneConfigured;
-        if (!appUsesCrane) continue;
-
-        NSMutableDictionary *craneMap = isIG ? igCraneMap : rdCraneMap;
-        NSMutableArray *targetList = isIG ? self.igContainersList : self.redditContainersList;
-        NSMutableSet *seenKeys = isIG ? seenIGKeys : seenRDKeys;
-
-        for (NSString *cKey in craneMap) {
-            NSDictionary *cEntry = craneMap[cKey];
-            NSString *cID = [cEntry isKindOfClass:[NSDictionary class]] ? (cEntry[@"id"] ?: cKey) : cKey;
-            NSString *cName = [cEntry isKindOfClass:[NSDictionary class]] ? (cEntry[@"name"] ?: cID) : [cEntry description];
-            if (!cName || cName.length == 0) continue;
-
-            if ([seenKeys containsObject:[cID lowercaseString]] ||
-                [seenKeys containsObject:[cName lowercaseString]] ||
-                [hiddenSet containsObject:[cID lowercaseString]] ||
-                [hiddenSet containsObject:[cName lowercaseString]]) {
-                continue;
-            }
-
-            NSMutableDictionary *prof = [self ensureProfileForBundle:bID
-                                                                uuid:cID
-                                                             craneID:cID
-                                                         defaultName:cName
-                                                                path:@""
-                                                  allowEnableDefault:NO
-                                                             saveNow:NO];
-            [seenKeys addObject:[cID lowercaseString]];
-            [seenKeys addObject:[cName lowercaseString]];
-            [targetList addObject:prof];
-        }
-    }
-
-    NSComparator sortBlock = ^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-        NSString *na = a[@"containerName"] ?: @"";
-        NSString *nb = b[@"containerName"] ?: @"";
-        if ([na caseInsensitiveCompare:@"Default"] == NSOrderedSame) return NSOrderedAscending;
-        if ([nb caseInsensitiveCompare:@"Default"] == NSOrderedSame) return NSOrderedDescending;
-        return [na localizedCaseInsensitiveCompare:nb];
-    };
-    [self.igContainersList sortUsingComparator:sortBlock];
-    [self.redditContainersList sortUsingComparator:sortBlock];
-
-    NSMutableSet *activeProfileKeys = [NSMutableSet set];
-    for (NSDictionary *p in self.igContainersList) { if (p[@"containerUUID"]) [activeProfileKeys addObject:p[@"containerUUID"]]; }
-    for (NSDictionary *p in self.redditContainersList) { if (p[@"containerUUID"]) [activeProfileKeys addObject:p[@"containerUUID"]]; }
-
-    NSMutableDictionary *byUUID = [self.state[@"containersByUUID"] isKindOfClass:[NSDictionary class]]
-        ? [self.state[@"containersByUUID"] mutableCopy]
-        : [NSMutableDictionary dictionary];
-    for (NSString *savedKey in [byUUID allKeys]) {
-        if (![activeProfileKeys containsObject:savedKey]) {
-            [byUUID removeObjectForKey:savedKey];
-        }
-    }
-    self.state[@"containersByUUID"] = byUUID;
-
-    NSMutableDictionary *activeMap = [self.state[@"activeInCrane"] isKindOfClass:[NSDictionary class]]
-        ? [self.state[@"activeInCrane"] mutableCopy]
-        : [NSMutableDictionary dictionary];
-    if (igActiveCraneID && igActiveCraneID.length > 0) activeMap[@"com.burbn.instagram"] = igActiveCraneID;
-    if (rdActiveCraneID && rdActiveCraneID.length > 0) activeMap[@"com.reddit.Reddit"] = rdActiveCraneID;
-    self.state[@"activeInCrane"] = activeMap;
-
-    if (exclusive) {
-        [self deduplicateActiveIfMultiple];
-    }
-
-    [self syncAllContainerLocalPlists];
+    [persistentBadgePill sizeToFit];
+    CGFloat pillW = MIN(MAX(persistentBadgePill.bounds.size.width + 12.0, 62.0), 220.0);
+    persistentBadgePill.frame = CGRectMake((screenBounds.size.width - pillW) / 2.0, 18.0, pillW, 16.0);
 }
 
-- (void)calculateResidualTraces {
-    self.vpnActive = NO;
-    self.vpnInterfaceName = @"Inactivo";
-    self.realLocalIP = @"192.168.1.x";
-
-    [UIDevice currentDevice].batteryMonitoringEnabled = YES;
-    float rawBat = [UIDevice currentDevice].batteryLevel;
-    self.realBatteryPct = (rawBat > 0) ? (int)(rawBat * 100.0f) : 75;
-    self.realVolumePct = (int)([[AVAudioSession sharedInstance] outputVolume] * 100.0f);
-
-    NSDictionary *fsAttr = [[NSFileManager defaultManager] attributesOfFileSystemForPath:@"/var/mobile" error:nil];
-    unsigned long long freeBytes = [fsAttr[NSFileSystemFreeSize] unsignedLongLongValue];
-    self.realFreeDisk = [NSString stringWithFormat:@"%.2f GB libres", (double)freeBytes / (1024.0*1024.0*1024.0)];
-
-    struct ifaddrs *interfaces = NULL;
-    if (getifaddrs(&interfaces) == 0 && interfaces != NULL) {
-        struct ifaddrs *temp = interfaces;
-        while (temp != NULL) {
-            if (temp->ifa_name && temp->ifa_addr && (temp->ifa_flags & IFF_UP)) {
-                NSString *ifName = [NSString stringWithUTF8String:temp->ifa_name];
-                if (temp->ifa_addr->sa_family == AF_INET) {
-                    struct sockaddr_in sin;
-                    memcpy(&sin, temp->ifa_addr, sizeof(sin));
-                    if (sin.sin_addr.s_addr != 0) {
-                        char addrBuf[INET_ADDRSTRLEN] = {0};
-                        inet_ntop(AF_INET, &sin.sin_addr, addrBuf, INET_ADDRSTRLEN);
-                        NSString *ipStr = [NSString stringWithUTF8String:addrBuf];
-                        if ([ifName isEqualToString:@"en0"] && ipStr.length > 0) {
-                            self.realLocalIP = ipStr;
-                        } else if (isTunnelInterfacePrefsName(ifName)) {
-                            self.vpnActive = YES;
-                            self.vpnInterfaceName = ifName;
-                        }
-                    }
-                } else if (temp->ifa_addr->sa_family == AF_INET6 && isTunnelInterfacePrefsName(ifName) && !self.vpnActive) {
-                    self.vpnActive = YES;
-                    self.vpnInterfaceName = ifName;
-                }
-            }
-            temp = temp->ifa_next;
+static void startTunnelWatchdogTimer(void) {
+    if (s_tunnelWatchdogTimer != nil || !s_shieldActive || !s_spoofNetwork) return;
+    s_tunnelWatchdogTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (!s_tunnelWatchdogTimer) return;
+    dispatch_source_set_timer(s_tunnelWatchdogTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                              (uint64_t)(2.5 * NSEC_PER_SEC),
+                              (uint64_t)(0.5 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(s_tunnelWatchdogTimer, ^{
+        if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+            refreshBadgePillStateOnMain();
         }
-        freeifaddrs(interfaces);
-    }
-
-    NSUInteger pbItems = 0;
-    unsigned long long pbBytes = 0;
-    inspectPasteboardUsage(&pbItems, &pbBytes);
-
-    NSArray *hiddenIDs = [self.state[@"hiddenContainerIDs"] isKindOfClass:[NSArray class]] ? self.state[@"hiddenContainerIDs"] : @[];
-    NSArray<NSString *> *pathsToScan = collectAllPhysicalContainerPaths(self.igContainersList, self.redditContainersList, hiddenIDs);
-
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        unsigned long long residualBytes = 0;
-        NSUInteger residualFiles = 0;
-        NSArray<NSString *> *trackedSubs = residualSubdirectoriesToTrack();
-
-        for (NSString *cPath in pathsToScan) {
-            for (NSString *sub in trackedSubs) {
-                accumulateDirectoryCacheUsage([cPath stringByAppendingPathComponent:sub], &residualBytes, &residualFiles);
-            }
-        }
-
-        double mb = (double)residualBytes / (1024.0 * 1024.0);
-        double pbKB = (double)pbBytes / 1024.0;
-        NSString *pbText = (pbItems > 0)
-            ? [NSString stringWithFormat:@"Portapapeles: %lu ítem(s) (%.1f KB)", (unsigned long)pbItems, pbKB]
-            : @"Portapapeles: Vacío (0 KB)";
-
-        NSString *summary = [NSString stringWithFormat:@"Caché en %lu carpeta(s): %lu archivos (%.2f MB)\n%@",
-                             (unsigned long)pathsToScan.count, (unsigned long)residualFiles, mb, pbText];
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) return;
-            strongSelf.residualSummary = summary;
-            if (strongSelf.tableView) {
-                [strongSelf.tableView reloadData];
-            }
-        });
     });
+    dispatch_resume(s_tunnelWatchdogTimer);
 }
 
-- (void)cleanResidualTracesAndKillApps:(BOOL)showPopup {
-    triggerHaptic();
-    killAppProcess(@"Instagram");
-    killAppProcess(@"Reddit");
+static void showStartupBannerAndPersistentIcon(int attempt) {
+    if (bannerShownThisSession) return;
+    ensureProfileLoaded();
+    if (!liveContainerProfile) return;
 
-    unsigned long long freedBytes = 0;
-    NSUInteger removedCount = 0;
+    s_inInternalCall = YES;
+    NSUUID *liveVendorUUID = [[UIDevice currentDevice] identifierForVendor];
+    s_inInternalCall = NO;
 
-    NSUInteger pbItemsBefore = 0;
-    unsigned long long pbBytesBefore = 0;
-    inspectPasteboardUsage(&pbItemsBefore, &pbBytesBefore);
-
-    [UIPasteboard generalPasteboard].items = @[];
-    [UIPasteboard generalPasteboard].string = @"";
-    [[NSURLCache sharedURLCache] removeAllCachedResponses];
-
-    NSArray *hiddenIDs = [self.state[@"hiddenContainerIDs"] isKindOfClass:[NSArray class]] ? self.state[@"hiddenContainerIDs"] : @[];
-    NSArray<NSString *> *pathsToClean = collectAllPhysicalContainerPaths(self.igContainersList, self.redditContainersList, hiddenIDs);
-    NSArray<NSString *> *trackedSubs = residualSubdirectoriesToTrack();
-
-    for (NSString *cPath in pathsToClean) {
-        for (NSString *sub in trackedSubs) {
-            purgeDirectoryCacheContents([cPath stringByAppendingPathComponent:sub], &freedBytes, &removedCount);
-        }
-    }
-
-    double freedMB = (double)freedBytes / (1024.0 * 1024.0);
-    double pbFreedKB = (double)pbBytesBefore / 1024.0;
-    [self calculateResidualTraces];
-    [self.tableView reloadData];
-
-    if (showPopup) {
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Caché y Portapapeles Limpiados"
-                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados (%lu carpeta(s) purgadas).\n• %lu archivos eliminados (%.2f MB liberados).\n• Portapapeles vaciado: %lu ítem(s) (%.1f KB).",
-                                                                             (unsigned long)pathsToClean.count, (unsigned long)removedCount, freedMB, (unsigned long)pbItemsBefore, pbFreedKB]
-                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Listo" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:ac animated:YES completion:nil];
-    }
-}
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 4; }
-
-- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"CONTROL GENERAL DE SISTEMA";
-    if (section == 1) return @"CONTENEDORES AISLADOS (CRANE)";
-    if (section == 2) return @"ESTADO DE RED Y SEGURIDAD OPSEC";
-    return @"GESTIÓN DE RASTRO Y PORTAPAPELES";
-}
-
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return (section == 3) ? 1 : 2;
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
-
-    if (indexPath.section == 0) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.textLabel.numberOfLines = 0;
-        cell.detailTextLabel.numberOfLines = 0;
-
-        if (indexPath.row == 0) {
-            cell.imageView.image = settingsBadgeIcon(@"shield.fill", masterOn ? [UIColor systemBlueColor] : [UIColor systemGrayColor]);
-            cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-            cell.textLabel.text = @"Escudo Maestro IGFarmShield";
-            cell.detailTextLabel.text = masterOn ? @"Operativo (Sincronizado en Sandbox con cada contenedor)" : @"En pausa manual (Todo desactivado)";
-            UISwitch *sw = [[UISwitch alloc] init];
-            sw.on = masterOn;
-            sw.tag = 10;
-            [sw addTarget:self action:@selector(toggleRootSwitch:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
-        } else {
-            BOOL excl = [self.state[@"exclusiveMode"] boolValue];
-            cell.imageView.image = settingsBadgeIcon(@"lock.fill", excl ? [UIColor systemIndigoColor] : [UIColor systemGrayColor]);
-            cell.textLabel.font = [UIFont systemFontOfSize:15.5 weight:UIFontWeightSemibold];
-            cell.textLabel.text = @"Modo Exclusivo Automático";
-            cell.detailTextLabel.text = excl ? @"Al encender un contenedor se suspenden los demás automáticamente" : @"Inactivo (Control manual independiente por contenedor)";
-            UISwitch *sw = [[UISwitch alloc] init];
-            sw.on = excl;
-            sw.tag = 11;
-            [sw addTarget:self action:@selector(toggleRootSwitch:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
-        }
-        return cell;
-    }
-
-    if (indexPath.section == 1) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        cell.textLabel.numberOfLines = 0;
-        cell.detailTextLabel.numberOfLines = 0;
-
-        BOOL isIGRow = (indexPath.row == 0);
-        BOOL appOn = [self.state[isIGRow ? @"enableIG" : @"enableReddit"] boolValue];
-        NSArray *list = isIGRow ? self.igContainersList : self.redditContainersList;
-        cell.imageView.image = settingsBadgeIcon(isIGRow ? @"camera.fill" : @"bubble.left.and.bubble.right.fill",
-                                                 isIGRow ? [UIColor systemPinkColor] : [UIColor systemOrangeColor]);
-
-        NSUInteger onCount = 0;
-        NSString *activeName = @"Ninguno";
-        for (NSDictionary *p in list) {
-            if ([p[@"enabled"] boolValue]) {
-                onCount++;
-                activeName = p[@"containerName"] ?: @"Default";
+    if (liveVendorUUID) {
+        NSString *captured = [[liveVendorUUID UUIDString] uppercaseString];
+        if (captured.length >= 32) {
+            origCraneIDFV = captured;
+            if (!liveContainerProfile[@"idfv"] || [liveContainerProfile[@"idfv"] length] < 32) {
+                NSDictionary *snap = [liveContainerProfile copy];
+                liveContainerProfile[@"idfv"] = captured;
+                liveContainerProfile[@"craneOriginalIDFV"] = captured;
+                persistCurrentProfileToSandboxIfNeeded(snap);
             }
         }
-        cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-        cell.textLabel.text = [NSString stringWithFormat:@"%@ (%lu)", isIGRow ? @"Instagram" : @"Reddit", (unsigned long)list.count];
-        cell.detailTextLabel.textColor = (masterOn && appOn && onCount > 0) ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-        cell.detailTextLabel.text = (list.count == 0)
-            ? @"Sin contenedores Crane detectados"
-            : ((!masterOn || !appOn || onCount == 0)
-                ? @"En pausa manual"
-                : (onCount == 1 ? [NSString stringWithFormat:@"Protegido: %@", activeName] : [NSString stringWithFormat:@"%lu contenedores activos", (unsigned long)onCount]));
-        return cell;
     }
 
-    if (indexPath.section == 2) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        cell.textLabel.numberOfLines = 0;
-        cell.detailTextLabel.numberOfLines = 0;
+    s_inInternalCall = YES;
+    UIWindowScene *activeScene = nil;
+    UIWindow *targetWin = nil;
 
-        if (indexPath.row == 0) {
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            BOOL ksBlocking = (masterOn && self.stealthCurrentlyActive && !self.vpnActive);
-            cell.imageView.image = settingsBadgeIcon(@"network", self.vpnActive ? [UIColor systemGreenColor] : (ksBlocking ? [UIColor systemRedColor] : [UIColor systemGrayColor]));
-            cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-            cell.textLabel.text = @"Túnel Proxy / Kill-Switch POSIX";
-            cell.detailTextLabel.textColor = ksBlocking ? [UIColor systemRedColor] : [UIColor secondaryLabelColor];
-            cell.detailTextLabel.text = self.vpnActive
-                ? [NSString stringWithFormat:@"Enrutado (%@) • TCP Puro • UDP externo e IPv6 bloqueados", self.vpnInterfaceName]
-                : (ksBlocking ? @"⛔ Túnel apagado: Kill-Switch bloqueando salida en contenedores activos" : @"Sin túnel de red activo en este momento");
-        } else {
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.imageView.image = settingsBadgeIcon(@"eye.slash.fill", self.stealthCurrentlyActive ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
-            cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-            cell.textLabel.text = @"Subsistema de Ocultamiento y Escalabilidad";
-            cell.detailTextLabel.textColor = self.stealthCurrentlyActive ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-            cell.detailTextLabel.text = self.stealthSummary;
-        }
-        return cell;
-    }
-
-    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-    cell.imageView.image = settingsBadgeIcon(@"trash.fill", [UIColor systemRedColor]);
-    cell.textLabel.numberOfLines = 0;
-    cell.detailTextLabel.numberOfLines = 0;
-    cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-    cell.textLabel.textColor = [UIColor systemRedColor];
-    cell.textLabel.text = @"Cerrar Apps y Purgar Caché + Portapapeles";
-    cell.detailTextLabel.text = self.residualSummary;
-    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-    return cell;
-}
-
-- (void)toggleRootSwitch:(UISwitch *)sender {
-    triggerHaptic();
-    if (sender.tag == 10) {
-        self.state[@"masterEnabled"] = @(sender.isOn);
-        [self syncAllContainerLocalPlists];
-        [self auditStealthEngineStatus];
-        killAppProcess(@"Instagram");
-        killAppProcess(@"Reddit");
-        self.tableView.tableHeaderView = [self buildHeaderBannerView];
-        [self.tableView reloadData];
-    } else if (sender.tag == 11) {
-        self.state[@"exclusiveMode"] = @(sender.isOn);
-        if (sender.isOn) {
-            NSString *keptSummary = [self enforceExclusiveModeWhenToggledOn];
-            [self auditStealthEngineStatus];
-            killAppProcess(@"Instagram");
-            killAppProcess(@"Reddit");
-            self.tableView.tableHeaderView = [self buildHeaderBannerView];
-            [self.tableView reloadData];
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔒 Modo Exclusivo Aplicado"
-                                                                        message:[NSString stringWithFormat:@"Estado actual por aplicación:\n• %@", keptSummary ?: @"Ninguno"]
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:ac animated:YES completion:nil];
-        } else {
-            [self syncAllContainerLocalPlists];
-            [self.tableView reloadData];
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            if (!activeScene || ws.activationState == UISceneActivationStateForegroundActive) {
+                activeScene = ws;
+            }
+            for (UIWindow *w in ws.windows) {
+                if (w != persistentBadgeWindow && !w.hidden && w.alpha > 0.01 && w.bounds.size.width > 100) {
+                    if (w.isKeyWindow || !targetWin) targetWin = w;
+                }
+            }
         }
     }
-}
 
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-
-    if (indexPath.section == 1) {
-        triggerHaptic();
-        IGFarmAppContainersController *appVC = [[IGFarmAppContainersController alloc] init];
-        appVC.parentRoot = self;
-        if (indexPath.row == 0) {
-            appVC.bundleID = @"com.burbn.instagram";
-            appVC.appTitle = @"Instagram";
-            appVC.appStateKey = @"enableIG";
-            appVC.containers = self.igContainersList;
-        } else {
-            appVC.bundleID = @"com.reddit.Reddit";
-            appVC.appTitle = @"Reddit";
-            appVC.appStateKey = @"enableReddit";
-            appVC.containers = self.redditContainersList;
+    if (!targetWin) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w != persistentBadgeWindow && !w.hidden && w.bounds.size.width > 100) {
+                targetWin = w;
+                if (!activeScene) activeScene = w.windowScene;
+                break;
+            }
         }
-        [self.navigationController pushViewController:appVC animated:YES];
+    }
+    s_inInternalCall = NO;
+
+    if (!targetWin) {
+        if (attempt < 10) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                showStartupBannerAndPersistentIcon(attempt + 1);
+            });
+        }
         return;
     }
 
-    if (indexPath.section == 2 && indexPath.row == 1) {
-        triggerHaptic();
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🛡️ Arquitectura v36"
-                                                                    message:self.stealthDetailReport
-                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Entendido" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:ac animated:YES completion:nil];
-        return;
-    }
+    bannerShownThisSession = YES;
 
-    if (indexPath.section == 3) {
-        [self cleanResidualTracesAndKillApps:YES];
-    }
-}
-
-@end
-
-@implementation IGFarmAppContainersController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = self.appTitle;
-    self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
-    self.tableView.delegate = self;
-    self.tableView.dataSource = self;
-    self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 68.0;
-    self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-
-    UIRefreshControl *rc = [[UIRefreshControl alloc] init];
-    [rc addTarget:self action:@selector(refreshFromCrane:) forControlEvents:UIControlEventValueChanged];
-    self.tableView.refreshControl = rc;
-
-    [self.view addSubview:self.tableView];
-}
-
-- (void)refreshFromCrane:(UIRefreshControl *)rc {
-    triggerHaptic();
-    [self.parentRoot scanAndSyncAllContainers];
-    [self.parentRoot auditStealthEngineStatus];
-    self.containers = [self.bundleID isEqualToString:@"com.burbn.instagram"]
-        ? self.parentRoot.igContainersList
-        : self.parentRoot.redditContainersList;
-    [self.tableView reloadData];
-    [rc endRefreshing];
-}
-
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self.parentRoot scanAndSyncAllContainers];
-    [self.parentRoot auditStealthEngineStatus];
-    self.containers = [self.bundleID isEqualToString:@"com.burbn.instagram"]
-        ? self.parentRoot.igContainersList
-        : self.parentRoot.redditContainersList;
-    [self.tableView reloadData];
-}
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
-
-- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"CONFIGURACIÓN DE APLICACIÓN";
-    return [NSString stringWithFormat:@"CONTENEDORES (%lu) — DESLIZA PARA PURGAR", (unsigned long)self.containers.count];
-}
-
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (section == 0) return 1;
-    return MAX(1, self.containers.count);
-}
-
-- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.section != 1 || self.containers.count == 0) return NO;
-    NSDictionary *prof = self.containers[indexPath.row];
-    return ([prof[@"containerName"] caseInsensitiveCompare:@"Default"] != NSOrderedSame);
-}
-
-- (NSString *)tableView:(UITableView *)tableView titleForDeleteConfirmationButtonForRowAtIndexPath:(NSIndexPath *)indexPath {
-    return @"Purgar Rastro";
-}
-
-- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (editingStyle == UITableViewCellEditingStyleDelete && indexPath.section == 1 && indexPath.row < self.containers.count) {
-        triggerHaptic();
-        NSDictionary *prof = self.containers[indexPath.row];
-        NSString *cName = prof[@"containerName"] ?: @"Contenedor";
-        [self.parentRoot purgeGhostContainerFromTweak:prof];
-        [self.containers removeObjectAtIndex:indexPath.row];
-        [self.parentRoot auditStealthEngineStatus];
-        [self.tableView reloadData];
-
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Contenedor Purgado"
-                                                                    message:[NSString stringWithFormat:@"Se eliminó todo rastro residual y perfil de \"%@\".", cName]
-                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:ac animated:YES completion:nil];
-    }
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    BOOL masterOn = [self.parentRoot.state[@"masterEnabled"] boolValue];
-    BOOL appOn = [self.parentRoot.state[self.appStateKey] boolValue];
-
-    if (indexPath.section == 0) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.imageView.image = settingsBadgeIcon(@"power", (masterOn && appOn) ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
-        cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-        cell.textLabel.text = [NSString stringWithFormat:@"Permitir Escudo en %@", self.appTitle];
-        cell.detailTextLabel.text = (masterOn && appOn) ? @"Activo (Enciende abajo el contenedor operativo)" : @"En pausa manual para esta app";
-        UISwitch *sw = [[UISwitch alloc] init];
-        sw.on = appOn;
-        sw.enabled = masterOn;
-        [sw addTarget:self action:@selector(toggleAppMaster:) forControlEvents:UIControlEventValueChanged];
-        cell.accessoryView = sw;
-        return cell;
-    }
-
-    if (self.containers.count == 0) {
-        UITableViewCell *empty = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        empty.textLabel.text = @"Sin contenedores de Crane en esta app";
-        empty.detailTextLabel.text = @"Crea un contenedor en Crane para gestionarlo aquí";
-        return empty;
-    }
-
-    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-    cell.textLabel.numberOfLines = 0;
-    cell.detailTextLabel.numberOfLines = 0;
-
-    NSMutableDictionary *prof = self.containers[indexPath.row];
-    NSString *uuid = prof[@"containerUUID"] ?: @"Default";
-    NSString *craneID = prof[@"craneIdentifier"] ?: uuid;
+    NSDictionary *prof = liveContainerProfile;
     NSString *cName = prof[@"containerName"] ?: @"Default";
-    BOOL contOn = prof[@"enabled"] ? [prof[@"enabled"] boolValue] : NO;
+    CGRect screenBounds = [UIScreen mainScreen].bounds;
+    BOOL tunnelUp = hasActiveUtunTunnelLive();
+    BOOL killSwitchTriggered = (s_shieldActive && s_spoofNetwork && !tunnelUp);
 
-    NSDictionary *activeMap = self.parentRoot.state[@"activeInCrane"];
-    NSString *activeID = activeMap[self.bundleID];
-    BOOL isCurrentInCrane = (activeID &&
-                             ([activeID caseInsensitiveCompare:uuid] == NSOrderedSame ||
-                              [activeID caseInsensitiveCompare:craneID] == NSOrderedSame ||
-                              [activeID caseInsensitiveCompare:cName] == NSOrderedSame));
+    if (!persistentBadgeWindow) {
+        if (activeScene) {
+            persistentBadgeWindow = [[_UIStatusBarLocalOverlayWindow alloc] initWithWindowScene:activeScene];
+        } else {
+            persistentBadgeWindow = [[_UIStatusBarLocalOverlayWindow alloc] initWithFrame:screenBounds];
+        }
+        persistentBadgeWindow.frame = CGRectMake(0, 0, screenBounds.size.width, 92);
+        persistentBadgeWindow.backgroundColor = [UIColor clearColor];
+        persistentBadgeWindow.windowLevel = UIWindowLevelStatusBar + 100.0;
+        persistentBadgeWindow.userInteractionEnabled = NO;
 
-    cell.imageView.image = settingsBadgeIcon(isCurrentInCrane ? @"checkmark.circle.fill" : @"shippingbox.fill",
-                                             (masterOn && appOn && contOn) ? [UIColor systemBlueColor] : [UIColor systemGrayColor]);
-    cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-    cell.textLabel.text = isCurrentInCrane ? [NSString stringWithFormat:@"%@ (Activo en Crane)", cName] : cName;
+        UIViewController *rootVC = [[UIViewController alloc] init];
+        rootVC.view.backgroundColor = [UIColor clearColor];
+        rootVC.view.userInteractionEnabled = NO;
+        persistentBadgeWindow.rootViewController = rootVC;
 
-    NSString *shortIDFV = [prof[@"idfv"] length] >= 8 ? [prof[@"idfv"] substringToIndex:8] : prof[@"idfv"];
-    BOOL isCell = ![prof[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
-    NSString *netDesc = isCell
+        persistentBadgePill = [[UILabel alloc] init];
+        persistentBadgePill.font = [UIFont systemFontOfSize:10.0 weight:UIFontWeightBold];
+        persistentBadgePill.textColor = [UIColor whiteColor];
+        persistentBadgePill.textAlignment = NSTextAlignmentCenter;
+        persistentBadgePill.layer.cornerRadius = 8.0;
+        persistentBadgePill.layer.borderWidth = 0.8;
+        persistentBadgePill.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.25].CGColor;
+        persistentBadgePill.clipsToBounds = YES;
+
+        [rootVC.view addSubview:persistentBadgePill];
+        s_lastRenderedBadgeState = -1;
+        refreshBadgePillStateOnMain();
+        persistentBadgeWindow.hidden = NO;
+        startTunnelWatchdogTimer();
+    }
+
+    NSString *netMode = s_isCellularMode
         ? [NSString stringWithFormat:@"4G: %@ (%@)", prof[@"CarrierName"] ?: @"Móvil", prof[@"cellularLocalIP"] ?: @"CGNAT"]
         : [NSString stringWithFormat:@"Wi-Fi (%@)", prof[@"localIP"] ?: @"LAN"];
     int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
-    if (masterOn && appOn && contOn) {
-        BOOL ksNoTunnel = (!self.parentRoot.vpnActive && (prof[@"spoofNetwork"] == nil || [prof[@"spoofNetwork"] boolValue]));
-        cell.detailTextLabel.textColor = ksNoTunnel ? [UIColor systemRedColor] : [UIColor systemGreenColor];
-        cell.detailTextLabel.text = ksNoTunnel
-            ? [NSString stringWithFormat:@"⛔ KILL-SWITCH (Sin túnel) • %@\nIP: %@ • ID: %@...", netDesc, prof[@"lastSyncedIP"] ?: @"Pendiente", shortIDFV]
-            : [NSString stringWithFormat:@"● PROTEGIDO • %@ • ID: %@...\nIP: %@ • Bat: %d%%", netDesc, shortIDFV, prof[@"lastSyncedIP"] ?: @"Sin sincronizar", batPct];
+    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(16, 40, screenBounds.size.width - 32, 42)];
+    toast.layer.cornerRadius = 10.0;
+    toast.clipsToBounds = YES;
+    toast.textAlignment = NSTextAlignmentCenter;
+    toast.font = [UIFont boldSystemFontOfSize:11.5];
+    toast.numberOfLines = 2;
+    toast.textColor = [UIColor whiteColor];
+    toast.userInteractionEnabled = NO;
+
+    if (killSwitchTriggered) {
+        toast.backgroundColor = [UIColor colorWithRed:0.80 green:0.12 blue:0.12 alpha:0.96];
+        toast.text = [NSString stringWithFormat:@"⛔ %@ (SIN TÚNEL IPV4) • Kill-Switch Activo\nEnciende Shadowrocket para habilitar conexión", cName];
+    } else if (s_shieldActive) {
+        toast.backgroundColor = [UIColor colorWithRed:0.06 green:0.48 blue:0.24 alpha:0.94];
+        toast.text = [NSString stringWithFormat:@"🛡️ %@ • %@ • Bat: %d%%\n%@ • %@",
+                      cName, netMode, batPct, prof[@"lastSyncedIP"] ?: @"TCP Puro", prof[@"timeZone"] ?: @""];
     } else {
-        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"○ EN PAUSA • ID: %@...", shortIDFV];
+        toast.backgroundColor = [UIColor colorWithRed:0.45 green:0.45 blue:0.48 alpha:0.92];
+        toast.text = [NSString stringWithFormat:@"⚪ %@ • En Pausa Manual (Datos Nativos)", cName];
     }
 
-    UISwitch *sw = [[UISwitch alloc] init];
-    sw.on = contOn;
-    sw.enabled = (masterOn && appOn);
-    sw.tag = indexPath.row;
-    [sw addTarget:self action:@selector(toggleContainerRowSwitch:) forControlEvents:UIControlEventValueChanged];
-    cell.accessoryView = sw;
-    return cell;
-}
-
-- (void)toggleAppMaster:(UISwitch *)sender {
-    triggerHaptic();
-    self.parentRoot.state[self.appStateKey] = @(sender.isOn);
-    [self.parentRoot syncAllContainerLocalPlists];
-    [self.parentRoot auditStealthEngineStatus];
-    killAppProcess([self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
-    [self.tableView reloadData];
-}
-
-- (void)toggleContainerRowSwitch:(UISwitch *)sender {
-    triggerHaptic();
-    if (sender.tag < 0 || sender.tag >= self.containers.count) return;
-    NSMutableDictionary *targetProf = self.containers[sender.tag];
-    NSString *targetUUID = targetProf[@"containerUUID"];
-    NSString *cName = targetProf[@"containerName"] ?: @"Contenedor";
-    BOOL excl = [self.parentRoot.state[@"exclusiveMode"] boolValue];
-
-    [self.parentRoot setContainer:targetUUID enabled:sender.isOn inBundle:self.bundleID];
-    self.containers = [self.bundleID isEqualToString:@"com.burbn.instagram"]
-        ? self.parentRoot.igContainersList
-        : self.parentRoot.redditContainersList;
-    [self.tableView reloadData];
-
-    if (sender.isOn && excl && self.containers.count > 1) {
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔒 Contenedor Exclusivo Activo"
-                                                                    message:[NSString stringWithFormat:@"Se activó \"%@\" y se pusieron en pausa los demás contenedores de %@.", cName, self.appTitle]
-                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:ac animated:YES completion:nil];
-    }
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    if (indexPath.section != 1 || self.containers.count == 0) return;
-
-    triggerHaptic();
-    NSMutableDictionary *prof = self.containers[indexPath.row];
-    IGFarmContainerDetailController *detailVC = [[IGFarmContainerDetailController alloc] init];
-    detailVC.bundleID = self.bundleID;
-    detailVC.containerUUID = prof[@"containerUUID"];
-    detailVC.profile = prof;
-    detailVC.parentRoot = self.parentRoot;
-    [self.navigationController pushViewController:detailVC animated:YES];
-}
-
-@end
-
-@implementation IGFarmContainerDetailController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
-    self.tableView.delegate = self;
-    self.tableView.dataSource = self;
-    self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 68.0;
-    self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.view addSubview:self.tableView];
-}
-
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    NSMutableDictionary *fresh = [self.parentRoot profileForUUID:self.containerUUID];
-    if (fresh) self.profile = fresh;
-    self.title = self.profile[@"containerName"] ?: @"Contenedor";
-    [self.tableView reloadData];
-}
-
-- (void)saveCurrentProfile {
-    if (self.parentRoot && self.profile && self.containerUUID) {
-        [self.parentRoot saveProfile:self.profile forUUID:self.containerUUID saveNow:YES];
-        [self.parentRoot syncAllContainerLocalPlists];
-        [self.parentRoot auditStealthEngineStatus];
-        killAppProcess([self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"Instagram" : @"Reddit");
-    }
-}
-
-- (BOOL)isModOn:(NSString *)key {
-    BOOL contOn = self.profile[@"enabled"] ? [self.profile[@"enabled"] boolValue] : NO;
-    if (!contOn) return NO;
-    return (self.profile[key] == nil) ? YES : [self.profile[key] boolValue];
-}
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 4; }
-
-- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    switch (section) {
-        case 0: return @"1. CONEXIÓN Y AUDITORÍA DE RED";
-        case 1: return @"2. MÓDULOS DE AISLAMIENTO INDEPENDIENTES";
-        case 2: return @"3. HUELLA AISLADA (TOCA PARA COPIAR)";
-        case 3: return @"4. SENSORES Y ACCIONES DE CICLO";
-        default: return nil;
-    }
-}
-
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    switch (section) {
-        case 0: return 3;
-        case 1: return 5;
-        case 2: return 6;
-        case 3: return 2;
-        default: return 0;
-    }
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    BOOL contOn = self.profile[@"enabled"] ? [self.profile[@"enabled"] boolValue] : NO;
-
-    if (indexPath.section == 0) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        cell.textLabel.numberOfLines = 0;
-        cell.detailTextLabel.numberOfLines = 0;
-
-        if (indexPath.row == 0) {
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            cell.imageView.image = settingsBadgeIcon(@"shield.fill", contOn ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
-            cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-            cell.textLabel.text = @"Activar Escudo en este Contenedor";
-            cell.detailTextLabel.text = contOn ? @"Activo • Sincronizado en Sandbox con cápsula superior" : @"En pausa manual (Datos nativos)";
-            cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-            UISwitch *sw = [[UISwitch alloc] init];
-            sw.on = contOn;
-            sw.tag = 100;
-            [sw addTarget:self action:@selector(toggleSwitch:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
-        } else if (indexPath.row == 1) {
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.imageView.image = settingsBadgeIcon(@"network", [UIColor systemBlueColor]);
-            cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-            cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.textLabel.text = @"Sincronizar IP y Red en este Contenedor";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"Adapta operadora, CGNAT y hora al proxy • IP: %@",
-                                         self.profile[@"lastSyncedIP"] ?: @"Sin sincronizar"];
-        } else {
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-            cell.imageView.image = settingsBadgeIcon(@"paperplane.fill", [UIColor systemIndigoColor]);
-            cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-            cell.textLabel.textColor = [UIColor systemIndigoColor];
-            cell.textLabel.text = @"Auditar IP en Proxy Center (Telegram)";
-            cell.detailTextLabel.text = @"Verifica en tu VPS si la IP actual está limpia";
-        }
-        return cell;
-    }
-
-    if (indexPath.section == 1) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.textLabel.numberOfLines = 0;
-        cell.detailTextLabel.numberOfLines = 0;
-
-        NSArray *icons = @[@"key.fill", @"network", @"globe.americas.fill", @"battery.100", @"eye.slash.fill"];
-        NSArray *colors = @[[UIColor systemPurpleColor], [UIColor systemBlueColor], [UIColor systemTealColor], [UIColor systemGreenColor], [UIColor systemOrangeColor]];
-        NSArray *titles = @[
-            @"Identificadores y Tiempo de Arranque",
-            @"Coherencia 4G CGNAT, TCP Puro y Kill-Switch",
-            @"Hora e Idioma según la IP",
-            @"Sensores de Humanidad del Teléfono",
-            @"Modo Invisible (C, Foundation, Swift y ObjC)"
-        ];
-        NSArray *subtitles = @[
-            @"Aísla IDFV de Crane, BootSessionUUID, kern.boottime y systemUptime por contenedor",
-            @"Presenta pdp_ip0 (100.x.y.z) + WWAN, rechaza QUIC/UDP externo y activa Kill-Switch utun",
-            @"Ajusta la zona horaria (C TZ + NSTimeZone) e idioma sin duplicados en NSLocale",
-            @"Simula batería, volumen, brillo y espacio libre sin alterar la identidad",
-            @"Oculta /var/jb, Crane, ElleKit y este tweak ante llamadas directas e indirectas"
-        ];
-        NSArray *keys = @[@"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity"];
-
-        cell.imageView.image = settingsBadgeIcon(icons[indexPath.row], colors[indexPath.row]);
-        cell.textLabel.font = [UIFont systemFontOfSize:14.5 weight:UIFontWeightSemibold];
-        cell.textLabel.text = titles[indexPath.row];
-        cell.detailTextLabel.font = [UIFont systemFontOfSize:12.0];
-        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-        cell.detailTextLabel.text = subtitles[indexPath.row];
-
-        UISwitch *sw = [[UISwitch alloc] init];
-        NSString *k = keys[indexPath.row];
-        sw.on = (self.profile[k] == nil) ? YES : [self.profile[k] boolValue];
-        sw.enabled = contOn;
-        sw.tag = 200 + indexPath.row;
-        [sw addTarget:self action:@selector(toggleSwitch:) forControlEvents:UIControlEventValueChanged];
-        cell.accessoryView = sw;
-        return cell;
-    }
-
-    if (indexPath.section == 2) {
-        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-        cell.textLabel.numberOfLines = 0;
-        cell.detailTextLabel.numberOfLines = 0;
-        cell.textLabel.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
-        cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:11.5 weight:UIFontWeightRegular];
-
-        double freeGB = [self.profile[@"freeBytes"] unsignedLongLongValue] / (1024.0*1024.0*1024.0);
-        int batPct = (int)([self.profile[@"batteryLevel"] floatValue] * 100.0f);
-        int volPct = (int)([self.profile[@"audioVolume"] floatValue] * 100.0f);
-        int briPct = (int)([self.profile[@"brightness"] floatValue] * 100.0f);
-        NSString *craneID = self.profile[@"craneIdentifier"] ?: self.containerUUID;
-
-        switch (indexPath.row) {
-            case 0: {
-                cell.textLabel.text = @"📦 Identidad del Contenedor (Crane)";
-                cell.detailTextLabel.textColor = contOn ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"Nombre:       %@\nContainer ID: %@",
-                                             self.profile[@"containerName"] ?: @"Default", craneID];
-                break;
+    [persistentBadgeWindow.rootViewController.view addSubview:toast];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.35 animations:^{
+            toast.alpha = 0.0;
+        } completion:^(BOOL f) {
+            [toast removeFromSuperview];
+            if (persistentBadgeWindow) {
+                persistentBadgeWindow.frame = CGRectMake(0, 0, screenBounds.size.width, 40);
             }
-            case 1: {
-                BOOL on = [self isModOn:@"spoofIDs"];
-                cell.textLabel.text = @"🔑 Identificadores y Arranque Aislado";
-                cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-                cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"● CONSTANTES EN ESTA CUENTA:\nIDFV:     %@\nBootUUID: %@\nUptime:   %@",
-                       self.profile[@"idfv"], self.profile[@"bootSessionUUID"], formatBootUptimeSummary(self.profile)]
-                    : @"○ EN PAUSA (Mostrando BootUUID y boottime nativos)";
-                break;
-            }
-            case 2: {
-                BOOL on = [self isModOn:@"spoofNetwork"];
-                BOOL isCell = ![self.profile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
-                cell.textLabel.text = @"📡 Configuración de Red y Kill-Switch";
-                cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-                if (!on) {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"○ EN PAUSA (LAN real: %@)", self.parentRoot.realLocalIP ?: @"LAN"];
-                } else if (isCell) {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL MÓVIL 4G WWAN + TCP PURO:\nOperadora: %@ (MCC %@ / MNC %@)\nInterfaz:  pdp_ip0 (%@) • en0/utun ocultos\nSockets:   Kill-Switch activo • QUIC/UDP rechazados",
-                                                 self.profile[@"CarrierName"] ?: @"T-Mobile",
-                                                 self.profile[@"CarrierMCC"] ?: @"310",
-                                                 self.profile[@"CarrierMNC"] ?: @"260",
-                                                 self.profile[@"cellularLocalIP"] ?: @"100.72.14.88"];
-                } else {
-                    cell.detailTextLabel.text = [NSString stringWithFormat:@"● PERFIL WI-FI RESIDENCIAL + TCP PURO:\nRouter:    %@ (%@)\nInterfaz:  en0 (%@) • pdp_ip0/utun ocultos\nSockets:   Kill-Switch activo • QUIC/UDP rechazados",
-                                                 self.profile[@"ssid"], self.profile[@"bssid"],
-                                                 self.profile[@"localIP"] ?: @"192.168.1.45"];
-                }
-                break;
-            }
-            case 3: {
-                BOOL on = [self isModOn:@"spoofLocation"];
-                cell.textLabel.text = @"🌎 Ubicación de Red y Zona Horaria";
-                cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-                cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"● AISLADO POR CONTENEDOR:\nIP / ISP:      %@ (%@)\nUbicación:     %@\nZona / Idioma: %@ (%@)",
-                       self.profile[@"lastSyncedIP"] ?: @"Sin sincronizar", self.profile[@"ispName"] ?: @"ISP",
-                       self.profile[@"cityCountry"] ?: @"Sincroniza arriba", self.profile[@"timeZone"], self.profile[@"localeID"]]
-                    : [NSString stringWithFormat:@"○ EN PAUSA (Hora local %@)", [[NSTimeZone localTimeZone] name]];
-                break;
-            }
-            case 4: {
-                BOOL on = [self isModOn:@"spoofHardware"];
-                cell.textLabel.text = @"🔋 Sensores de Humanidad";
-                cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-                cell.detailTextLabel.text = on
-                    ? [NSString stringWithFormat:@"● INDEPENDIENTE DEL TELÉFONO REAL:\nBatería: %d%% (Descarga gradual) • Volumen: %d%%\nBrillo:  %d%% • Disco Libre: %.2f GB",
-                       batPct, volPct, briPct, freeGB]
-                    : [NSString stringWithFormat:@"○ EN PAUSA (Bat %d%% • Vol %d%%)", self.parentRoot.realBatteryPct, self.parentRoot.realVolumePct];
-                break;
-            }
-            case 5: {
-                BOOL on = [self isModOn:@"spoofSecurity"];
-                cell.textLabel.text = @"🛡️ Modo Invisible";
-                cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
-                cell.detailTextLabel.text = on
-                    ? @"● ACTIVO EN ESTE CONTENEDOR:\nProtegidos: access/faccessat/stat/lstat/fopen/opendir\nCapas:      NSData/NSFileManager/NSURL/dyld/dladdr/Swift"
-                    : @"○ DESACTIVADO EN ESTE CONTENEDOR";
-                break;
-            }
-        }
-        return cell;
-    }
-
-    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-    cell.textLabel.numberOfLines = 0;
-    cell.detailTextLabel.numberOfLines = 0;
-
-    if (indexPath.row == 0) {
-        cell.imageView.image = settingsBadgeIcon(@"battery.100", [UIColor systemBlueColor]);
-        cell.textLabel.textColor = [UIColor systemBlueColor];
-        cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-        cell.textLabel.text = @"Renovar Sensores de Humanidad";
-        cell.detailTextLabel.text = @"Varía batería, volumen, brillo y memoria libre SIN cambiar BootUUID ni IDFV";
-        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-    } else {
-        cell.imageView.image = settingsBadgeIcon(@"arrow.clockwise.circle.fill", [UIColor systemOrangeColor]);
-        cell.textLabel.textColor = [UIColor systemOrangeColor];
-        cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-        cell.textLabel.text = @"Simular Reinicio del Teléfono (Nuevo BootUUID)";
-        cell.detailTextLabel.text = @"Renueva BootSessionUUID, kern.boottime e IP CGNAT manteniendo intacto el IDFV";
-        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-    }
-    return cell;
-}
-
-- (void)toggleSwitch:(UISwitch *)sender {
-    triggerHaptic();
-    if (sender.tag == 100) {
-        [self.parentRoot setContainer:self.containerUUID enabled:sender.isOn inBundle:self.bundleID];
-        self.profile[@"enabled"] = @(sender.isOn);
-        [self.tableView reloadData];
-
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:sender.isOn ? @"🟢 Contenedor Protegido" : @"⚪ Contenedor en Pausa"
-                                                                    message:sender.isOn
-                                                                        ? [NSString stringWithFormat:@"Escudo activado para \"%@\".\n• IDFV: %@\n• BootUUID: %@\n• Uptime: %@", self.profile[@"containerName"], self.profile[@"idfv"], self.profile[@"bootSessionUUID"], formatBootUptimeSummary(self.profile)]
-                                                                        : @"Contenedor en pausa manual."
-                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:ac animated:YES completion:nil];
-        return;
-    }
-
-    if (sender.tag >= 200) {
-        NSInteger idx = sender.tag - 200;
-        NSArray *keys = @[@"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity"];
-        self.profile[keys[idx]] = @(sender.isOn);
-        [self saveCurrentProfile];
-        [self.tableView reloadData];
-    }
-}
-
-- (void)refreshPurePhoneTelemetryValuesOnly {
-    uint64_t seed = randomSeedPrefs64(self.containerUUID);
-    unsigned long long freeBytes = ((14200ULL + (seed % 32000ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
-
-    self.profile[@"batteryLevel"] = @(0.26f + ((seed % 66) / 100.0f));
-    self.profile[@"audioVolume"] = @(0.15f + (((seed >> 6) % 75) / 100.0f));
-    self.profile[@"brightness"] = @(0.22f + (((seed >> 4) % 68) / 100.0f));
-    self.profile[@"freeBytes"] = @(freeBytes);
-    self.profile[@"pasteboardCount"] = @(4 + (seed % 95));
-}
-
-- (void)refreshPurePhoneTelemetryWithPopup {
-    triggerHaptic();
-    [self refreshPurePhoneTelemetryValuesOnly];
-    [self saveCurrentProfile];
-    [self.tableView reloadData];
-
-    double freeGB = [self.profile[@"freeBytes"] unsignedLongLongValue] / (1024.0*1024.0*1024.0);
-    int batPct = (int)([self.profile[@"batteryLevel"] floatValue] * 100.0f);
-    int volPct = (int)([self.profile[@"audioVolume"] floatValue] * 100.0f);
-    int briPct = (int)([self.profile[@"brightness"] floatValue] * 100.0f);
-
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔋 Sensores Renovados"
-                                                                message:[NSString stringWithFormat:@"Sensores actualizados en \"%@\" (IDFV y BootUUID intactos):\n\n• Batería: %d%%\n• Volumen: %d%%\n• Brillo: %d%%\n• Espacio Libre: %.2f GB",
-                                                                         self.profile[@"containerName"], batPct, volPct, briPct, freeGB]
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Perfecto" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)rotateBootUUIDWithPopup {
-    triggerHaptic();
-    NSString *newBootUUID = [[NSUUID UUID] UUIDString];
-    self.profile[@"bootSessionUUID"] = newBootUUID;
-    assignSpoofedBootTimeToProfile(self.profile, YES);
-    self.profile[@"cellularLocalIP"] = generateCellularCGNATAddress(newBootUUID);
-    [self saveCurrentProfile];
-    [self.tableView reloadData];
-
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔄 Reinicio Simulado Aplicado"
-                                                                message:[NSString stringWithFormat:@"Ciclo renovado en \"%@\" (IDFV intacto):\n\n• Nuevo BootUUID:\n%@\n\n• Nuevo Uptime:\n%@\n\n• Nueva IP CGNAT 4G:\n%@",
-                                                                         self.profile[@"containerName"],
-                                                                         newBootUUID,
-                                                                         formatBootUptimeSummary(self.profile),
-                                                                         self.profile[@"cellularLocalIP"]]
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    triggerHaptic();
-
-    if (indexPath.section == 0) {
-        if (indexPath.row == 1) [self syncWithLiveIPAndAuditVPS:NO];
-        else if (indexPath.row == 2) [self syncWithLiveIPAndAuditVPS:YES];
-        return;
-    }
-
-    if (indexPath.section == 2) {
-        UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
-        if (cell.detailTextLabel.text.length > 0) {
-            [UIPasteboard generalPasteboard].string = cell.detailTextLabel.text;
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"📋 Copiado al Portapapeles"
-                                                                        message:cell.detailTextLabel.text
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:ac animated:YES completion:nil];
-        }
-        return;
-    }
-
-    if (indexPath.section == 3) {
-        if (indexPath.row == 0) [self refreshPurePhoneTelemetryWithPopup];
-        else [self rotateBootUUIDWithPopup];
-    }
-}
-
-- (void)syncWithLiveIPAndAuditVPS:(BOOL)sendToVPS {
-    NSArray *endpoints = @[
-        @"https://ipwho.is/",
-        @"https://ipinfo.io/json",
-        @"https://ipapi.co/json/",
-        @"https://freeipapi.com/api/json",
-        @"http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,timezone,isp,mobile,query"
-    ];
-
-    fetchLiveIPFromEndpoints(endpoints, 0, ^(NSDictionary *parsed, NSError *error) {
-        if (!parsed || error) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Error de Conexión"
-                                                                            message:@"Ningún servidor de IP respondió a través del proxy actual. Verifica que Shadowrocket esté encendido y con salida."
-                                                                     preferredStyle:UIAlertControllerStyleAlert];
-                [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                [self presentViewController:ac animated:YES completion:nil];
-            });
-            return;
-        }
-
-        NSString *ip = parsed[@"ip"];
-        NSString *ispRaw = parsed[@"isp"];
-        NSString *cc = parsed[@"cc"];
-        NSString *city = parsed[@"city"];
-        NSString *region = parsed[@"region"];
-        NSString *tz = parsed[@"tz"];
-        BOOL isMobileISP = [parsed[@"mobile"] boolValue];
-
-        classifyIPAndApplyToProfile(self.profile, ip, ispRaw, cc, city, region, tz, isMobileISP);
-        [self saveCurrentProfile];
-
-        if (!sendToVPS) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self.tableView reloadData];
-                BOOL isCell = ![self.profile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"✅ Red Sincronizada"
-                                                                            message:[NSString stringWithFormat:@"• Contenedor: %@\n• IP Pública: %@\n• ISP: %@\n• Perfil: %@\n• Ubicación: %@, %@ (%@)\n• Zona Horaria: %@",
-                                                                                     self.profile[@"containerName"], ip, ispRaw, isCell ? @"📱 4G CGNAT (pdp_ip0)" : @"🛜 Wi-Fi Residencial (en0)", city, region, [cc uppercaseString], tz]
-                                                                     preferredStyle:UIAlertControllerStyleAlert];
-                [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                [self presentViewController:ac animated:YES completion:nil];
-            });
-            return;
-        }
-
-        NSString *plat = [self.bundleID isEqualToString:@"com.burbn.instagram"] ? @"INSTAGRAM" : @"REDDIT";
-        NSString *cName = self.profile[@"containerName"] ?: @"Default";
-        NSString *contEnc = [cName stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"Default";
-        NSString *ispEnc = [(ispRaw ?: @"") stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
-        int shieldFlag = [self isModOn:@"spoofSecurity"] ? 1 : 0;
-
-        NSString *vpsUrlStr = [NSString stringWithFormat:@"%@?ip=%@&contenedor=%@&plataforma=%@&shield=%d&bssid=%@&isp=%@&cc=%@",
-                               VPS_AUDIT_URL, ip, contEnc, plat, shieldFlag, self.profile[@"bssid"] ?: @"", ispEnc, cc];
-
-        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-        cfg.timeoutIntervalForRequest = 8.0;
-        NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-
-        [[session dataTaskWithURL:[NSURL URLWithString:vpsUrlStr] completionHandler:^(NSData *vData, NSURLResponse *vResp, NSError *vErr) {
-            NSDictionary *vpsJson = (!vErr && vData) ? [NSJSONSerialization JSONObjectWithData:vData options:0 error:nil] : nil;
-            NSString *msj = ([vpsJson isKindOfClass:[NSDictionary class]] && vpsJson[@"mensaje_iphone"])
-                ? vpsJson[@"mensaje_iphone"]
-                : [NSString stringWithFormat:@"⚠️ El VPS no respondió en el puerto 5001 (verifica 162.35.105.151 en skip-proxy de Shadowrocket), pero la IP %@ (%@) quedó sincronizada en este contenedor.", ip, ispRaw];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self.tableView reloadData];
-                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Auditoría Proxy Center" message:msj preferredStyle:UIAlertControllerStyleAlert];
-                [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                [self presentViewController:ac animated:YES completion:nil];
-            });
-        }] resume];
+        }];
     });
 }
 
-@end
+// ============================================================================
+// MODO INVISIBLE EN C, DLOPEN, FOUNDATION, SWIFT Y OBJECTIVE-C
+// ============================================================================
+static BOOL isHiddenPathForTargetAppC(const char *path) {
+    if (!path || !*path) return NO;
+
+    if (containsIgnoreCaseC(path, "cryptex")) return NO;
+
+    if (s_containerHomeLen > 0 && strncmp(path, s_containerHomePath, s_containerHomeLen) == 0) {
+        if (strstr(path, ".igshield_container") != NULL || containsIgnoreCaseC(path, "igfarmshield")) {
+            return YES;
+        }
+        return NO;
+    }
+
+    if (containsIgnoreCaseC(path, "igfarmshield") || strstr(path, ".igshield_container") != NULL) {
+        return YES;
+    }
+
+    if (containsIgnoreCaseC(path, "crane.dylib") ||
+        containsIgnoreCaseC(path, "libcrane") ||
+        containsIgnoreCaseC(path, "cranegui") ||
+        containsIgnoreCaseC(path, "com.opa334.crane") ||
+        containsIgnoreCaseC(path, "/application support/crane") ||
+        containsIgnoreCaseC(path, "/library/crane") ||
+        strstr(path, "___Crane_Containers") != NULL) {
+        return YES;
+    }
+
+    if (strncmp(path, "/var/jb", 7) == 0 ||
+        strncmp(path, "/private/var/jb", 15) == 0 ||
+        strncmp(path, "/private/preboot", 16) == 0 ||
+        containsIgnoreCaseC(path, "/applications/sileo.app") ||
+        containsIgnoreCaseC(path, "/applications/zebra.app") ||
+        containsIgnoreCaseC(path, "/applications/filza.app") ||
+        containsIgnoreCaseC(path, "/applications/cydia.app") ||
+        strncmp(path, "/Library/MobileSubstrate", 24) == 0 ||
+        containsIgnoreCaseC(path, "ellekit") ||
+        containsIgnoreCaseC(path, "choicy") ||
+        containsIgnoreCaseC(path, "shadow.dylib") ||
+        containsIgnoreCaseC(path, "sileo") ||
+        containsIgnoreCaseC(path, "filza") ||
+        containsIgnoreCaseC(path, "palera1n") ||
+        containsIgnoreCaseC(path, "dopamine") ||
+        containsIgnoreCaseC(path, "mobilesubstrate") ||
+        containsIgnoreCaseC(path, "substrate") ||
+        containsIgnoreCaseC(path, "substitute") ||
+        containsIgnoreCaseC(path, "tweakinject") ||
+        containsIgnoreCaseC(path, "apt/sources.list")) {
+        return YES;
+    }
+    return NO;
+}
+
+static int custom_access(const char *path, int amode) {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return orig_access(path, amode);
+}
+
+static int custom_faccessat(int fd, const char *path, int mode, int flag) {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return orig_faccessat(fd, path, mode, flag);
+}
+
+static int custom_stat(const char *path, struct stat *buf) {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return orig_stat(path, buf);
+}
+
+static int custom_lstat(const char *path, struct stat *buf) {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return orig_lstat(path, buf);
+}
+
+static FILE *custom_fopen(const char *path, const char *mode) {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            errno = ENOENT;
+            return NULL;
+        }
+    }
+    return orig_fopen(path, mode);
+}
+
+static DIR *custom_opendir(const char *dirname) {
+    if (s_spoofSecurity && dirname && isHiddenPathForTargetAppC(dirname)) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            errno = ENOENT;
+            return NULL;
+        }
+    }
+    return orig_opendir(dirname);
+}
+
+static void *custom_dlopen(const char *path, int mode) {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
+        if (isCallerAppOrSwift(__builtin_return_address(0))) {
+            return NULL;
+        }
+    }
+    return orig_dlopen(path, mode);
+}
+
+static char *custom_getenv(const char *name) {
+    if (s_spoofSecurity && name && isCallerFromTargetAppStrict(__builtin_return_address(0))) {
+        if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
+            strcmp(name, "_MSSafeMode") == 0 ||
+            strcmp(name, "_SafeMode") == 0 ||
+            strcmp(name, "TZ") == 0 ||
+            strncmp(name, "CRANE_", 6) == 0) {
+            return NULL;
+        }
+    }
+    return orig_getenv(name);
+}
+
+static const char *custom_dyld_get_image_name(uint32_t image_index) {
+    const char *name = orig_dyld_get_image_name(image_index);
+    if (s_spoofSecurity && name && isHiddenPathForTargetAppC(name)) {
+        if (isCallerAppOrSwift(__builtin_return_address(0))) {
+            static const char *cleanSystemPaths[] = {
+                "/usr/lib/libSystem.B.dylib",
+                "/usr/lib/libc++.1.dylib",
+                "/usr/lib/libsqlite3.dylib",
+                "/usr/lib/libz.1.dylib",
+                "/usr/lib/libxml2.2.dylib",
+                "/usr/lib/libicucore.A.dylib",
+                "/usr/lib/libcompression.dylib",
+                "/usr/lib/libarchive.2.dylib",
+                "/usr/lib/libbsm.0.dylib",
+                "/usr/lib/libCRFSuite.dylib",
+                "/usr/lib/libenergytrace.dylib",
+                "/usr/lib/liblangid.dylib",
+                "/usr/lib/liblzma.5.dylib",
+                "/usr/lib/libMobileGestalt.dylib",
+                "/usr/lib/libnetwork.dylib",
+                "/usr/lib/libresolv.9.dylib"
+            };
+            return cleanSystemPaths[(image_index * 7U) % 16U];
+        }
+    }
+    return name;
+}
+
+static int custom_dladdr(const void *addr, Dl_info *info) {
+    int ret = orig_dladdr(addr, info);
+    if (s_spoofSecurity && ret != 0 && info && info->dli_fname && isHiddenPathForTargetAppC(info->dli_fname)) {
+        if (isCallerAppOrSwift(__builtin_return_address(0))) {
+            info->dli_fname = "/System/Library/Frameworks/UIKitCore.framework/UIKitCore";
+        }
+    }
+    return ret;
+}
+
+%hook NSData
++ (instancetype)dataWithContentsOfFile:(NSString *)path {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) return nil;
+    }
+    return %orig;
+}
++ (instancetype)dataWithContentsOfFile:(NSString *)path options:(NSDataReadingOptions)readOptionsMask error:(NSError * _Nullable *)errorPtr {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            if (errorPtr) *errorPtr = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
+            return nil;
+        }
+    }
+    return %orig;
+}
+%end
+
+%hook UIViewController
+- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    if ((s_spoofSecurity || s_spoofIDs) && [viewControllerToPresent isKindOfClass:[UIAlertController class]]) {
+        UIAlertController *ac = (UIAlertController *)viewControllerToPresent;
+        NSString *t = [ac.title ?: @"" lowercaseString];
+        NSString *m = [ac.message ?: @"" lowercaseString];
+        if ([t containsString:@"apple id"] || [t containsString:@"icloud"] ||
+            [m containsString:@"apple id"] || [m containsString:@"icloud"]) {
+            if (completion) completion();
+            return;
+        }
+    }
+    %orig;
+}
+%end
+
+%hook UIApplication
+- (BOOL)canOpenURL:(NSURL *)url {
+    if (s_spoofSecurity && url && url.scheme) {
+        NSString *s = url.scheme.lowercaseString;
+        if ([@[@"sileo", @"zbra", @"filza", @"cydia", @"palera1n", @"dopamine", @"santander"] containsObject:s]) {
+            return NO;
+        }
+    }
+    return %orig;
+}
+- (NSArray<UIWindow *> *)windows {
+    NSArray<UIWindow *> *orig = %orig;
+    if (!persistentBadgeWindow || s_inInternalCall || !orig) return orig;
+    if (![orig containsObject:persistentBadgeWindow]) return orig;
+    NSMutableArray<UIWindow *> *filtered = [orig mutableCopy];
+    [filtered removeObject:persistentBadgeWindow];
+    return filtered;
+}
+%end
+
+%hook UIWindowScene
+- (NSArray<UIWindow *> *)windows {
+    NSArray<UIWindow *> *orig = %orig;
+    if (!persistentBadgeWindow || s_inInternalCall || !orig) return orig;
+    if (![orig containsObject:persistentBadgeWindow]) return orig;
+    NSMutableArray<UIWindow *> *filtered = [orig mutableCopy];
+    [filtered removeObject:persistentBadgeWindow];
+    return filtered;
+}
+%end
+
+%hook UIPasteboard
+- (NSInteger)changeCount {
+    if (!s_spoofSecurity || !liveContainerProfile) return %orig;
+    return [liveContainerProfile[@"pasteboardCount"] integerValue];
+}
+%end
+
+// ============================================================================
+// ZONA HORARIA (COREFOUNDATION + OBJC + C) E IDIOMA POR CONTENEDOR
+// ============================================================================
+static CFTimeZoneRef createSpoofedCFTimeZoneOrNull(void) {
+    if (!s_spoofLocation || !liveContainerProfile || s_inInternalCall) return NULL;
+    NSString *tzName = liveContainerProfile[@"timeZone"];
+    if (![tzName isKindOfClass:[NSString class]] || tzName.length == 0 ||
+        [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "]) {
+        return NULL;
+    }
+    return CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
+}
+
+static CFTimeZoneRef custom_CFTimeZoneCopySystem(void) {
+    CFTimeZoneRef tz = createSpoofedCFTimeZoneOrNull();
+    if (tz) return tz;
+    return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : NULL;
+}
+
+static CFTimeZoneRef custom_CFTimeZoneCopyDefault(void) {
+    CFTimeZoneRef tz = createSpoofedCFTimeZoneOrNull();
+    if (tz) return tz;
+    return orig_CFTimeZoneCopyDefault ? orig_CFTimeZoneCopyDefault() : NULL;
+}
+
+%hook NSTimeZone
++ (NSTimeZone *)systemTimeZone {
+    if (!s_spoofLocation || !liveContainerProfile) return %orig;
+    NSString *tzName = liveContainerProfile[@"timeZone"];
+    if (!tzName || [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "]) return %orig;
+    return [NSTimeZone timeZoneWithName:tzName] ?: %orig;
+}
++ (NSTimeZone *)localTimeZone {
+    if (!s_spoofLocation) return %orig;
+    return [self systemTimeZone];
+}
++ (NSTimeZone *)defaultTimeZone {
+    if (!s_spoofLocation) return %orig;
+    return [self systemTimeZone];
+}
+%end
+
+%hook NSLocale
++ (NSLocale *)currentLocale {
+    if (!s_spoofLocation || !liveContainerProfile) return %orig;
+    NSString *locID = liveContainerProfile[@"localeID"];
+    if (!locID) return %orig;
+    return [NSLocale localeWithLocaleIdentifier:locID] ?: %orig;
+}
++ (NSLocale *)autoupdatingCurrentLocale {
+    if (!s_spoofLocation) return %orig;
+    return [self currentLocale];
+}
++ (NSArray<NSString *> *)preferredLanguages {
+    if (!s_spoofLocation || !liveContainerProfile) return %orig;
+    NSString *locID = liveContainerProfile[@"localeID"] ?: @"en_US";
+    NSString *lang = [locID stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
+    if ([lang caseInsensitiveCompare:@"en-US"] == NSOrderedSame) {
+        return @[@"en-US"];
+    }
+    return @[lang, @"en-US"];
+}
+%end
+
+// ============================================================================
+// CORTAFUEGOS POSIX: KILL-SWITCH IPV4, BLOQUEO RFC1918 LAN, ANTI-QUIC E IP_BOUND_IF
+// ============================================================================
+static BOOL isSocketDatagram(int sockfd) {
+    int sockType = 0;
+    socklen_t optLen = sizeof(sockType);
+    if (getsockopt(sockfd, SOL_SOCKET, SO_TYPE, &sockType, &optLen) == 0) {
+        return (sockType == SOCK_DGRAM);
+    }
+    return NO;
+}
+
+static BOOL isRFC1918OrLinkLocalIPv4(uint32_t ipHost) {
+    if ((ipHost >> 24) == 10) return YES;                        // 10.0.0.0/8
+    if ((ipHost & 0xFFF00000U) == 0xAC100000U) return YES;       // 172.16.0.0/12
+    if ((ipHost & 0xFFFF0000U) == 0xC0A80000U) return YES;       // 192.168.0.0/16
+    if ((ipHost & 0xFFFF0000U) == 0xA9FE0000U) return YES;       // 169.254.0.0/16
+    return NO;
+}
+
+static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (!s_spoofNetwork || s_inInternalCall || !addr) return 0;
+
+    if (addr->sa_family == AF_INET && addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+        struct sockaddr_in sin;
+        memcpy(&sin, addr, sizeof(sin));
+        uint32_t ipHost = ntohl(sin.sin_addr.s_addr);
+        if (ipHost == 0 || (ipHost >> 24) == 127) return 0;
+
+        // 1. Kill-Switch real: exige interfaz utun IPv4 activa de Shadowrocket
+        if (!hasActiveUtunTunnelCached()) {
+            return ENETUNREACH;
+        }
+
+        // 2. Bloquea salida hacia el router/LAN local (excluida en tun-excluded-routes) y multicast
+        // Nota: 198.18.0.0/15 (Fake-IP de Shadowrocket) NO es RFC1918 y pasa limpiamente
+        if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
+            return EHOSTUNREACH;
+        }
+
+        // 3. Bloquea QUIC (UDP 443/80), STUN y todo UDP distinto de DNS enrutado al túnel (:53)
+        if (isSocketDatagram(sockfd)) {
+            uint16_t dstPort = ntohs(sin.sin_port);
+            if (dstPort != 53) {
+                return EHOSTUNREACH;
+            }
+        }
+        return 0;
+    }
+
+    if (addr->sa_family == AF_INET6 && addrlen >= (socklen_t)sizeof(struct sockaddr_in6)) {
+        struct sockaddr_in6 sin6;
+        memcpy(&sin6, addr, sizeof(sin6));
+
+        static const uint8_t loop6[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+        static const uint8_t zero6[16] = {0};
+        if (memcmp(sin6.sin6_addr.s6_addr, loop6, 16) == 0 ||
+            memcmp(sin6.sin6_addr.s6_addr, zero6, 16) == 0) {
+            return 0;
+        }
+
+        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        if (memcmp(sin6.sin6_addr.s6_addr, v4mapPrefix, 12) == 0) {
+            uint32_t mappedIPv4 = 0;
+            memcpy(&mappedIPv4, &sin6.sin6_addr.s6_addr[12], 4);
+            uint32_t ipHost = ntohl(mappedIPv4);
+            if (ipHost == 0 || (ipHost >> 24) == 127) return 0;
+
+            if (!hasActiveUtunTunnelCached()) {
+                return ENETUNREACH;
+            }
+            if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
+                return EHOSTUNREACH;
+            }
+            if (isSocketDatagram(sockfd)) {
+                uint16_t dstPort = ntohs(sin6.sin6_port);
+                if (dstPort != 53) {
+                    return EHOSTUNREACH;
+                }
+            }
+            return 0;
+        }
+
+        return ENETUNREACH;
+    }
+
+    return 0;
+}
+
+// Evita EADDRNOTAVAIL si Proxygen/WebRTC intenta hacer bind() a la IP CGNAT/LAN simulada
+static int custom_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (s_spoofNetwork && !s_inInternalCall && addr &&
+        addr->sa_family == AF_INET && addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+        struct sockaddr_in sin;
+        memcpy(&sin, addr, sizeof(sin));
+        if ((s_spoofedCellularAddr != 0 && sin.sin_addr.s_addr == s_spoofedCellularAddr) ||
+            (s_spoofedLanAddr != 0 && sin.sin_addr.s_addr == s_spoofedLanAddr)) {
+            sin.sin_addr.s_addr = htonl(INADDR_ANY);
+            return orig_bind(sockfd, (const struct sockaddr *)&sin, sizeof(sin));
+        }
+    }
+    return orig_bind(sockfd, addr, addrlen);
+}
+
+// Neutraliza IP_BOUND_IF hacia en0/pdp_ip0 para impedir bypass directo del túnel utun
+static int custom_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+    if (s_spoofNetwork && !s_inInternalCall && optval && optlen >= (socklen_t)sizeof(int)) {
+        if ((level == IPPROTO_IP && optname == IP_BOUND_IF) ||
+            (level == IPPROTO_IPV6 && optname == IPV6_BOUND_IF)) {
+            int reqIndex = 0;
+            memcpy(&reqIndex, optval, sizeof(int));
+            if (reqIndex > 0) {
+                char ifName[IF_NAMESIZE] = {0};
+                if (if_indextoname((unsigned int)reqIndex, ifName) != NULL) {
+                    if (strcmp(ifName, "lo0") != 0 && !isTunnelInterfaceNameC(ifName)) {
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    return orig_setsockopt(sockfd, level, optname, optval, optlen);
+}
+
+static int custom_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    int blockErr = evaluateSocketPolicy(sockfd, addr, addrlen);
+    if (blockErr != 0) {
+        errno = blockErr;
+        return -1;
+    }
+    return orig_connect(sockfd, addr, addrlen);
+}
+
+static ssize_t custom_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
+    if (dest_addr) {
+        int blockErr = evaluateSocketPolicy(sockfd, dest_addr, addrlen);
+        if (blockErr != 0) {
+            errno = blockErr;
+            return -1;
+        }
+    }
+    return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+}
+
+static ssize_t custom_sendmsg(int sockfd, const struct msghdr *msg, int flags) {
+    if (msg && msg->msg_name && msg->msg_namelen >= (socklen_t)sizeof(struct sockaddr)) {
+        int blockErr = evaluateSocketPolicy(sockfd, (const struct sockaddr *)msg->msg_name, msg->msg_namelen);
+        if (blockErr != 0) {
+            errno = blockErr;
+            return -1;
+        }
+    }
+    return orig_sendmsg(sockfd, msg, flags);
+}
+
+// ============================================================================
+// COHERENCIA DE RED, CARRIER SINTÉTICO SIN SIM Y GETIFADDRS ALINEADO EN ARM64
+// ============================================================================
+static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
+    Boolean ok = orig_SCNetworkReachabilityGetFlags ? orig_SCNetworkReachabilityGetFlags(target, flags) : FALSE;
+    if (!ok || !flags || !s_spoofNetwork) return ok;
+    if (!isCallerAppOrSwift(__builtin_return_address(0))) return ok;
+
+    if (!hasActiveUtunTunnelCached()) {
+        *flags = 0;
+        return TRUE;
+    }
+
+    *flags &= ~((SCNetworkReachabilityFlags)kSCNetworkReachabilityFlagsTransientConnection);
+    if ((*flags & kSCNetworkReachabilityFlagsReachable) != 0) {
+        if (s_isCellularMode) {
+            *flags |= kSCNetworkReachabilityFlagsIsWWAN;
+        } else {
+            *flags &= ~((SCNetworkReachabilityFlags)kSCNetworkReachabilityFlagsIsWWAN);
+        }
+    }
+    return ok;
+}
+
+static CFDictionaryRef custom_CFNetworkCopySystemProxySettings(void) {
+    CFDictionaryRef origRef = orig_CFNetworkCopySystemProxySettings ? orig_CFNetworkCopySystemProxySettings() : NULL;
+    if (!origRef || !s_spoofNetwork) return origRef;
+    if (!isCallerFromTargetAppStrict(__builtin_return_address(0))) return origRef;
+    if (!hasActiveUtunTunnelCached()) return origRef;
+
+    NSDictionary *origDict = (__bridge NSDictionary *)origRef;
+    NSMutableDictionary *cleanDict = [NSMutableDictionary dictionary];
+    NSString *primaryIf = s_isCellularMode ? @"pdp_ip0" : @"en0";
+
+    NSDictionary *scoped = origDict[@"__SCOPED__"];
+    if ([scoped isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *cleanScoped = [NSMutableDictionary dictionary];
+        for (NSString *ifKey in scoped) {
+            if (isTunnelInterfaceNameC([ifKey UTF8String])) continue;
+            if (s_isCellularMode && ([ifKey isEqualToString:@"en0"] || isSecondaryWifiInterfaceNameC([ifKey UTF8String]))) {
+                continue;
+            }
+            if (!s_isCellularMode && [ifKey hasPrefix:@"pdp_ip"]) continue;
+            cleanScoped[ifKey] = @{};
+        }
+        if (cleanScoped.count == 0) cleanScoped[primaryIf] = @{};
+        cleanDict[@"__SCOPED__"] = cleanScoped;
+    } else {
+        cleanDict[@"__SCOPED__"] = @{primaryIf: @{}};
+    }
+
+    CFRelease(origRef);
+    return (__bridge_retained CFDictionaryRef)cleanDict;
+}
+
+static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings) {
+    if (s_spoofNetwork && isCallerFromTargetAppStrict(__builtin_return_address(0))) {
+        if (hasActiveUtunTunnelCached()) {
+            NSDictionary *directProxy = @{
+                (__bridge NSString *)kCFProxyTypeKey : (__bridge NSString *)kCFProxyTypeNone
+            };
+            NSArray *arr = @[ directProxy ];
+            return (__bridge_retained CFArrayRef)arr;
+        }
+    }
+    return orig_CFNetworkCopyProxiesForURL ? orig_CFNetworkCopyProxiesForURL(url, proxySettings) : NULL;
+}
+
+%hook NSMutableURLRequest
+- (void)setAssumesHTTP3Capable:(BOOL)capable {
+    if (s_spoofNetwork) {
+        %orig(NO);
+        return;
+    }
+    %orig(capable);
+}
+- (BOOL)assumesHTTP3Capable {
+    if (s_spoofNetwork) return NO;
+    return %orig;
+}
+%end
+
+%hook NSURLSessionConfiguration
+- (NSDictionary *)connectionProxyDictionary {
+    NSDictionary *orig = %orig;
+    if (s_spoofNetwork && orig != nil && isCallerFromTargetAppStrict(__builtin_return_address(0))) {
+        if (hasActiveUtunTunnelCached()) return nil;
+    }
+    return orig;
+}
+%end
+
+static CTCarrier *sharedSyntheticCarrier(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        s_syntheticCarrier = [[CTCarrier alloc] init];
+    });
+    return s_syntheticCarrier;
+}
+
+%hook CTCarrier
+- (NSString *)carrierName {
+    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_isCellularMode) return nil;
+    return liveContainerProfile[@"CarrierName"] ?: @"T-Mobile";
+}
+- (NSString *)mobileCountryCode {
+    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_isCellularMode) return nil;
+    return liveContainerProfile[@"CarrierMCC"] ?: @"310";
+}
+- (NSString *)mobileNetworkCode {
+    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_isCellularMode) return nil;
+    return liveContainerProfile[@"CarrierMNC"] ?: @"260";
+}
+- (NSString *)isoCountryCode {
+    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_isCellularMode) return nil;
+    return liveContainerProfile[@"CarrierISO"] ?: @"us";
+}
+- (BOOL)allowsVOIP { return YES; }
+%end
+
+%hook CTTelephonyNetworkInfo
+- (CTCarrier *)subscriberCellularProvider {
+    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_isCellularMode) return nil;
+    return %orig ?: sharedSyntheticCarrier();
+}
+- (NSDictionary<NSString *, CTCarrier *> *)serviceSubscriberCellularProviders {
+    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_isCellularMode) return @{};
+    NSDictionary *orig = %orig;
+    if (orig && orig.count > 0) return orig;
+    return @{@"0000000100000001": sharedSyntheticCarrier()};
+}
+- (NSString *)currentRadioAccessTechnology {
+    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_isCellularMode) return nil;
+    return CTRadioAccessTechnologyLTE;
+}
+- (NSDictionary<NSString *, NSString *> *)serviceCurrentRadioAccessTechnology {
+    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_isCellularMode) return nil;
+    return @{@"0000000100000001": CTRadioAccessTechnologyLTE};
+}
+%end
+
+static void writeSockaddrInAddrSafely(struct sockaddr *sa, in_addr_t ipv4NetOrder) {
+    if (!sa || sa->sa_family != AF_INET) return;
+    memcpy((char *)sa + offsetof(struct sockaddr_in, sin_addr), &ipv4NetOrder, sizeof(in_addr_t));
+}
+
+static void applySpoofedCellularNode(struct ifaddrs *node) {
+    if (!node || s_spoofedCellularAddr == 0) return;
+    node->ifa_name = (char *)"pdp_ip0";
+    writeSockaddrInAddrSafely(node->ifa_addr, s_spoofedCellularAddr);
+    writeSockaddrInAddrSafely(node->ifa_netmask, htonl(0xFFFFFFFFU));
+    writeSockaddrInAddrSafely(node->ifa_dstaddr, s_spoofedCellularAddr);
+}
+
+static void applySpoofedWifiLanNode(struct ifaddrs *node) {
+    if (!node || s_spoofedLanAddr == 0) return;
+    writeSockaddrInAddrSafely(node->ifa_addr, s_spoofedLanAddr);
+    writeSockaddrInAddrSafely(node->ifa_netmask, s_spoofedLanMask);
+    writeSockaddrInAddrSafely(node->ifa_dstaddr, s_spoofedLanBcast);
+}
+
+static int custom_getifaddrs(struct ifaddrs **ifap) {
+    int res = orig_getifaddrs(ifap);
+    if (res != 0 || !ifap || !*ifap || !s_spoofNetwork) return res;
+    if (!isCallerAppOrSwift(__builtin_return_address(0))) return res;
+
+    BOOL hasLiveCellularIPv4 = NO;
+    for (struct ifaddrs *scan = *ifap; scan != NULL; scan = scan->ifa_next) {
+        if (scan->ifa_name && strcmp(scan->ifa_name, "pdp_ip0") == 0 &&
+            (scan->ifa_flags & IFF_UP) && scan->ifa_addr && scan->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in sin;
+            memcpy(&sin, scan->ifa_addr, sizeof(sin));
+            if (sin.sin_addr.s_addr != 0) {
+                hasLiveCellularIPv4 = YES;
+                break;
+            }
+        }
+    }
+
+    struct ifaddrs *head = *ifap;
+    if (head->ifa_name) {
+        if (isTunnelInterfaceNameC(head->ifa_name)) {
+            head->ifa_name = (char *)"lo0";
+            head->ifa_flags &= ~IFF_POINTOPOINT;
+        } else if (strcmp(head->ifa_name, "en0") == 0) {
+            if (s_isCellularMode && !hasLiveCellularIPv4 && head->ifa_addr && head->ifa_addr->sa_family == AF_INET) {
+                applySpoofedCellularNode(head);
+            } else if (!s_isCellularMode && head->ifa_addr && head->ifa_addr->sa_family == AF_INET) {
+                applySpoofedWifiLanNode(head);
+            }
+        }
+    }
+
+    struct ifaddrs *prev = head;
+    struct ifaddrs *curr = head->ifa_next;
+
+    while (curr != NULL) {
+        BOOL shouldHide = NO;
+        if (curr->ifa_name) {
+            if (isTunnelInterfaceNameC(curr->ifa_name)) {
+                shouldHide = YES;
+            } else if (s_isCellularMode && isSecondaryWifiInterfaceNameC(curr->ifa_name)) {
+                shouldHide = YES;
+            } else if (strcmp(curr->ifa_name, "en0") == 0) {
+                if (s_isCellularMode) {
+                    if (hasLiveCellularIPv4) {
+                        shouldHide = YES;
+                    } else if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
+                        applySpoofedCellularNode(curr);
+                    } else {
+                        shouldHide = YES;
+                    }
+                } else {
+                    if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
+                        applySpoofedWifiLanNode(curr);
+                    } else if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET6) {
+                        shouldHide = YES;
+                    }
+                }
+            } else if (strncmp(curr->ifa_name, "pdp_ip", 6) == 0) {
+                if (!s_isCellularMode) {
+                    shouldHide = YES;
+                } else if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET) {
+                    applySpoofedCellularNode(curr);
+                } else if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET6) {
+                    shouldHide = YES;
+                }
+            } else if (curr->ifa_addr && curr->ifa_addr->sa_family == AF_INET6 && strcmp(curr->ifa_name, "lo0") != 0) {
+                shouldHide = YES;
+            }
+        }
+
+        if (shouldHide) {
+            prev->ifa_next = curr->ifa_next;
+        } else {
+            prev = curr;
+        }
+        curr = curr->ifa_next;
+    }
+
+    return res;
+}
+
+static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
+    if (!s_spoofNetwork || !liveContainerProfile) return orig_CNCopyCurrentNetworkInfo(interfaceName);
+    if (s_isCellularMode) return NULL;
+    NSDictionary *fakeWifi = @{
+        @"SSID": liveContainerProfile[@"ssid"] ?: @"HomeWiFi-5G",
+        @"BSSID": liveContainerProfile[@"bssid"] ?: @"a4:83:e7:21:9a:10",
+        @"SSIDDATA": [(liveContainerProfile[@"ssid"] ?: @"HomeWiFi-5G") dataUsingEncoding:NSUTF8StringEncoding]
+    };
+    return (__bridge_retained CFDictionaryRef)fakeWifi;
+}
+
+// ============================================================================
+// TELEMETRÍA ORGÁNICA, RELOJ MONOTÓNICO Y BOOTTIME COHERENTE POR CONTENEDOR
+// ============================================================================
+%hook UIDevice
+- (NSString *)name {
+    if (!s_spoofHardware) return %orig;
+    return @"iPhone";
+}
+- (NSUUID *)identifierForVendor {
+    NSUUID *origUUID = %orig;
+    if (origUUID && !origCraneIDFV) {
+        origCraneIDFV = [[origUUID UUIDString] uppercaseString];
+    }
+    if (s_spoofIDs && liveContainerProfile) {
+        NSString *profUUIDStr = liveContainerProfile[@"idfv"];
+        if ([profUUIDStr isKindOfClass:[NSString class]] && profUUIDStr.length >= 32) {
+            NSUUID *customUUID = [[NSUUID alloc] initWithUUIDString:profUUIDStr];
+            if (customUUID) return customUUID;
+        }
+    }
+    return origUUID;
+}
+- (float)batteryLevel {
+    if (!s_spoofHardware || !liveContainerProfile) return %orig;
+    float baseBat = [liveContainerProfile[@"batteryLevel"] floatValue];
+    NSTimeInterval elapsedMinutes = ([[NSDate date] timeIntervalSince1970] - sessionStartTimestamp) / 60.0;
+    float drop = (float)((int)(elapsedMinutes / 12.0)) * 0.01f;
+    return MAX(0.15f, baseBat - drop);
+}
+- (UIDeviceBatteryState)batteryState {
+    if (!s_spoofHardware) return %orig;
+    return UIDeviceBatteryStateUnplugged;
+}
+%end
+
+%hook AVAudioSession
+- (float)outputVolume {
+    if (!s_spoofHardware || !liveContainerProfile) return %orig;
+    return liveContainerProfile[@"audioVolume"] ? [liveContainerProfile[@"audioVolume"] floatValue] : 0.50f;
+}
+%end
+
+static unsigned long long currentSmoothFreeDiskBytes(void) {
+    unsigned long long baseFree = [liveContainerProfile[@"freeBytes"] unsignedLongLongValue];
+    double elapsed = [[NSDate date] timeIntervalSince1970] - sessionStartTimestamp;
+    if (elapsed < 0.0) elapsed = 0.0;
+    unsigned long long consumed = (unsigned long long)(elapsed * 2048.0);
+    unsigned long long cap = 16ULL * 1024ULL * 1024ULL;
+    if (consumed > cap) consumed = cap;
+    return (baseFree > consumed) ? (baseFree - consumed) : baseFree;
+}
+
+static int custom_statfs(const char *path, struct statfs *buf) {
+    int ret = orig_statfs(path, buf);
+    if (ret == 0 && buf && s_spoofHardware && liveContainerProfile && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (liveContainerProfile[@"freeBytes"] && buf->f_bsize > 0) {
+            unsigned long long finalFree = currentSmoothFreeDiskBytes();
+            uint64_t blocks = finalFree / buf->f_bsize;
+            buf->f_bavail = blocks;
+            buf->f_bfree = blocks;
+        }
+    }
+    return ret;
+}
+
+%hook NSFileManager
+- (NSDictionary<NSFileAttributeKey, id> *)attributesOfFileSystemForPath:(NSString *)path error:(NSError * _Nullable *)error {
+    NSDictionary *orig = %orig;
+    if (!s_spoofHardware || !orig || !liveContainerProfile || !isCallerAppOrSwift(__builtin_return_address(0))) return orig;
+    NSMutableDictionary *modified = [orig mutableCopy];
+    if (liveContainerProfile[@"freeBytes"]) {
+        modified[NSFileSystemFreeSize] = @(currentSmoothFreeDiskBytes());
+    }
+    return modified;
+}
+- (BOOL)fileExistsAtPath:(NSString *)path {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) return NO;
+    }
+    return %orig;
+}
+- (BOOL)fileExistsAtPath:(NSString *)path isDirectory:(BOOL *)isDirectory {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) return NO;
+    }
+    return %orig;
+}
+- (NSArray<NSString *> *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError * _Nullable *)error {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
+            return nil;
+        }
+    }
+    return %orig;
+}
+- (NSDictionary<NSFileAttributeKey, id> *)attributesOfItemAtPath:(NSString *)path error:(NSError * _Nullable *)error {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC([path UTF8String])) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
+            return nil;
+        }
+    }
+    return %orig;
+}
+%end
+
+%hook NSURL
+- (BOOL)checkResourceIsReachableAndReturnError:(NSError * _Nullable *)error {
+    if (s_spoofSecurity && [self isFileURL]) {
+        NSString *p = [self path];
+        if (p && isHiddenPathForTargetAppC([p UTF8String])) {
+            if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+                if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadNoSuchFileError userInfo:nil];
+                return NO;
+            }
+        }
+    }
+    return %orig;
+}
+%end
+
+%hook NSProcessInfo
+- (NSString *)hostName {
+    if (s_spoofHardware || s_spoofIDs) {
+        return @"iphone.local";
+    }
+    return %orig;
+}
+- (NSTimeInterval)systemUptime {
+    if ((s_spoofIDs || s_spoofHardware) && s_spoofedBootSec > 0 && !s_inInternalCall) {
+        return spoofedSystemUptime();
+    }
+    return %orig;
+}
+- (NSDictionary<NSString *, NSString *> *)environment {
+    NSDictionary *orig = %orig;
+    if (!s_spoofSecurity || !orig || !isCallerAppOrSwift(__builtin_return_address(0))) {
+        return orig;
+    }
+    NSMutableDictionary *cleanEnv = [orig mutableCopy];
+    for (NSString *k in [orig allKeys]) {
+        if ([k isEqualToString:@"DYLD_INSERT_LIBRARIES"] ||
+            [k isEqualToString:@"_MSSafeMode"] ||
+            [k isEqualToString:@"_SafeMode"] ||
+            [k isEqualToString:@"TZ"] ||
+            [k hasPrefix:@"CRANE_"]) {
+            [cleanEnv removeObjectForKey:k];
+        }
+    }
+    return cleanEnv;
+}
+%end
+
+static int custom_clock_gettime(clockid_t clk_id, struct timespec *tp) {
+    int ret = orig_clock_gettime(clk_id, tp);
+    if (ret == 0 && tp && (s_spoofIDs || s_spoofHardware) && s_spoofedBootSec > 0 && s_realMonoAtLaunch > 0.0) {
+        if (clk_id == CLOCK_UPTIME_RAW || clk_id == CLOCK_MONOTONIC || clk_id == CLOCK_MONOTONIC_RAW) {
+            if (isCallerFromTargetAppStrict(__builtin_return_address(0))) {
+                double monoNow = (double)tp->tv_sec + ((double)tp->tv_nsec / 1000000000.0);
+                double delta = monoNow - s_realMonoAtLaunch;
+                if (delta < 0.0) delta = 0.0;
+                double totalSpoofed = s_baseAwakeUptimeSec + delta;
+                time_t secPart = (time_t)totalSpoofed;
+                long nsecPart = (long)((totalSpoofed - (double)secPart) * 1000000000.0);
+                if (nsecPart < 0L) nsecPart = 0L;
+                if (nsecPart >= 1000000000L) nsecPart = 999999999L;
+                tp->tv_sec = secPart;
+                tp->tv_nsec = nsecPart;
+            }
+        }
+    }
+    return ret;
+}
+
+static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    if (ret == 0 && name && oldlenp && liveContainerProfile && isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (strcmp(name, "kern.bootsessionuuid") == 0 && s_spoofIDs) {
+            NSString *bootUUID = liveContainerProfile[@"bootSessionUUID"];
+            if (bootUUID) {
+                const char *uuidStr = [bootUUID UTF8String];
+                size_t len = strlen(uuidStr) + 1;
+                if (oldp && *oldlenp >= len) memcpy(oldp, uuidStr, len);
+                *oldlenp = len;
+            }
+        } else if (strcmp(name, "kern.boottime") == 0 && (s_spoofIDs || s_spoofHardware) && s_spoofedBootSec > 0) {
+            struct timeval tv;
+            tv.tv_sec = s_spoofedBootSec;
+            tv.tv_usec = s_spoofedBootUsec;
+            if (oldp && *oldlenp >= sizeof(struct timeval)) {
+                memcpy(oldp, &tv, sizeof(struct timeval));
+            }
+            *oldlenp = sizeof(struct timeval);
+        } else if (strcmp(name, "kern.hostname") == 0 && (s_spoofHardware || s_spoofIDs)) {
+            static const char *cleanHost = "iPhone";
+            size_t len = strlen(cleanHost) + 1;
+            if (oldp && *oldlenp >= len) memcpy(oldp, cleanHost, len);
+            *oldlenp = len;
+        }
+    }
+    return ret;
+}
+
+static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+    if (ret == 0 && name && namelen == 2 && oldlenp &&
+        name[0] == CTL_KERN && name[1] == KERN_BOOTTIME &&
+        (s_spoofIDs || s_spoofHardware) && s_spoofedBootSec > 0 &&
+        isCallerAppOrSwift(__builtin_return_address(0))) {
+        struct timeval tv;
+        tv.tv_sec = s_spoofedBootSec;
+        tv.tv_usec = s_spoofedBootUsec;
+        if (oldp && *oldlenp >= sizeof(struct timeval)) {
+            memcpy(oldp, &tv, sizeof(struct timeval));
+        }
+        *oldlenp = sizeof(struct timeval);
+    }
+    return ret;
+}
+
+%hook UIScreen
+- (CGFloat)brightness {
+    if (!s_spoofHardware || !liveContainerProfile) return %orig;
+    return [liveContainerProfile[@"brightness"] floatValue];
+}
+- (BOOL)isCaptured {
+    if (!s_spoofSecurity) return %orig;
+    return NO;
+}
+%end
+
+%ctor {
+    MSHookFunction((void *)dladdr, (void *)custom_dladdr, (void **)&orig_dladdr);
+    MSHookFunction((void *)getenv, (void *)custom_getenv, (void **)&orig_getenv);
+    MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
+
+    ensureProfileLoaded();
+
+    MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
+    MSHookFunction((void *)access, (void *)custom_access, (void **)&orig_access);
+    MSHookFunction((void *)stat, (void *)custom_stat, (void **)&orig_stat);
+    MSHookFunction((void *)lstat, (void *)custom_lstat, (void **)&orig_lstat);
+    MSHookFunction((void *)fopen, (void *)custom_fopen, (void **)&orig_fopen);
+    MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
+    MSHookFunction((void *)sysctl, (void *)custom_sysctl, (void **)&orig_sysctl);
+    MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
+    MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
+
+    void *symDlopen = dlsym(RTLD_DEFAULT, "dlopen");
+    if (symDlopen) MSHookFunction(symDlopen, (void *)custom_dlopen, (void **)&orig_dlopen);
+
+    void *symClockGettime = dlsym(RTLD_DEFAULT, "clock_gettime");
+    if (symClockGettime) MSHookFunction(symClockGettime, (void *)custom_clock_gettime, (void **)&orig_clock_gettime);
+
+    void *symCFTimeZoneSys = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
+    if (symCFTimeZoneSys) MSHookFunction(symCFTimeZoneSys, (void *)custom_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
+
+    void *symCFTimeZoneDef = dlsym(RTLD_DEFAULT, "CFTimeZoneCopyDefault");
+    if (symCFTimeZoneDef) MSHookFunction(symCFTimeZoneDef, (void *)custom_CFTimeZoneCopyDefault, (void **)&orig_CFTimeZoneCopyDefault);
+
+    void *symFaccessat = dlsym(RTLD_DEFAULT, "faccessat");
+    if (symFaccessat) MSHookFunction(symFaccessat, (void *)custom_faccessat, (void **)&orig_faccessat);
+
+    void *symOpendir = dlsym(RTLD_DEFAULT, "opendir");
+    if (symOpendir) MSHookFunction(symOpendir, (void *)custom_opendir, (void **)&orig_opendir);
+
+    void *symReachFlags = dlsym(RTLD_DEFAULT, "SCNetworkReachabilityGetFlags");
+    if (symReachFlags) MSHookFunction(symReachFlags, (void *)custom_SCNetworkReachabilityGetFlags, (void **)&orig_SCNetworkReachabilityGetFlags);
+
+    void *symBind = dlsym(RTLD_DEFAULT, "bind");
+    if (symBind) MSHookFunction(symBind, (void *)custom_bind, (void **)&orig_bind);
+
+    void *symSetsockopt = dlsym(RTLD_DEFAULT, "setsockopt");
+    if (symSetsockopt) MSHookFunction(symSetsockopt, (void *)custom_setsockopt, (void **)&orig_setsockopt);
+
+    void *symConnect = dlsym(RTLD_DEFAULT, "connect");
+    if (symConnect) MSHookFunction(symConnect, (void *)custom_connect, (void **)&orig_connect);
+
+    void *symSendto = dlsym(RTLD_DEFAULT, "sendto");
+    if (symSendto) MSHookFunction(symSendto, (void *)custom_sendto, (void **)&orig_sendto);
+
+    void *symSendmsg = dlsym(RTLD_DEFAULT, "sendmsg");
+    if (symSendmsg) MSHookFunction(symSendmsg, (void *)custom_sendmsg, (void **)&orig_sendmsg);
+
+    void *symProxySettings = dlsym(RTLD_DEFAULT, "CFNetworkCopySystemProxySettings");
+    if (symProxySettings) {
+        MSHookFunction(symProxySettings, (void *)custom_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
+    }
+    void *symProxiesForURL = dlsym(RTLD_DEFAULT, "CFNetworkCopyProxiesForURL");
+    if (symProxiesForURL) {
+        MSHookFunction(symProxiesForURL, (void *)custom_CFNetworkCopyProxiesForURL, (void **)&orig_CFNetworkCopyProxiesForURL);
+    }
+
+    %init;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        showStartupBannerAndPersistentIcon(0);
+    });
+}
