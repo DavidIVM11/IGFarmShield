@@ -34,7 +34,13 @@
 #if __has_include(<substrate.h>)
 #import <substrate.h>
 #else
-extern void MSHookFunction(void *symbol, void *replace, void **result);
+#ifdef __cplusplus
+extern "C" {
+#endif
+void MSHookFunction(void *symbol, void *replace, void **result);
+#ifdef __cplusplus
+}
+#endif
 #endif
 
 #ifndef IP_BOUND_IF
@@ -110,6 +116,7 @@ static void *(*orig_dlopen)(const char *, int) = NULL;
 static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
+static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
 static int (*orig_statfs)(const char *, struct statfs *) = NULL;
 static int (*orig_access)(const char *, int) = NULL;
 static int (*orig_faccessat)(int, const char *, int, int) = NULL;
@@ -451,7 +458,8 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bund
 
 static NSTimeInterval spoofedSystemUptime(void) {
     struct timespec tsNow;
-    if (clock_gettime(CLOCK_UPTIME_RAW, &tsNow) == 0 && s_realMonoAtLaunch > 0.0) {
+    int (*clkFn)(clockid_t, struct timespec *) = orig_clock_gettime ? orig_clock_gettime : clock_gettime;
+    if (clkFn(CLOCK_UPTIME_RAW, &tsNow) == 0 && s_realMonoAtLaunch > 0.0) {
         double monoNow = (double)tsNow.tv_sec + ((double)tsNow.tv_nsec / 1000000000.0);
         double delta = monoNow - s_realMonoAtLaunch;
         if (delta < 0.0) delta = 0.0;
@@ -467,7 +475,8 @@ static void ensureProfileLoaded(void) {
 
     sessionStartTimestamp = [[NSDate date] timeIntervalSince1970];
     struct timespec tsInit;
-    if (clock_gettime(CLOCK_UPTIME_RAW, &tsInit) == 0) {
+    int (*clkInitFn)(clockid_t, struct timespec *) = orig_clock_gettime ? orig_clock_gettime : clock_gettime;
+    if (clkInitFn(CLOCK_UPTIME_RAW, &tsInit) == 0) {
         s_realMonoAtLaunch = (double)tsInit.tv_sec + ((double)tsInit.tv_nsec / 1000000000.0);
     }
 
@@ -561,7 +570,7 @@ static void ensureProfileLoaded(void) {
         : nil;
     NSString *nativeCraneUUID = (origCraneIDFV && origCraneIDFV.length >= 32)
         ? origCraneIDFV
-        : (existingIDFV ?: (([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : [[NSUUID UUID] UUIDString]));
+        : (existingIDFV ?: (([craneID containsString:@"-"] && craneID.length >= 32) ? [craneID uppercaseString] : nil));
 
     if (!profile || !profile[@"bootSessionUUID"]) {
         uint64_t seed = randomSeed64(keyUUID);
@@ -580,6 +589,7 @@ static void ensureProfileLoaded(void) {
                             2 + (int)((seed >> 16) % 250)];
         unsigned long long freeBytes = ((14800ULL + (seed % 31500ULL)) * 1024ULL * 1024ULL) + ((seed >> 12) % 1048576ULL);
         BOOL manualEnabled = (settingsEntry && settingsEntry[@"enabled"] != nil) ? [settingsEntry[@"enabled"] boolValue] : NO;
+        NSString *initialIDFV = nativeCraneUUID ?: @"";
 
         profile = [@{
             @"schemaVersion": @(CURRENT_SCHEMA_VERSION),
@@ -597,8 +607,8 @@ static void ensureProfileLoaded(void) {
             @"spoofSecurity": @YES,
             @"locationAnchored": @NO,
             @"deviceModel": @"iPhone10,4",
-            @"craneOriginalIDFV": nativeCraneUUID,
-            @"idfv": nativeCraneUUID,
+            @"craneOriginalIDFV": initialIDFV,
+            @"idfv": initialIDFV,
             @"bootSessionUUID": [[NSUUID UUID] UUIDString],
             @"bssid": bssid,
             @"ssid": ssid,
@@ -621,8 +631,10 @@ static void ensureProfileLoaded(void) {
             @"CarrierISO": @"us"
         } mutableCopy];
     } else {
-        profile[@"idfv"] = nativeCraneUUID;
-        profile[@"craneOriginalIDFV"] = nativeCraneUUID;
+        if (nativeCraneUUID.length >= 32) {
+            profile[@"idfv"] = nativeCraneUUID;
+            profile[@"craneOriginalIDFV"] = nativeCraneUUID;
+        }
         profile[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
         profile[@"bundleID"] = bundleID;
         profile[@"path"] = homePath;
@@ -777,6 +789,7 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     if (!liveContainerProfile) return;
 
     s_inInternalCall = YES;
+    NSUUID *liveVendorUUID = [[UIDevice currentDevice] identifierForVendor];
     UIWindowScene *activeScene = nil;
     UIWindow *targetWin = nil;
 
@@ -804,6 +817,17 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
         }
     }
     s_inInternalCall = NO;
+
+    if (liveVendorUUID && (!liveContainerProfile[@"idfv"] || [liveContainerProfile[@"idfv"] length] < 32)) {
+        NSString *captured = [[liveVendorUUID UUIDString] uppercaseString];
+        if (captured.length >= 32) {
+            NSDictionary *snap = [liveContainerProfile copy];
+            origCraneIDFV = captured;
+            liveContainerProfile[@"idfv"] = captured;
+            liveContainerProfile[@"craneOriginalIDFV"] = captured;
+            persistCurrentProfileToSandboxIfNeeded(snap);
+        }
+    }
 
     if (!targetWin) {
         if (attempt < 10) {
@@ -1204,7 +1228,7 @@ static CFTimeZoneRef custom_CFTimeZoneCopyDefault(void) {
 %end
 
 // ============================================================================
-// CORTAFUEGOS POSIX: KILL-SWITCH IPV4, DNS PERMITIDO, BLOQUEO LAN Y ANTI-QUIC
+// CORTAFUEGOS POSIX: KILL-SWITCH IPV4, BLOQUEO LAN RFC1918, DNS TUN Y ANTI-QUIC
 // ============================================================================
 static BOOL isSocketDatagram(int sockfd) {
     int sockType = 0;
@@ -1237,16 +1261,16 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
             return ENETUNREACH;
         }
 
-        // 2. Permitir consultas DNS (:53) interceptadas por el túnel de Shadowrocket
+        // 2. Bloquear acceso al router/LAN física (RFC1918) y multicast incluso en puerto 53
+        // Nota: 198.18.0.0/15 (Fake-IP / DNS TUN de Shadowrocket), 1.1.1.1 y 8.8.8.8 pasan limpios
+        if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
+            return EHOSTUNREACH;
+        }
+
+        // 3. Permitir consultas DNS (:53) hacia IPs no-LAN interceptadas por el túnel utun
         uint16_t dstPort = ntohs(sin.sin_port);
         if (dstPort == 53) {
             return 0;
-        }
-
-        // 3. Bloquear acceso a la red LAN física (RFC1918) y multicast fuera de DNS
-        // Nota: 198.18.0.0/15 (Fake-IP de Shadowrocket) NO es RFC1918 y pasa limpiamente
-        if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
-            return EHOSTUNREACH;
         }
 
         // 4. Bloquear QUIC (UDP 443/80), STUN/WebRTC y cualquier otro UDP externo
@@ -1277,12 +1301,12 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
             if (!hasActiveUtunTunnelCached()) {
                 return ENETUNREACH;
             }
+            if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
+                return EHOSTUNREACH;
+            }
             uint16_t dstPort = ntohs(sin6.sin6_port);
             if (dstPort == 53) {
                 return 0;
-            }
-            if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
-                return EHOSTUNREACH;
             }
             if (isSocketDatagram(sockfd)) {
                 return EHOSTUNREACH;
@@ -1296,7 +1320,6 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
     return 0;
 }
 
-// Evita EADDRNOTAVAIL si Proxygen/WebRTC intenta hacer bind() a la IP CGNAT/LAN simulada
 static int custom_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (s_spoofNetwork && !s_inInternalCall && addr &&
         addr->sa_family == AF_INET && addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
@@ -1311,7 +1334,6 @@ static int custom_bind(int sockfd, const struct sockaddr *addr, socklen_t addrle
     return orig_bind(sockfd, addr, addrlen);
 }
 
-// Neutraliza IP_BOUND_IF hacia en0/pdp_ip0 para impedir bypass directo del túnel utun
 static int custom_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
     if (s_spoofNetwork && !s_inInternalCall && optval && optlen >= (socklen_t)sizeof(int)) {
         if ((level == IPPROTO_IP && optname == IP_BOUND_IF) ||
@@ -1555,9 +1577,13 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
             head->ifa_name = (char *)"lo0";
             head->ifa_flags &= ~IFF_POINTOPOINT;
         } else if (strcmp(head->ifa_name, "en0") == 0) {
-            if (s_isCellularMode && !hasLiveCellularIPv4 && head->ifa_addr && head->ifa_addr->sa_family == AF_INET) {
-                applySpoofedCellularNode(head);
-            } else if (!s_isCellularMode && head->ifa_addr && head->ifa_addr->sa_family == AF_INET) {
+            if (s_isCellularMode) {
+                if (!hasLiveCellularIPv4 && head->ifa_addr && head->ifa_addr->sa_family == AF_INET) {
+                    applySpoofedCellularNode(head);
+                } else {
+                    head->ifa_name = (char *)"lo0";
+                }
+            } else if (head->ifa_addr && head->ifa_addr->sa_family == AF_INET) {
                 applySpoofedWifiLanNode(head);
             }
         }
@@ -1625,7 +1651,7 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
 }
 
 // ============================================================================
-// TELEMETRÍA ORGÁNICA, RELOJ MONOTÓNICO Y BOOTTIME COHERENTE POR CONTENEDOR
+// TELEMETRÍA ORGÁNICA, RELOJ UPTIME O(1) Y BOOTTIME COHERENTE POR CONTENEDOR
 // ============================================================================
 %hook UIDevice
 - (NSString *)name {
@@ -1636,6 +1662,12 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
     NSUUID *origUUID = %orig;
     if (origUUID && !origCraneIDFV) {
         origCraneIDFV = [[origUUID UUIDString] uppercaseString];
+        if (liveContainerProfile && (!liveContainerProfile[@"idfv"] || [liveContainerProfile[@"idfv"] length] < 32)) {
+            NSDictionary *snap = [liveContainerProfile copy];
+            liveContainerProfile[@"idfv"] = origCraneIDFV;
+            liveContainerProfile[@"craneOriginalIDFV"] = origCraneIDFV;
+            persistCurrentProfileToSandboxIfNeeded(snap);
+        }
     }
     if (s_spoofIDs && liveContainerProfile) {
         NSString *profUUIDStr = liveContainerProfile[@"idfv"];
@@ -1778,6 +1810,25 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 }
 %end
 
+// Sincroniza CLOCK_UPTIME_RAW en O(1) sin tocar CLOCK_MONOTONIC (evita bloqueos en condition_variable)
+static int custom_clock_gettime(clockid_t clk_id, struct timespec *tp) {
+    int ret = orig_clock_gettime(clk_id, tp);
+    if (ret == 0 && tp && !s_inInternalCall && (s_spoofIDs || s_spoofHardware) &&
+        clk_id == CLOCK_UPTIME_RAW && s_spoofedBootSec > 0 && s_realMonoAtLaunch > 0.0) {
+        double monoNow = (double)tp->tv_sec + ((double)tp->tv_nsec / 1000000000.0);
+        double delta = monoNow - s_realMonoAtLaunch;
+        if (delta < 0.0) delta = 0.0;
+        double totalSpoofed = s_baseAwakeUptimeSec + delta;
+        time_t secPart = (time_t)totalSpoofed;
+        long nsecPart = (long)((totalSpoofed - (double)secPart) * 1000000000.0);
+        if (nsecPart < 0L) nsecPart = 0L;
+        if (nsecPart >= 1000000000L) nsecPart = 999999999L;
+        tp->tv_sec = secPart;
+        tp->tv_nsec = nsecPart;
+    }
+    return ret;
+}
+
 static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     if (ret == 0 && name && oldlenp && liveContainerProfile && isCallerAppOrSwift(__builtin_return_address(0))) {
@@ -1840,15 +1891,6 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     MSHookFunction((void *)getenv, (void *)custom_getenv, (void **)&orig_getenv);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
-    %init;
-
-    s_inInternalCall = YES;
-    NSUUID *rawIDFV = [[UIDevice currentDevice] identifierForVendor];
-    s_inInternalCall = NO;
-    if (rawIDFV) {
-        origCraneIDFV = [[rawIDFV UUIDString] uppercaseString];
-    }
-
     ensureProfileLoaded();
 
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
@@ -1863,6 +1905,9 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
 
     void *symDlopen = dlsym(RTLD_DEFAULT, "dlopen");
     if (symDlopen) MSHookFunction(symDlopen, (void *)custom_dlopen, (void **)&orig_dlopen);
+
+    void *symClockGettime = dlsym(RTLD_DEFAULT, "clock_gettime");
+    if (symClockGettime) MSHookFunction(symClockGettime, (void *)custom_clock_gettime, (void **)&orig_clock_gettime);
 
     void *symCFTimeZoneSys = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
     if (symCFTimeZoneSys) MSHookFunction(symCFTimeZoneSys, (void *)custom_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
@@ -1902,6 +1947,8 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     if (symProxiesForURL) {
         MSHookFunction(symProxiesForURL, (void *)custom_CFNetworkCopyProxiesForURL, (void **)&orig_CFNetworkCopyProxiesForURL);
     }
+
+    %init;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         showStartupBannerAndPersistentIcon(0);
