@@ -28,14 +28,12 @@ extern char **environ;
 #define VPS_AUDIT_URL @"http://162.35.105.151:5001/iphone_audit"
 #define CURRENT_SCHEMA_VERSION 37
 
+// Limita el borrado a cachés temporales volátiles sin tocar WebKit ni sesiones guardadas
 static NSArray<NSString *> *residualSubdirectoriesToTrack(void) {
     return @[
         @"tmp",
         @"Library/Caches",
-        @"Library/WebKit",
-        @"Library/Saved Application State",
         @"Library/SplashBoard/Snapshots",
-        @"Library/Logs",
         @"SystemData/com.apple.SafariViewService"
     ];
 }
@@ -464,6 +462,9 @@ static void classifyIPAndApplyToProfile(NSMutableDictionary *prof, NSString *ip,
                            [ispUp containsString:@"ORANGE"] ||
                            [ispUp containsString:@"O2"] ||
                            [ispUp containsString:@"THREE"] ||
+                           [ispUp containsString:@"TELCEL"] ||
+                           [ispUp containsString:@"ROGERS"] ||
+                           [ispUp containsString:@"BELL"] ||
                            [ispUp containsString:@"CELL"] ||
                            [ispUp containsString:@"MOBILE"] ||
                            [ispUp containsString:@"WIRELESS"];
@@ -613,7 +614,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)purgeGhostContainerFromTweak:(NSDictionary *)prof;
 @end
 
-@interface IGFarmAppContainersController : PSViewController <UITableViewDelegate, UITableViewDataSource>
+@interface IGFarmAppContainersController : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) NSString *bundleID;
 @property (nonatomic, strong) NSString *appTitle;
 @property (nonatomic, strong) NSString *appStateKey;
@@ -625,7 +626,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 - (void)toggleContainerRowSwitch:(UISwitch *)sender;
 @end
 
-@interface IGFarmContainerDetailController : PSViewController <UITableViewDelegate, UITableViewDataSource>
+@interface IGFarmContainerDetailController : UIViewController <UITableViewDelegate, UITableViewDataSource>
 @property (nonatomic, strong) NSString *bundleID;
 @property (nonatomic, strong) NSString *containerUUID;
 @property (nonatomic, strong) NSMutableDictionary *profile;
@@ -675,7 +676,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     self.redditContainersList = [NSMutableArray array];
     [self saveState];
 
-    self.residualSummary = @"Calculando caché acumulada y portapapeles...";
+    self.residualSummary = @"Calculando caché temporal y portapapeles...";
 
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.delegate = self;
@@ -694,9 +695,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         loaded = [NSDictionary dictionaryWithContentsOfFile:MIRROR_STATE_PLIST];
     }
     if (loaded) self.state = [loaded mutableCopy];
+    [self calculateResidualTraces];
     [self scanAndSyncAllContainers];
     [self auditStealthEngineStatus];
-    [self calculateResidualTraces];
     self.tableView.tableHeaderView = [self buildHeaderBannerView];
     [self.tableView reloadData];
 }
@@ -712,13 +713,17 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     card.clipsToBounds = YES;
 
     BOOL masterOn = [self.state[@"masterEnabled"] boolValue];
+    BOOL ksAlert = (masterOn && self.stealthCurrentlyActive && !self.vpnActive);
 
     UIImageView *shieldView = [[UIImageView alloc] initWithFrame:CGRectMake(16, 18, 50, 50)];
-    shieldView.backgroundColor = (masterOn && self.stealthCurrentlyActive) ? [UIColor systemBlueColor] : [UIColor systemGrayColor];
+    shieldView.backgroundColor = ksAlert
+        ? [UIColor systemRedColor]
+        : ((masterOn && self.stealthCurrentlyActive) ? [UIColor systemBlueColor] : [UIColor systemGrayColor]);
     shieldView.layer.cornerRadius = 12.0;
     shieldView.contentMode = UIViewContentModeCenter;
     UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:26 weight:UIImageSymbolWeightBold];
-    shieldView.image = [[UIImage systemImageNamed:@"checkmark.shield.fill" withConfiguration:symCfg] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
+    NSString *iconName = ksAlert ? @"xmark.shield.fill" : @"checkmark.shield.fill";
+    shieldView.image = [[UIImage systemImageNamed:iconName withConfiguration:symCfg] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
     [card addSubview:shieldView];
 
     UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(78, 16, card.bounds.size.width - 90, 22)];
@@ -736,7 +741,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 260, 18)];
     pill.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
-    if (masterOn && self.stealthCurrentlyActive && !self.vpnActive) {
+    if (ksAlert) {
         pill.textColor = [UIColor systemRedColor];
         pill.text = @"⛔ KILL-SWITCH ACTIVO (SIN TÚNEL IPV4)";
     } else if (masterOn && self.stealthCurrentlyActive) {
@@ -752,7 +757,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     return header;
 }
 
-// Guarda en STATE_PLIST y replica en MIRROR_STATE_PLIST para inmunidad ante el Sandbox
+// Guarda en STATE_PLIST y replica en MIRROR_STATE_PLIST para inmunidad ante el Sandbox rootless
 - (void)saveState {
     self.state[@"schemaVersion"] = @(CURRENT_SCHEMA_VERSION);
     [self.state writeToFile:STATE_PLIST atomically:YES];
@@ -886,9 +891,9 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
     self.stealthDetailReport =
         @"Especificaciones del Subsistema v37:\n\n"
-        @"1. Kill-Switch IPv4 + Anti-QUIC/STUN + IP_BOUND_IF: Exige túnel utun con IPv4 real, permite DNS (:53), bloquea LAN RFC1918/UDP externo y neutraliza intentos de evasión por IP_BOUND_IF.\n\n"
+        @"1. Kill-Switch IPv4 + Anti-QUIC/STUN + IP_BOUND_IF: Exige túnel utun con IPv4 real, bloquea LAN RFC1918 incluso en puerto 53, permite DNS TUN y neutraliza intentos de evasión por IP_BOUND_IF.\n\n"
         @"2. Ocultamiento en C, dlopen, NSData, Objective-C y Swift: Filtra rutas de jailbreak (/var/jb, Crane, ElleKit) respetando las llamadas internas de Crane.\n\n"
-        @"3. Carrier Sintético sin SIM, CGNAT 4G y BootTime: Inyecta CTCarrier virtual en equipos sin SIM física, transforma en0 en pdp_ip0 (100.64.0.0/10) y sincroniza kern.boottime / systemUptime.";
+        @"3. Carrier Sintético sin SIM, CGNAT 4G y Reloj Coherente: Inyecta CTCarrier virtual en equipos sin SIM física, transforma en0 en pdp_ip0 (100.64.0.0/10) y alinea kern.boottime, systemUptime y CLOCK_UPTIME_RAW.";
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -1116,9 +1121,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     NSString *diskCapturedIDFV = ([disk isKindOfClass:[NSDictionary class]] && [disk[@"craneOriginalIDFV"] isKindOfClass:[NSString class]] && [disk[@"craneOriginalIDFV"] length] >= 32)
         ? [disk[@"craneOriginalIDFV"] uppercaseString]
         : nil;
-    NSString *nativeCraneIDFV = hasValidCraneUUID
-        ? [craneID uppercaseString]
-        : (diskCapturedIDFV ?: (profile[@"idfv"] ?: [[NSUUID UUID] UUIDString]));
+    NSString *profileSavedIDFV = ([profile[@"idfv"] isKindOfClass:[NSString class]] && [profile[@"idfv"] length] >= 32)
+        ? [profile[@"idfv"] uppercaseString]
+        : nil;
+    NSString *nativeCraneIDFV = diskCapturedIDFV
+        ?: (hasValidCraneUUID ? [craneID uppercaseString] : (profileSavedIDFV ?: [[NSUUID UUID] UUIDString]));
 
     BOOL isNewProfile = (!profile || !profile[@"bootSessionUUID"]);
 
@@ -1560,7 +1567,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             ? [NSString stringWithFormat:@"Portapapeles: %lu ítem(s) (%.1f KB)", (unsigned long)pbItems, pbKB]
             : @"Portapapeles: Vacío (0 KB)";
 
-        NSString *summary = [NSString stringWithFormat:@"Caché en %lu carpeta(s): %lu archivos (%.2f MB)\n%@",
+        NSString *summary = [NSString stringWithFormat:@"Caché temporal en %lu carpeta(s): %lu archivos (%.2f MB)\n%@",
                              (unsigned long)pathsToScan.count, (unsigned long)residualFiles, mb, pbText];
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1606,8 +1613,8 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     [self.tableView reloadData];
 
     if (showPopup) {
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Caché y Portapapeles Limpiados"
-                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados (%lu carpeta(s) purgadas).\n• %lu archivos eliminados (%.2f MB liberados).\n• Portapapeles vaciado: %lu ítem(s) (%.1f KB).",
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Caché Temporal y Portapapeles Limpiados"
+                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados (%lu carpeta(s) revisadas).\n• %lu archivos temporales eliminados (%.2f MB liberados).\n• Portapapeles vaciado: %lu ítem(s) (%.1f KB).\n• Sesiones y datos WebKit preservados.",
                                                                              (unsigned long)pathsToClean.count, (unsigned long)removedCount, freedMB, (unsigned long)pbItemsBefore, pbFreedKB]
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"Listo" style:UIAlertActionStyleDefault handler:nil]];
@@ -1623,7 +1630,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     if (section == 0) return @"CONTROL GENERAL DE SISTEMA";
     if (section == 1) return @"CONTENEDORES AISLADOS (CRANE)";
     if (section == 2) return @"ESTADO DE RED Y SEGURIDAD OPSEC";
-    return @"GESTIÓN DE RASTRO Y PORTAPAPELES";
+    return @"GESTIÓN DE CACHÉ TEMPORAL Y PORTAPAPELES";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -1722,13 +1729,16 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
         if (indexPath.row == 0) {
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            cell.imageView.image = settingsBadgeIcon(@"network", self.vpnActive ? [UIColor systemGreenColor] : [UIColor systemRedColor]);
+            BOOL ksBlocking = (masterOn && self.stealthCurrentlyActive && !self.vpnActive);
+            cell.imageView.image = settingsBadgeIcon(@"network", self.vpnActive ? [UIColor systemGreenColor] : (ksBlocking ? [UIColor systemRedColor] : [UIColor systemGrayColor]));
             cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
             cell.textLabel.text = @"Túnel Proxy / Kill-Switch POSIX";
-            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            cell.detailTextLabel.textColor = ksBlocking ? [UIColor systemRedColor] : [UIColor secondaryLabelColor];
             cell.detailTextLabel.text = self.vpnActive
                 ? [NSString stringWithFormat:@"Enrutado (%@ IPv4) • TCP Puro + IP_BOUND_IF protegido", self.vpnInterfaceName]
-                : @"⛔ Sin túnel IPv4 activo — El Kill-Switch bloqueará tráfico en contenedores protegidos";
+                : (ksBlocking
+                    ? @"⛔ Sin túnel IPv4 activo — Kill-Switch bloqueando tráfico en contenedores activos"
+                    : @"Sin túnel IPv4 activo en este momento");
         } else {
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
             cell.imageView.image = settingsBadgeIcon(@"eye.slash.fill", self.stealthCurrentlyActive ? [UIColor systemGreenColor] : [UIColor systemGrayColor]);
@@ -1746,7 +1756,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     cell.detailTextLabel.numberOfLines = 0;
     cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     cell.textLabel.textColor = [UIColor systemRedColor];
-    cell.textLabel.text = @"Limpieza Profunda de Caché y Portapapeles";
+    cell.textLabel.text = @"Limpiar Caché Temporal y Portapapeles";
     cell.detailTextLabel.text = self.residualSummary;
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     return cell;
@@ -1816,7 +1826,15 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     }
 
     if (indexPath.section == 3) {
-        [self cleanResidualTracesAndKillApps:YES];
+        triggerHaptic();
+        UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"¿Limpiar Caché Temporal y Portapapeles?"
+                                                                         message:@"Se cerrarán Instagram y Reddit, se vaciará el portapapeles y se borrarán únicamente cachés volátiles (tmp, Caches y capturas SplashBoard) sin afectar sesiones iniciadas ni datos WebKit."
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Cancelar" style:UIAlertActionStyleCancel handler:nil]];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Limpiar Ahora" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+            [self cleanResidualTracesAndKillApps:YES];
+        }]];
+        [self presentViewController:confirm animated:YES completion:nil];
     }
 }
 
@@ -1843,6 +1861,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
 - (void)refreshFromCrane:(UIRefreshControl *)rc {
     triggerHaptic();
+    [self.parentRoot calculateResidualTraces];
     [self.parentRoot scanAndSyncAllContainers];
     [self.parentRoot auditStealthEngineStatus];
     self.containers = [self.bundleID isEqualToString:@"com.burbn.instagram"]
@@ -1854,6 +1873,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    [self.parentRoot calculateResidualTraces];
     [self.parentRoot scanAndSyncAllContainers];
     [self.parentRoot auditStealthEngineStatus];
     self.containers = [self.bundleID isEqualToString:@"com.burbn.instagram"]
@@ -1897,7 +1917,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         [self.tableView reloadData];
 
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Contenedor Purgado"
-                                                                    message:[NSString stringWithFormat:@"Se eliminaron los metadatos y registros residuales de \"%@\".", cName]
+                                                                    message:[NSString stringWithFormat:@"Se eliminaron los metadatos y cachés temporales de \"%@\".", cName]
                                                              preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:ac animated:YES completion:nil];
@@ -1962,9 +1982,13 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     int batPct = (int)([prof[@"batteryLevel"] floatValue] * 100.0f);
 
     if (masterOn && appOn && contOn) {
-        cell.detailTextLabel.textColor = [UIColor systemGreenColor];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"● AISLADO • %@ • ID: %@...\nIP: %@ • Batería: %d%%",
-                                     netDesc, shortIDFV, prof[@"lastSyncedIP"] ?: @"Pendiente", batPct];
+        BOOL ksNoTunnel = (!self.parentRoot.vpnActive && (prof[@"spoofNetwork"] == nil || [prof[@"spoofNetwork"] boolValue]));
+        cell.detailTextLabel.textColor = ksNoTunnel ? [UIColor systemRedColor] : [UIColor systemGreenColor];
+        cell.detailTextLabel.text = ksNoTunnel
+            ? [NSString stringWithFormat:@"⛔ KILL-SWITCH (Sin túnel IPv4) • %@\nIP: %@ • ID: %@...",
+               netDesc, prof[@"lastSyncedIP"] ?: @"Pendiente", shortIDFV]
+            : [NSString stringWithFormat:@"● AISLADO • %@ • ID: %@...\nIP: %@ • Batería: %d%%",
+               netDesc, shortIDFV, prof[@"lastSyncedIP"] ?: @"Pendiente", batPct];
     } else {
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
         cell.detailTextLabel.text = [NSString stringWithFormat:@"○ EN PAUSA • ID: %@...", shortIDFV];
@@ -2148,7 +2172,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             @"Subsistema de Ocultamiento (C / ObjC / Swift)"
         ];
         NSArray *subtitles = @[
-            @"Aísla IDFV de Crane, BootSessionUUID, kern.boottime y systemUptime por cuenta",
+            @"Aísla IDFV de Crane, BootSessionUUID, kern.boottime y CLOCK_UPTIME_RAW por cuenta",
             @"Exige utun IPv4, inyecta Carrier virtual / CGNAT 100.x.y.z y bloquea IP_BOUND_IF",
             @"Ajusta CFTimeZone, NSTimeZone, C TZ e idioma al país del proxy activo",
             @"Simula batería, volumen, brillo y espacio libre con deriva suave",
@@ -2494,8 +2518,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         NSString *ispEnc = [(ispRaw ?: @"") stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
 
         int shieldActiveFlag = [self isModOn:@"spoofSecurity"] ? 1 : 0;
+        NSString *baseAuditURL = ([self.parentRoot.state[@"vpsAuditURL"] isKindOfClass:[NSString class]] && [self.parentRoot.state[@"vpsAuditURL"] length] > 0)
+            ? self.parentRoot.state[@"vpsAuditURL"]
+            : VPS_AUDIT_URL;
         NSString *vpsUrlStr = [NSString stringWithFormat:@"%@?ip=%@&contenedor=%@&plataforma=%@&shield=%d&bssid=%@&isp=%@&cc=%@",
-                               VPS_AUDIT_URL, ip, contEnc, plat, shieldActiveFlag, self.profile[@"bssid"] ?: @"", ispEnc, cc];
+                               baseAuditURL, ip, contEnc, plat, shieldActiveFlag, self.profile[@"bssid"] ?: @"", ispEnc, cc];
 
         NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
         cfg.timeoutIntervalForRequest = 12.0;
