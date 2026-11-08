@@ -192,7 +192,6 @@ static uint64_t randomSeed64(NSString *salt) {
     return hash ^ r;
 }
 
-// Genera un UUID v4 determinista por contenedor para evitar ventana vacía antes de capturar el de Crane
 static NSString *deterministicUUIDStringFromSalt(NSString *salt) {
     uint64_t h1 = deterministicHash64(salt ?: @"IGFarmShield");
     uint64_t h2 = deterministicHash64([NSString stringWithFormat:@"%@_v4_%llu", salt ?: @"IG", h1]);
@@ -835,7 +834,7 @@ static void refreshBadgePillStateOnMain(void) {
     persistentBadgePill.frame = CGRectMake((screenBounds.size.width - pillW) / 2.0, 18.0, pillW, 16.0);
 }
 
-static void applyAutoDetectedProxyMetadata(NSString *ip, NSString *ispRaw, NSString *cc, NSString *city, NSString *region, NSString *tz) {
+static void applyAutoDetectedProxyMetadataOnMain(NSString *ip, NSString *ispRaw, NSString *cc, NSString *city, NSString *region, NSString *tz) {
     if (!liveContainerProfile || !ip || !tz) return;
     NSDictionary *snap = [liveContainerProfile copy];
     NSString *ispUp = [ispRaw ?: @"" uppercaseString];
@@ -881,7 +880,7 @@ static void applyAutoDetectedProxyMetadata(NSString *ip, NSString *ispRaw, NSStr
     persistCurrentProfileToSandboxIfNeeded(snap);
 }
 
-// Verifica en segundo plano que el proxy activo coincida con la zona horaria/país del contenedor
+// Verifica en segundo plano que el proxy activo coincida con la zona horaria/país del contenedor (Thread-Safe en Main Queue)
 static void verifyLiveProxyCoherenceOnStartup(void) {
     if (s_proxyCoherenceChecked || !s_shieldActive || !s_spoofNetwork || !liveContainerProfile) return;
     if (!hasActiveUtunTunnelCached()) return;
@@ -915,23 +914,24 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
 
         if (!liveIP || !liveTZ || liveTZ.length == 0) return;
 
-        BOOL anchored = [liveContainerProfile[@"locationAnchored"] boolValue];
-        NSString *savedIP = liveContainerProfile[@"lastSyncedIP"] ?: @"Sin sincronizar";
-        NSString *savedTZ = liveContainerProfile[@"timeZone"] ?: @"";
-        NSString *savedISO = [liveContainerProfile[@"CarrierISO"] ?: @"us" lowercaseString];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!liveContainerProfile) return;
+            BOOL anchored = [liveContainerProfile[@"locationAnchored"] boolValue];
+            NSString *savedIP = liveContainerProfile[@"lastSyncedIP"] ?: @"Sin sincronizar";
+            NSString *savedTZ = liveContainerProfile[@"timeZone"] ?: @"";
+            NSString *savedISO = [liveContainerProfile[@"CarrierISO"] ?: @"us" lowercaseString];
 
-        if (!anchored || [savedIP hasPrefix:@"Sin "]) {
-            applyAutoDetectedProxyMetadata(liveIP, liveISP, liveCC ?: @"us", liveCity, liveRegion, liveTZ);
-            return;
-        }
+            if (!anchored || [savedIP hasPrefix:@"Sin "]) {
+                applyAutoDetectedProxyMetadataOnMain(liveIP, liveISP, liveCC ?: @"us", liveCity, liveRegion, liveTZ);
+                return;
+            }
 
-        BOOL tzDiffers = (savedTZ.length > 0 && ![savedTZ isEqualToString:liveTZ]);
-        BOOL ccDiffers = (liveCC.length > 0 && savedISO.length > 0 && ![savedISO isEqualToString:liveCC]);
+            BOOL tzDiffers = (savedTZ.length > 0 && ![savedTZ isEqualToString:liveTZ]);
+            BOOL ccDiffers = (liveCC.length > 0 && savedISO.length > 0 && ![savedISO isEqualToString:liveCC]);
 
-        if (tzDiffers || ccDiffers) {
-            s_proxyMismatchDetected = YES;
-            s_proxyMismatchSummary = [NSString stringWithFormat:@"Proxy actual: %@ (%@) ≠ Perfil: %@", liveIP, liveTZ, savedTZ];
-            dispatch_async(dispatch_get_main_queue(), ^{
+            if (tzDiffers || ccDiffers) {
+                s_proxyMismatchDetected = YES;
+                s_proxyMismatchSummary = [NSString stringWithFormat:@"Proxy actual: %@ (%@) ≠ Perfil: %@", liveIP, liveTZ, savedTZ];
                 s_lastRenderedBadgeState = -1;
                 refreshBadgePillStateOnMain();
                 if (persistentBadgeWindow && persistentBadgeWindow.rootViewController) {
@@ -955,12 +955,12 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
                         }];
                     });
                 }
-            });
-        } else if (![savedIP isEqualToString:liveIP]) {
-            NSDictionary *snap = [liveContainerProfile copy];
-            liveContainerProfile[@"lastSyncedIP"] = liveIP;
-            persistCurrentProfileToSandboxIfNeeded(snap);
-        }
+            } else if (![savedIP isEqualToString:liveIP]) {
+                NSDictionary *snap = [liveContainerProfile copy];
+                liveContainerProfile[@"lastSyncedIP"] = liveIP;
+                persistCurrentProfileToSandboxIfNeeded(snap);
+            }
+        });
     }] resume];
 }
 
@@ -1256,11 +1256,30 @@ static char *custom_getenv(const char *name) {
     return orig_getenv(name);
 }
 
+// Rota entre 16 dylibs del sistema para evitar entradas duplicadas al escanear índices dyld
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
     const char *name = orig_dyld_get_image_name(image_index);
     if (s_spoofSecurity && name && isHiddenPathForTargetAppC(name)) {
         if (isCallerAppOrSwift(__builtin_return_address(0))) {
-            return s_uikitImagePath;
+            static const char *cleanSystemPaths[] = {
+                "/usr/lib/libSystem.B.dylib",
+                "/usr/lib/libc++.1.dylib",
+                "/usr/lib/libsqlite3.dylib",
+                "/usr/lib/libz.1.dylib",
+                "/usr/lib/libxml2.2.dylib",
+                "/usr/lib/libicucore.A.dylib",
+                "/usr/lib/libcompression.dylib",
+                "/usr/lib/libarchive.2.dylib",
+                "/usr/lib/libbsm.0.dylib",
+                "/usr/lib/libCRFSuite.dylib",
+                "/usr/lib/libenergytrace.dylib",
+                "/usr/lib/liblangid.dylib",
+                "/usr/lib/liblzma.5.dylib",
+                "/usr/lib/libMobileGestalt.dylib",
+                "/usr/lib/libnetwork.dylib",
+                "/usr/lib/libresolv.9.dylib"
+            };
+            return cleanSystemPaths[(image_index * 7U) % 16U];
         }
     }
     return name;
@@ -1438,8 +1457,6 @@ static BOOL isRFC1918OrLinkLocalIPv4(uint32_t ipHost) {
     return NO;
 }
 
-// Si c-ares consulta un DNS en rango LAN (ej. 192.168.1.1:53), construye una copia en pila hacia 1.1.1.1:53
-// Así la consulta nunca escapa al router Wi-Fi ni falla con EHOSTUNREACH, entrando al túnel utun de Shadowrocket
 static BOOL rewriteRFC1918DnsDestinationIfNeeded(const struct sockaddr *addr, socklen_t addrlen, struct sockaddr_storage *outStorage, socklen_t *outLen) {
     if (!s_spoofNetwork || s_inInternalCall || !addr || !outStorage || !outLen) return NO;
 
@@ -1486,23 +1503,19 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
         uint32_t ipHost = ntohl(sin.sin_addr.s_addr);
         if (ipHost == 0 || (ipHost >> 24) == 127) return 0;
 
-        // 1. Kill-Switch real: exige interfaz utun IPv4 activa de Shadowrocket
         if (!hasActiveUtunTunnelCached()) {
             return ENETUNREACH;
         }
 
-        // 2. Bloquear acceso a la red LAN física (RFC1918) y multicast
         if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
             return EHOSTUNREACH;
         }
 
-        // 3. Permitir consultas DNS (:53) hacia Fake-IP (198.18.0.0/15) o DNS públicos enrutados por utun
         uint16_t dstPort = ntohs(sin.sin_port);
         if (dstPort == 53) {
             return 0;
         }
 
-        // 4. Bloquear QUIC (UDP 443/80), STUN/WebRTC y cualquier otro UDP externo
         if (isSocketDatagram(sockfd)) {
             return EHOSTUNREACH;
         }
@@ -2146,7 +2159,6 @@ static int custom_clock_gettime(clockid_t clk_id, struct timespec *tp) {
     return ret;
 }
 
-// Sin filtro isCallerAppOrSwift para cubrir llamadas originadas desde libsystem_c / C++ (ej. gethostname)
 static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     if (ret == 0 && name && oldlenp && liveContainerProfile && !s_inInternalCall) {
@@ -2176,18 +2188,24 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     return ret;
 }
 
+// Cubre tanto KERN_BOOTTIME como KERN_HOSTNAME (usado internamente por gethostname() y uname())
 static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    if (ret == 0 && name && namelen == 2 && oldlenp && !s_inInternalCall &&
-        name[0] == CTL_KERN && name[1] == KERN_BOOTTIME &&
-        (s_spoofIDs || s_spoofHardware) && s_spoofedBootSec > 0) {
-        struct timeval tv;
-        tv.tv_sec = s_spoofedBootSec;
-        tv.tv_usec = s_spoofedBootUsec;
-        if (oldp && *oldlenp >= sizeof(struct timeval)) {
-            memcpy(oldp, &tv, sizeof(struct timeval));
+    if (ret == 0 && name && namelen == 2 && oldlenp && !s_inInternalCall && name[0] == CTL_KERN) {
+        if (name[1] == KERN_BOOTTIME && (s_spoofIDs || s_spoofHardware) && s_spoofedBootSec > 0) {
+            struct timeval tv;
+            tv.tv_sec = s_spoofedBootSec;
+            tv.tv_usec = s_spoofedBootUsec;
+            if (oldp && *oldlenp >= sizeof(struct timeval)) {
+                memcpy(oldp, &tv, sizeof(struct timeval));
+            }
+            *oldlenp = sizeof(struct timeval);
+        } else if (name[1] == KERN_HOSTNAME && (s_spoofHardware || s_spoofIDs)) {
+            static const char *cleanHost = "iPhone";
+            size_t len = strlen(cleanHost) + 1;
+            if (oldp && *oldlenp >= len) memcpy(oldp, cleanHost, len);
+            *oldlenp = len;
         }
-        *oldlenp = sizeof(struct timeval);
     }
     return ret;
 }
