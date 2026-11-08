@@ -1,6 +1,6 @@
 Package: com.ivm.igfarmshield
 Name: IGFarmShield
-Version: 2.3.0
+Version: 2.3.1
 Architecture: iphoneos-arm64
 Description: Aislamiento integral de contenedores Crane, red TCP/CGNAT y anti-fingerprinting para Instagram y Reddit.
 Maintainer: IVM
