@@ -1615,25 +1615,55 @@ static int custom_connect(int sockfd, const struct sockaddr *addr, socklen_t add
 }
 
 static int custom_connectx(int sockfd, const sa_endpoints_t *endpoints, sae_associd_t associd, unsigned int flags, const struct iovec *iov, unsigned int iovcnt, size_t *len, sae_connid_t *connid) {
-    if (endpoints && endpoints->sae_dstaddr && endpoints->sae_dstaddrlen >= (socklen_t)sizeof(struct sockaddr)) {
+    if (endpoints && s_spoofNetwork && !s_inInternalCall) {
+        sa_endpoints_t modifiedEndpoints = *endpoints;
+        BOOL endpointsModified = NO;
+
+        // 1. Neutraliza sae_srcif si intenta atar el socket a una interfaz física fuera del túnel utun
+        if (modifiedEndpoints.sae_srcif > 0) {
+            char ifName[IF_NAMESIZE] = {0};
+            if (if_indextoname(modifiedEndpoints.sae_srcif, ifName) != NULL) {
+                if (strcmp(ifName, "lo0") != 0 && !isTunnelInterfaceNameC(ifName)) {
+                    modifiedEndpoints.sae_srcif = 0;
+                    endpointsModified = YES;
+                }
+            }
+        }
+
+        // 2. Evita EADDRNOTAVAIL si sae_srcaddr intenta enlazar a la IP CGNAT o LAN simulada
+        if (modifiedEndpoints.sae_srcaddr &&
+            modifiedEndpoints.sae_srcaddr->sa_family == AF_INET &&
+            modifiedEndpoints.sae_srcaddrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+            struct sockaddr_in srcSin;
+            memcpy(&srcSin, modifiedEndpoints.sae_srcaddr, sizeof(srcSin));
+            if ((s_spoofedCellularAddr != 0 && srcSin.sin_addr.s_addr == s_spoofedCellularAddr) ||
+                (s_spoofedLanAddr != 0 && srcSin.sin_addr.s_addr == s_spoofedLanAddr)) {
+                modifiedEndpoints.sae_srcaddr = NULL;
+                modifiedEndpoints.sae_srcaddrlen = 0;
+                endpointsModified = YES;
+            }
+        }
+
+        // 3. Redirección DNAT DNS (RFC1918:53 -> 1.1.1.1:53) y evaluación del Kill-Switch
         struct sockaddr_storage redirectedStorage;
         socklen_t redirectedLen = 0;
-        if (rewriteRFC1918DnsDestinationIfNeeded(endpoints->sae_dstaddr, endpoints->sae_dstaddrlen, &redirectedStorage, &redirectedLen)) {
-            sa_endpoints_t modifiedEndpoints = *endpoints;
-            modifiedEndpoints.sae_dstaddr = (const struct sockaddr *)&redirectedStorage;
-            modifiedEndpoints.sae_dstaddrlen = redirectedLen;
+        if (modifiedEndpoints.sae_dstaddr &&
+            modifiedEndpoints.sae_dstaddrlen >= (socklen_t)sizeof(struct sockaddr)) {
+            if (rewriteRFC1918DnsDestinationIfNeeded(modifiedEndpoints.sae_dstaddr, modifiedEndpoints.sae_dstaddrlen, &redirectedStorage, &redirectedLen)) {
+                modifiedEndpoints.sae_dstaddr = (const struct sockaddr *)&redirectedStorage;
+                modifiedEndpoints.sae_dstaddrlen = redirectedLen;
+                endpointsModified = YES;
+            }
+
             int blockErr = evaluateSocketPolicy(sockfd, modifiedEndpoints.sae_dstaddr, modifiedEndpoints.sae_dstaddrlen);
             if (blockErr != 0) {
                 errno = blockErr;
                 return -1;
             }
-            return orig_connectx(sockfd, &modifiedEndpoints, associd, flags, iov, iovcnt, len, connid);
         }
 
-        int blockErr = evaluateSocketPolicy(sockfd, endpoints->sae_dstaddr, endpoints->sae_dstaddrlen);
-        if (blockErr != 0) {
-            errno = blockErr;
-            return -1;
+        if (endpointsModified) {
+            return orig_connectx(sockfd, &modifiedEndpoints, associd, flags, iov, iovcnt, len, connid);
         }
     }
     return orig_connectx(sockfd, endpoints, associd, flags, iov, iovcnt, len, connid);
