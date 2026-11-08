@@ -46,4 +46,3 @@ jobs:
           name: IGFarmShield-rootless-deb
           path: packages/*.deb
           if-no-files-found: error
-          
