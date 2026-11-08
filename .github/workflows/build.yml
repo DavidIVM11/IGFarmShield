@@ -36,7 +36,7 @@ jobs:
 
       - name: Normalize line endings and build package
         run: |
-          find . -type f \( -name "Makefile" -o -name "control" -o -name "*.plist" -o -name "*.x" -o -name "*.m" \) -exec perl -pi -e 's/\r\n/\n/g' {} +
+          find . -type f \( -name "Makefile" -o -name "control" -o -name "*.plist" -o -name "*.x" -o -name "*.m" \) -exec perl -pi -e 's/\r\n/\n/g; s/\xc2\xa0/ /g' {} +
           make clean
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless THEOS_PACKAGE_COMPRESSION=xz
 
