@@ -620,6 +620,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             fetchLiveIPFromEndpoints(urls, index + 1, completion);
         }
     }] resume];
+    [session finishTasksAndInvalidate];
 }
 
 @interface IGFarmRootListController : UIViewController <UITableViewDelegate, UITableViewDataSource>
@@ -800,7 +801,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     subLbl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     subLbl.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
     subLbl.textColor = [UIColor secondaryLabelColor];
-    subLbl.text = @"Modo Invisible • Aislamiento de Cuentas y Red";
+    subLbl.text = @"Modo Invisible v38 • Aislamiento de Cuentas y Red";
     [card addSubview:subLbl];
 
     UILabel *pill = [[UILabel alloc] initWithFrame:CGRectMake(78, 57, 260, 18)];
@@ -953,10 +954,10 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     }
 
     self.stealthDetailReport =
-        @"¿Qué hace el Modo Invisible?\n\n"
-        @"• Oculta el Jailbreak y Crane: Impide que Instagram y Reddit detecten archivos del sistema, librerías inyectadas o contenedores.\n\n"
-        @"• Protege tu conexión (Kill-Switch): Si Shadowrocket se desconecta, bloquea el internet de la app al instante para no filtrar tu IP real.\n\n"
-        @"• Aísla cada cuenta: Hace que cada contenedor tenga sus propios identificadores, hora, operadora 4G y nivel de batería.";
+        @"¿Qué hace el Modo Invisible v38?\n\n"
+        @"• Oculta el Jailbreak y Crane: Impide que Instagram y Reddit detecten archivos del sistema, librerías inyectadas (dladdr/dyld) o contenedores.\n\n"
+        @"• Protege tu conexión (Kill-Switch + DNAT DNS): Si Shadowrocket se desconecta, bloquea el internet de la app al instante y redirige consultas DNS locales por el túnel.\n\n"
+        @"• Aísla cada cuenta al 100%: Cada contenedor tiene su propio ID de volumen APFS (f_fsid), IDFV de Crane, hora, operadora 4G CGNAT (IFF_POINTOPOINT) y nivel de batería.";
 }
 
 - (NSMutableDictionary *)profileForUUID:(NSString *)uuid {
@@ -2255,7 +2256,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
             @"Modo Invisible"
         ];
         NSArray *subtitles = @[
-            @"Asigna un identificador único y tiempo de encendido propio a esta cuenta.",
+            @"Asigna un identificador único, volumen APFS y tiempo de encendido propio a esta cuenta.",
             @"Simula conexión móvil 4G o Wi-Fi y corta el internet si se desconecta el proxy.",
             @"Adapta la zona horaria y el idioma de la app al país de tu proxy.",
             @"Simula niveles independientes de batería, volumen, brillo y memoria libre.",
@@ -2358,7 +2359,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 cell.textLabel.text = @"👻 Modo Invisible";
                 cell.detailTextLabel.textColor = on ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
                 cell.detailTextLabel.text = on
-                    ? @"● Activo: Jailbreak, Crane y tweak ocultos ante la app."
+                    ? @"● Activo (v38): Jailbreak, Crane, APFS f_fsid y tweak ocultos."
                     : @"○ En pausa en esta cuenta.";
                 break;
             }
@@ -2638,6 +2639,7 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
                 [self presentViewController:ac animated:YES completion:nil];
             });
         }] resume];
+        [session finishTasksAndInvalidate];
     });
 }
 
