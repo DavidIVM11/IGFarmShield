@@ -645,6 +645,11 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
 @implementation IGFarmRootListController
 
 // Métodos requeridos por Preferences.app / PreferenceLoader
+- (instancetype)initForContentSize:(CGSize)contentSize { return [self init]; }
+- (void)viewWillBecomeVisible:(void *)source {}
+- (void)setRootController:(id)rootController { _rootController = rootController; }
+- (void)setParentController:(id)parentController { _parentController = parentController; }
+- (void)setSpecifier:(id)specifier { _specifier = specifier; }
 - (void)handleURL:(NSDictionary *)dictionary {}
 - (BOOL)canBeShownFromSuspendedState { return YES; }
 - (void)willResignActive {}
