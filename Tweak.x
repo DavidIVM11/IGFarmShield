@@ -82,6 +82,7 @@ void MSHookFunction(void *symbol, void *replace, void **result);
 @end
 
 static NSString *origCraneIDFV = nil;
+static NSUUID *s_cachedSpoofedIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
 static CTCarrier *s_syntheticCarrier = nil;
 static NSTimeInterval sessionStartTimestamp = 0;
@@ -96,11 +97,9 @@ static UILabel *persistentBadgePill = nil;
 static dispatch_source_t s_tunnelWatchdogTimer = nil;
 static int s_lastRenderedBadgeState = -1;
 
-// Dirección base real de UIKitCore para coherencia Mach-O en dladdr()
-static void *s_uikitBaseAddr = NULL;
 static const char *s_uikitImagePath = "/System/Library/Frameworks/UIKitCore.framework/UIKitCore";
 
-// Banderas O(1) en RAM y micro-variación de sensores por sesión
+// Caché inmutable en RAM/C inicializado en %ctor (Cero bloqueos y 100% Thread-Safe en 40+ hilos)
 static BOOL s_profileInitialized = NO;
 static BOOL s_shieldActive = NO;
 static BOOL s_spoofIDs = NO;
@@ -113,6 +112,7 @@ static float s_sessionBatteryBase = 0.62f;
 static float s_sessionBrightness = 0.48f;
 static float s_sessionVolume = 0.40f;
 static NSInteger s_sessionPasteboardCount = 8;
+static unsigned long long s_cachedFreeBytesBase = 24000000000ULL;
 static int32_t s_spoofedFsid0 = 0;
 static int32_t s_spoofedFsid1 = 0;
 static in_addr_t s_spoofedLanAddr = 0;
@@ -121,11 +121,26 @@ static in_addr_t s_spoofedLanBcast = 0;
 static in_addr_t s_spoofedCellularAddr = 0;
 static time_t s_spoofedBootSec = 0;
 static suseconds_t s_spoofedBootUsec = 0;
+static char s_cachedBootUUIDC[64] = {0};
 static char s_containerHomePath[PATH_MAX] = {0};
 static size_t s_containerHomeLen = 0;
+
+static NSString *s_cachedContainerName = @"Default";
+static NSString *s_cachedCarrierName = @"T-Mobile";
+static NSString *s_cachedCarrierMCC = @"310";
+static NSString *s_cachedCarrierMNC = @"260";
+static NSString *s_cachedCarrierISO = @"us";
+static NSString *s_cachedSSID = @"HomeWiFi-5G";
+static NSString *s_cachedBSSID = @"a4:83:e7:21:9a:10";
+static NSData *s_cachedSSIDData = nil;
+static NSTimeZone *s_cachedTimeZoneObj = nil;
+static NSLocale *s_cachedLocaleObj = nil;
+static NSArray<NSString *> *s_cachedPreferredLangs = nil;
+
 static __thread BOOL s_inInternalCall = NO;
 
 static os_unfair_lock s_tunnelCacheLock = OS_UNFAIR_LOCK_INIT;
+static os_unfair_lock s_idfvLock = OS_UNFAIR_LOCK_INIT;
 static BOOL s_cachedTunnelUp = NO;
 static CFAbsoluteTime s_lastTunnelCheck = 0;
 
@@ -136,9 +151,7 @@ static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) 
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
 static int (*orig_statfs)(const char *, struct statfs *) = NULL;
-static int (*orig_fstatfs)(int, struct statfs *) = NULL;
 static int (*orig_access)(const char *, int) = NULL;
-static int (*orig_faccessat)(int, const char *, int, int) = NULL;
 static int (*orig_stat)(const char *, struct stat *) = NULL;
 static int (*orig_lstat)(const char *, struct stat *) = NULL;
 static FILE *(*orig_fopen)(const char *, const char *) = NULL;
@@ -148,15 +161,10 @@ static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 static int (*orig_bind)(int, const struct sockaddr *, socklen_t) = NULL;
 static int (*orig_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
 static int (*orig_connect)(int, const struct sockaddr *, socklen_t) = NULL;
-static int (*orig_connectx)(int, const sa_endpoints_t *, sae_associd_t, unsigned int, const struct iovec *, unsigned int, size_t *, sae_connid_t *) = NULL;
 static ssize_t (*orig_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t) = NULL;
 static ssize_t (*orig_sendmsg)(int, const struct msghdr *, int) = NULL;
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
 static Boolean (*orig_SCNetworkReachabilityGetFlags)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *) = NULL;
-static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
-static CFArrayRef (*orig_CFNetworkCopyProxiesForURL)(CFURLRef, CFDictionaryRef) = NULL;
-static CFTimeZoneRef (*orig_CFTimeZoneCopySystem)(void) = NULL;
-static CFTimeZoneRef (*orig_CFTimeZoneCopyDefault)(void) = NULL;
 
 static float clampFloat(float val, float minVal, float maxVal) {
     if (val < minVal) return minVal;
@@ -203,7 +211,8 @@ static NSString *deterministicUUIDStringFromSalt(NSString *salt) {
     return [NSString stringWithFormat:@"%08X-%04X-%04X-%04X-%012llX", d1, d2, d3, d4, d5];
 }
 
-static void applyLowLevelCTimeZone(NSString *tzName) {
+// Solo se invoca durante %ctor cuando el proceso es monohilo
+static void applyLowLevelCTimeZoneAtLaunch(NSString *tzName) {
     if (!tzName || [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "] || tzName.length == 0) return;
     BOOL prev = s_inInternalCall;
     s_inInternalCall = YES;
@@ -211,6 +220,7 @@ static void applyLowLevelCTimeZone(NSString *tzName) {
     tzset();
     NSTimeZone *tzObj = [NSTimeZone timeZoneWithName:tzName];
     if (tzObj) {
+        s_cachedTimeZoneObj = tzObj;
         [NSTimeZone setDefaultTimeZone:tzObj];
     }
     s_inInternalCall = prev;
@@ -538,7 +548,6 @@ static void ensureProfileLoaded(void) {
     NSString *craneID = ident[@"craneID"];
     NSString *craneName = ident[@"craneName"];
 
-    // Deriva f_fsid de 64 bits único y determinista por contenedor para aislar el ID de volumen APFS
     uint64_t fsidHash = deterministicHash64([NSString stringWithFormat:@"APFS_%@_%@", bundleID, keyUUID]);
     s_spoofedFsid0 = (int32_t)((fsidHash >> 32) & 0x7FFFFFFFU);
     s_spoofedFsid1 = (int32_t)(fsidHash & 0x7FFFFFFFU);
@@ -600,7 +609,7 @@ static void ensureProfileLoaded(void) {
         }
     }
 
-NSMutableDictionary *profile = nil;
+    NSMutableDictionary *profile = nil;
     if ([diskLoaded isKindOfClass:[NSDictionary class]] && diskLoaded[@"bootSessionUUID"]) {
         profile = [diskLoaded mutableCopy];
     }
@@ -608,16 +617,8 @@ NSMutableDictionary *profile = nil;
         if (!profile) {
             profile = [settingsEntry mutableCopy];
         } else {
-            // Sincroniza interruptores y metadatos desde Ajustes sin borrar el anclaje de IP/Zona ya capturado en el sandbox
-            for (NSString *k in @[@"enabled", @"masterEnabled", @"appEnabled", @"effectiveShieldActive", @"containerName", @"craneIdentifier", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"localIP", @"cellularLocalIP", @"ssid", @"bssid", @"bootSessionUUID", @"spoofedBootEpoch", @"spoofedBootUsec", @"lastBootUUIDForTime", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"pasteboardCount"]) {
+            for (NSString *k in @[@"enabled", @"masterEnabled", @"appEnabled", @"effectiveShieldActive", @"containerName", @"craneIdentifier", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"cellularLocalIP", @"ssid", @"bssid", @"bootSessionUUID", @"spoofedBootEpoch", @"spoofedBootUsec", @"lastBootUUIDForTime", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"pasteboardCount"]) {
                 if (settingsEntry[k] != nil) profile[k] = settingsEntry[k];
-            }
-            BOOL settingsAnchored = [settingsEntry[@"locationAnchored"] boolValue];
-            BOOL diskAnchored = [profile[@"locationAnchored"] boolValue];
-            if (settingsAnchored || !diskAnchored) {
-                for (NSString * locKey in @[@"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP"]) {
-                    if (settingsEntry[locKey] != nil) profile[locKey] = settingsEntry[locKey];
-                }
             }
         }
     }
@@ -721,7 +722,10 @@ NSMutableDictionary *profile = nil;
     }
     s_spoofedCellularAddr = inet_addr([cellIP UTF8String]);
 
-    NSString *currentBootUUID = profile[@"bootSessionUUID"] ?: @"";
+    NSString *currentBootUUID = profile[@"bootSessionUUID"] ?: [[NSUUID UUID] UUIDString];
+    strncpy(s_cachedBootUUIDC, [currentBootUUID UTF8String], sizeof(s_cachedBootUUIDC) - 1);
+    s_cachedBootUUIDC[sizeof(s_cachedBootUUIDC) - 1] = '\0';
+
     NSString *savedBootUUIDRef = profile[@"lastBootUUIDForTime"] ?: @"";
     long long savedBootSec = [profile[@"spoofedBootEpoch"] longLongValue];
     int savedBootUsec = [profile[@"spoofedBootUsec"] intValue];
@@ -772,6 +776,31 @@ NSMutableDictionary *profile = nil;
     liveContainerProfile = profile;
     persistCurrentProfileToSandboxIfNeeded(diskLoaded);
 
+    // Cachear todas las propiedades en objetos inmutables para lecturas concurrentes sin crashes
+    s_cachedContainerName = [profile[@"containerName"] ?: @"Default" copy];
+    s_cachedCarrierName = [profile[@"CarrierName"] ?: @"T-Mobile" copy];
+    s_cachedCarrierMCC = [profile[@"CarrierMCC"] ?: @"310" copy];
+    s_cachedCarrierMNC = [profile[@"CarrierMNC"] ?: @"260" copy];
+    s_cachedCarrierISO = [profile[@"CarrierISO"] ?: @"us" copy];
+    s_cachedSSID = [profile[@"ssid"] ?: @"HomeWiFi-5G" copy];
+    s_cachedBSSID = [profile[@"bssid"] ?: @"a4:83:e7:21:9a:10" copy];
+    s_cachedSSIDData = [s_cachedSSID dataUsingEncoding:NSUTF8StringEncoding];
+    s_cachedFreeBytesBase = profile[@"freeBytes"] ? [profile[@"freeBytes"] unsignedLongLongValue] : 24000000000ULL;
+
+    NSString *idfvStr = profile[@"idfv"];
+    if ([idfvStr isKindOfClass:[NSString class]] && idfvStr.length >= 32) {
+        s_cachedSpoofedIDFV = [[NSUUID alloc] initWithUUIDString:idfvStr];
+    }
+
+    NSString *locID = profile[@"localeID"] ?: @"en_US";
+    s_cachedLocaleObj = [NSLocale localeWithLocaleIdentifier:locID];
+    NSString *lang = [locID stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
+    if ([lang caseInsensitiveCompare:@"en-US"] == NSOrderedSame) {
+        s_cachedPreferredLangs = @[@"en-US"];
+    } else {
+        s_cachedPreferredLangs = @[lang, @"en-US"];
+    }
+
     float rawBat = profile[@"batteryLevel"] ? [profile[@"batteryLevel"] floatValue] : 0.62f;
     float rawBri = profile[@"brightness"] ? [profile[@"brightness"] floatValue] : 0.48f;
     float rawVol = profile[@"audioVolume"] ? [profile[@"audioVolume"] floatValue] : 0.40f;
@@ -794,7 +823,7 @@ NSMutableDictionary *profile = nil;
     s_isCellularMode = ![profile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
 
     if (s_spoofLocation && profile[@"timeZone"]) {
-        applyLowLevelCTimeZone(profile[@"timeZone"]);
+        applyLowLevelCTimeZoneAtLaunch(profile[@"timeZone"]);
     }
 
     s_inInternalCall = NO;
@@ -804,23 +833,23 @@ NSMutableDictionary *profile = nil;
 // CÁPSULA SUPERIOR CON MONITOR DE TÚNEL Y DETECTOR DE DESFASE DE PROXY
 // ============================================================================
 static void refreshBadgePillStateOnMain(void) {
-    if (!persistentBadgePill || !liveContainerProfile) return;
+    if (!persistentBadgePill) return;
     BOOL tunnelUp = hasActiveUtunTunnelLive();
     int desiredState = 0;
     if (s_shieldActive && s_spoofNetwork && !tunnelUp) {
-        desiredState = 2; // Sin túnel IPv4 (Kill-Switch activo)
+        desiredState = 2;
     } else if (s_shieldActive && s_proxyMismatchDetected) {
-        desiredState = 3; // Alerta naranja: el proxy activo no coincide con la zona anclada del contenedor
+        desiredState = 3;
     } else if (s_shieldActive) {
-        desiredState = 1; // Protegido y coherente
+        desiredState = 1;
     } else {
-        desiredState = 0; // En pausa manual
+        desiredState = 0;
     }
 
     if (desiredState == s_lastRenderedBadgeState) return;
     s_lastRenderedBadgeState = desiredState;
 
-    NSString *cName = liveContainerProfile[@"containerName"] ?: @"Default";
+    NSString *cName = s_cachedContainerName ?: @"Default";
     CGRect screenBounds = [UIScreen mainScreen].bounds;
 
     if (desiredState == 2) {
@@ -842,53 +871,7 @@ static void refreshBadgePillStateOnMain(void) {
     persistentBadgePill.frame = CGRectMake((screenBounds.size.width - pillW) / 2.0, 18.0, pillW, 16.0);
 }
 
-static void applyAutoDetectedProxyMetadataOnMain(NSString *ip, NSString *ispRaw, NSString *cc, NSString *city, NSString *region, NSString *tz) {
-    if (!liveContainerProfile || !ip || !tz) return;
-    NSDictionary *snap = [liveContainerProfile copy];
-    NSString *ispUp = [ispRaw ?: @"" uppercaseString];
-    NSString *ccLow = [cc ?: @"us" lowercaseString];
-
-    liveContainerProfile[@"locationAnchored"] = @YES;
-    liveContainerProfile[@"lastSyncedIP"] = ip;
-    liveContainerProfile[@"ispName"] = ispRaw ?: @"ISP";
-    liveContainerProfile[@"cityCountry"] = [NSString stringWithFormat:@"%@, %@ (%@)", city ?: @"", region ?: @"", [ccLow uppercaseString]];
-    liveContainerProfile[@"timeZone"] = tz;
-    liveContainerProfile[@"localeID"] = [NSString stringWithFormat:@"en_%@", [ccLow uppercaseString]];
-
-    if ([ispUp containsString:@"T-MOBILE"] || [ispUp containsString:@"METRO"] || [ispUp containsString:@"MINT"]) {
-        liveContainerProfile[@"CarrierMode"] = @"CELLULAR";
-        liveContainerProfile[@"CarrierName"] = @"T-Mobile";
-        liveContainerProfile[@"CarrierMCC"] = @"310";
-        liveContainerProfile[@"CarrierMNC"] = @"260";
-        liveContainerProfile[@"CarrierISO"] = ccLow;
-    } else if ([ispUp containsString:@"AT&T"] || [ispUp containsString:@"CRICKET"]) {
-        liveContainerProfile[@"CarrierMode"] = @"CELLULAR";
-        liveContainerProfile[@"CarrierName"] = @"AT&T";
-        liveContainerProfile[@"CarrierMCC"] = @"310";
-        liveContainerProfile[@"CarrierMNC"] = @"410";
-        liveContainerProfile[@"CarrierISO"] = ccLow;
-    } else if ([ispUp containsString:@"VERIZON"] || [ispUp containsString:@"VISIBLE"]) {
-        liveContainerProfile[@"CarrierMode"] = @"CELLULAR";
-        liveContainerProfile[@"CarrierName"] = @"Verizon";
-        liveContainerProfile[@"CarrierMCC"] = @"311";
-        liveContainerProfile[@"CarrierMNC"] = @"480";
-        liveContainerProfile[@"CarrierISO"] = ccLow;
-    } else if ([ispUp containsString:@"CELL"] || [ispUp containsString:@"MOBILE"] || [ispUp containsString:@"WIRELESS"]) {
-        liveContainerProfile[@"CarrierMode"] = @"CELLULAR";
-        liveContainerProfile[@"CarrierName"] = ispRaw ?: @"LTE";
-        liveContainerProfile[@"CarrierMCC"] = @"310";
-        liveContainerProfile[@"CarrierMNC"] = @"260";
-        liveContainerProfile[@"CarrierISO"] = ccLow;
-    }
-
-    s_isCellularMode = ![liveContainerProfile[@"CarrierMode"] isEqualToString:@"WIFI_ONLY"];
-    if (s_spoofLocation) {
-        applyLowLevelCTimeZone(tz);
-    }
-    persistCurrentProfileToSandboxIfNeeded(snap);
-}
-
-// Verifica en segundo plano que el proxy activo coincida con la zona horaria/país del contenedor (Thread-Safe y sin leaks de NSURLSession)
+// Verificador pasivo en segundo plano (sin setenv multihilo ni mutación concurrente de RAM)
 static void verifyLiveProxyCoherenceOnStartup(void) {
     if (s_proxyCoherenceChecked || !s_shieldActive || !s_spoofNetwork || !liveContainerProfile) return;
     if (!hasActiveUtunTunnelCached()) return;
@@ -913,11 +896,7 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
 
         NSString *liveIP = [json[@"ip"] isKindOfClass:[NSString class]] ? json[@"ip"] : nil;
         NSString *liveCC = [json[@"country_code"] isKindOfClass:[NSString class]] ? [json[@"country_code"] lowercaseString] : nil;
-        NSString *liveCity = [json[@"city"] isKindOfClass:[NSString class]] ? json[@"city"] : @"";
-        NSString *liveRegion = [json[@"region"] isKindOfClass:[NSString class]] ? json[@"region"] : @"";
-        NSDictionary *conn = [json[@"connection"] isKindOfClass:[NSDictionary class]] ? json[@"connection"] : @{};
-        NSDictionary *tzDict = [json[@"timezone"] isKindOfClass:[NSDictionary class]] ? json[@"timezone"] : @{};
-        NSString *liveISP = conn[@"isp"] ?: (conn[@"org"] ?: @"ISP");
+        NSDictionary *tzDict = [json[@"timezone"] isKindOfClass:[NSSDictionary class]] ? json[@"timezone"] : @{};
         NSString *liveTZ = [tzDict[@"id"] isKindOfClass:[NSString class]] ? tzDict[@"id"] : nil;
 
         if (!liveIP || !liveTZ || liveTZ.length == 0) return;
@@ -925,21 +904,16 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!liveContainerProfile) return;
             BOOL anchored = [liveContainerProfile[@"locationAnchored"] boolValue];
-            NSString *savedIP = liveContainerProfile[@"lastSyncedIP"] ?: @"Sin sincronizar";
+            if (!anchored) return;
+
             NSString *savedTZ = liveContainerProfile[@"timeZone"] ?: @"";
             NSString *savedISO = [liveContainerProfile[@"CarrierISO"] ?: @"us" lowercaseString];
-
-            if (!anchored || [savedIP hasPrefix:@"Sin "]) {
-                applyAutoDetectedProxyMetadataOnMain(liveIP, liveISP, liveCC ?: @"us", liveCity, liveRegion, liveTZ);
-                return;
-            }
-
             BOOL tzDiffers = (savedTZ.length > 0 && ![savedTZ isEqualToString:liveTZ]);
             BOOL ccDiffers = (liveCC.length > 0 && savedISO.length > 0 && ![savedISO isEqualToString:liveCC]);
 
             if (tzDiffers || ccDiffers) {
                 s_proxyMismatchDetected = YES;
-                s_proxyMismatchSummary = [NSString stringWithFormat:@"Proxy actual: %@ (%@) ≠ Perfil: %@", liveIP, liveTZ, savedTZ];
+                s_proxyMismatchSummary = [NSString stringWithFormat:@"Proxy: %@ (%@) ≠ Perfil: %@", liveIP, liveTZ, savedTZ];
                 s_lastRenderedBadgeState = -1;
                 refreshBadgePillStateOnMain();
                 if (persistentBadgeWindow && persistentBadgeWindow.rootViewController) {
@@ -954,7 +928,7 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
                     warnToast.textColor = [UIColor whiteColor];
                     warnToast.backgroundColor = [UIColor colorWithRed:0.86 green:0.45 blue:0.04 alpha:0.96];
                     warnToast.text = [NSString stringWithFormat:@"⚠️ Zona del Proxy Cambió en %@\n%@",
-                                      liveContainerProfile[@"containerName"] ?: @"Contenedor", s_proxyMismatchSummary];
+                                      s_cachedContainerName ?: @"Contenedor", s_proxyMismatchSummary];
                     [persistentBadgeWindow.rootViewController.view addSubview:warnToast];
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                         [UIView animateWithDuration:0.35 animations:^{ warnToast.alpha = 0.0; } completion:^(BOOL f) {
@@ -963,10 +937,6 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
                         }];
                     });
                 }
-            } else if (![savedIP isEqualToString:liveIP]) {
-                NSDictionary *snap = [liveContainerProfile copy];
-                liveContainerProfile[@"lastSyncedIP"] = liveIP;
-                persistCurrentProfileToSandboxIfNeeded(snap);
             }
         });
     }] resume];
@@ -1027,7 +997,10 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     if (liveVendorUUID) {
         NSString *captured = [[liveVendorUUID UUIDString] uppercaseString];
         if (captured.length >= 32) {
+            os_unfair_lock_lock(&s_idfvLock);
             origCraneIDFV = captured;
+            s_cachedSpoofedIDFV = liveVendorUUID;
+            os_unfair_lock_unlock(&s_idfvLock);
             if (![liveContainerProfile[@"craneOriginalIDFV"] isEqualToString:captured]) {
                 NSDictionary *snap = [liveContainerProfile copy];
                 liveContainerProfile[@"idfv"] = captured;
@@ -1049,7 +1022,7 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     bannerShownThisSession = YES;
 
     NSDictionary *prof = liveContainerProfile;
-    NSString *cName = prof[@"containerName"] ?: @"Default";
+    NSString *cName = s_cachedContainerName ?: @"Default";
     CGRect screenBounds = [UIScreen mainScreen].bounds;
     BOOL tunnelUp = hasActiveUtunTunnelLive();
     BOOL killSwitchTriggered = (s_shieldActive && s_spoofNetwork && !tunnelUp);
@@ -1087,7 +1060,7 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     }
 
     NSString *netMode = s_isCellularMode
-        ? [NSString stringWithFormat:@"4G: %@ (%@)", prof[@"CarrierName"] ?: @"Móvil", prof[@"cellularLocalIP"] ?: @"CGNAT"]
+        ? [NSString stringWithFormat:@"4G: %@ (%@)", s_cachedCarrierName, prof[@"cellularLocalIP"] ?: @"CGNAT"]
         : [NSString stringWithFormat:@"Wi-Fi (%@)", prof[@"localIP"] ?: @"LAN"];
     int batPct = (int)(s_sessionBatteryBase * 100.0f);
 
@@ -1130,7 +1103,7 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
 }
 
 // ============================================================================
-// MODO INVISIBLE EN C, DLOPEN, DLADDR (CON DLI_FBASE REAL), FOUNDATION Y SWIFT
+// MODO INVISIBLE EN C, DLOPEN, DLADDR, FOUNDATION Y SWIFT
 // ============================================================================
 static BOOL isHiddenPathForTargetAppC(const char *path) {
     if (!path || !*path) return NO;
@@ -1191,16 +1164,6 @@ static int custom_access(const char *path, int amode) {
         }
     }
     return orig_access(path, amode);
-}
-
-static int custom_faccessat(int fd, const char *path, int mode, int flag) {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
-        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
-    return orig_faccessat(fd, path, mode, flag);
 }
 
 static int custom_stat(const char *path, struct stat *buf) {
@@ -1265,7 +1228,6 @@ static char *custom_getenv(const char *name) {
     return orig_getenv(name);
 }
 
-// Rota entre 16 dylibs del sistema para evitar entradas duplicadas al escanear índices dyld
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
     const char *name = orig_dyld_get_image_name(image_index);
     if (s_spoofSecurity && name && isHiddenPathForTargetAppC(name)) {
@@ -1294,17 +1256,13 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
     return name;
 }
 
-// Reemplaza tanto dli_fname como dli_fbase por el mach_header real de UIKitCore y limpia dli_sname/saddr
+// Preserva dli_fbase intacto para no romper la resta de punteros (addr - dli_fbase) en Proxygen/Crashlytics
 static int custom_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
     if (s_spoofSecurity && ret != 0 && info && info->dli_fname && isHiddenPathForTargetAppC(info->dli_fname)) {
         if (isCallerAppOrSwift(__builtin_return_address(0))) {
             info->dli_fname = s_uikitImagePath;
-            if (s_uikitBaseAddr != NULL) {
-                info->dli_fbase = s_uikitBaseAddr;
-            }
-            info->dli_sname = NULL;
-            info->dli_saddr = NULL;
+            info->dli_sname = "_UIApplicationMain";
         }
     }
     return ret;
@@ -1377,72 +1335,41 @@ static int custom_dladdr(const void *addr, Dl_info *info) {
 
 %hook UIPasteboard
 - (NSInteger)changeCount {
-    if (!s_spoofSecurity || !liveContainerProfile) return %orig;
+    if (!s_spoofSecurity) return %orig;
     return s_sessionPasteboardCount;
 }
 %end
 
 // ============================================================================
-// ZONA HORARIA (COREFOUNDATION + OBJC + C) E IDIOMA POR CONTENEDOR
+// ZONA HORARIA E IDIOMA POR CONTENEDOR (LECTURA O(1) INMUTABLE)
 // ============================================================================
-static CFTimeZoneRef createSpoofedCFTimeZoneOrNull(void) {
-    if (!s_spoofLocation || !liveContainerProfile || s_inInternalCall) return NULL;
-    NSString *tzName = liveContainerProfile[@"timeZone"];
-    if (![tzName isKindOfClass:[NSString class]] || tzName.length == 0 ||
-        [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "]) {
-        return NULL;
-    }
-    return CFTimeZoneCreateWithName(kCFAllocatorDefault, (__bridge CFStringRef)tzName, true);
-}
-
-static CFTimeZoneRef custom_CFTimeZoneCopySystem(void) {
-    CFTimeZoneRef tz = createSpoofedCFTimeZoneOrNull();
-    if (tz) return tz;
-    return orig_CFTimeZoneCopySystem ? orig_CFTimeZoneCopySystem() : NULL;
-}
-
-static CFTimeZoneRef custom_CFTimeZoneCopyDefault(void) {
-    CFTimeZoneRef tz = createSpoofedCFTimeZoneOrNull();
-    if (tz) return tz;
-    return orig_CFTimeZoneCopyDefault ? orig_CFTimeZoneCopyDefault() : NULL;
-}
-
 %hook NSTimeZone
 + (NSTimeZone *)systemTimeZone {
-    if (!s_spoofLocation || !liveContainerProfile) return %orig;
-    NSString *tzName = liveContainerProfile[@"timeZone"];
-    if (!tzName || [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "]) return %orig;
-    return [NSTimeZone timeZoneWithName:tzName] ?: %orig;
+    if (!s_spoofLocation || !s_cachedTimeZoneObj) return %orig;
+    return s_cachedTimeZoneObj;
 }
 + (NSTimeZone *)localTimeZone {
-    if (!s_spoofLocation) return %orig;
-    return [self systemTimeZone];
+    if (!s_spoofLocation || !s_cachedTimeZoneObj) return %orig;
+    return s_cachedTimeZoneObj;
 }
 + (NSTimeZone *)defaultTimeZone {
-    if (!s_spoofLocation) return %orig;
-    return [self systemTimeZone];
+    if (!s_spoofLocation || !s_cachedTimeZoneObj) return %orig;
+    return s_cachedTimeZoneObj;
 }
 %end
 
 %hook NSLocale
 + (NSLocale *)currentLocale {
-    if (!s_spoofLocation || !liveContainerProfile) return %orig;
-    NSString *locID = liveContainerProfile[@"localeID"];
-    if (!locID) return %orig;
-    return [NSLocale localeWithLocaleIdentifier:locID] ?: %orig;
+    if (!s_spoofLocation || !s_cachedLocaleObj) return %orig;
+    return s_cachedLocaleObj;
 }
 + (NSLocale *)autoupdatingCurrentLocale {
-    if (!s_spoofLocation) return %orig;
-    return [self currentLocale];
+    if (!s_spoofLocation || !s_cachedLocaleObj) return %orig;
+    return s_cachedLocaleObj;
 }
 + (NSArray<NSString *> *)preferredLanguages {
-    if (!s_spoofLocation || !liveContainerProfile) return %orig;
-    NSString *locID = liveContainerProfile[@"localeID"] ?: @"en_US";
-    NSString *lang = [locID stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
-    if ([lang caseInsensitiveCompare:@"en-US"] == NSOrderedSame) {
-        return @[@"en-US"];
-    }
-    return @[lang, @"en-US"];
+    if (!s_spoofLocation || !s_cachedPreferredLangs) return %orig;
+    return s_cachedPreferredLangs;
 }
 %end
 
@@ -1459,10 +1386,10 @@ static BOOL isSocketDatagram(int sockfd) {
 }
 
 static BOOL isRFC1918OrLinkLocalIPv4(uint32_t ipHost) {
-    if ((ipHost >> 24) == 10) return YES;                        // 10.0.0.0/8
-    if ((ipHost & 0xFFF00000U) == 0xAC100000U) return YES;       // 172.16.0.0/12
-    if ((ipHost & 0xFFFF0000U) == 0xC0A80000U) return YES;       // 192.168.0.0/16
-    if ((ipHost & 0xFFFF0000U) == 0xA9FE0000U) return YES;       // 169.254.0.0/16
+    if ((ipHost >> 24) == 10) return YES;
+    if ((ipHost & 0xFFF00000U) == 0xAC100000U) return YES;
+    if ((ipHost & 0xFFFF0000U) == 0xC0A80000U) return YES;
+    if ((ipHost & 0xFFFF0000U) == 0xA9FE0000U) return YES;
     return NO;
 }
 
@@ -1475,7 +1402,7 @@ static BOOL rewriteRFC1918DnsDestinationIfNeeded(const struct sockaddr *addr, so
         uint16_t dstPort = ntohs(sin.sin_port);
         uint32_t ipHost = ntohl(sin.sin_addr.s_addr);
         if (dstPort == 53 && isRFC1918OrLinkLocalIPv4(ipHost)) {
-            sin.sin_addr.s_addr = htonl(0x01010101U); // 1.1.1.1
+            sin.sin_addr.s_addr = htonl(0x01010101U);
             memset(outStorage, 0, sizeof(struct sockaddr_storage));
             memcpy(outStorage, &sin, sizeof(sin));
             *outLen = sizeof(sin);
@@ -1484,7 +1411,7 @@ static BOOL rewriteRFC1918DnsDestinationIfNeeded(const struct sockaddr *addr, so
     } else if (addr->sa_family == AF_INET6 && addrlen >= (socklen_t)sizeof(struct sockaddr_in6)) {
         struct sockaddr_in6 sin6;
         memcpy(&sin6, addr, sizeof(sin6));
-        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
         if (memcmp(sin6.sin6_addr.s6_addr, v4mapPrefix, 12) == 0) {
             uint32_t mappedIPv4 = 0;
             memcpy(&mappedIPv4, &sin6.sin6_addr.s6_addr[12], 4);
@@ -1542,7 +1469,7 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
             return 0;
         }
 
-        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
         if (memcmp(sin6.sin6_addr.s6_addr, v4mapPrefix, 12) == 0) {
             uint32_t mappedIPv4 = 0;
             memcpy(&mappedIPv4, &sin6.sin6_addr.s6_addr[12], 4);
@@ -1623,61 +1550,6 @@ static int custom_connect(int sockfd, const struct sockaddr *addr, socklen_t add
     return orig_connect(sockfd, targetAddr, targetLen);
 }
 
-static int custom_connectx(int sockfd, const sa_endpoints_t *endpoints, sae_associd_t associd, unsigned int flags, const struct iovec *iov, unsigned int iovcnt, size_t *len, sae_connid_t *connid) {
-    if (endpoints && s_spoofNetwork && !s_inInternalCall) {
-        sa_endpoints_t modifiedEndpoints = *endpoints;
-        BOOL endpointsModified = NO;
-
-        // 1. Neutraliza sae_srcif si intenta atar el socket a una interfaz física fuera del túnel utun
-        if (modifiedEndpoints.sae_srcif > 0) {
-            char ifName[IF_NAMESIZE] = {0};
-            if (if_indextoname(modifiedEndpoints.sae_srcif, ifName) != NULL) {
-                if (strcmp(ifName, "lo0") != 0 && !isTunnelInterfaceNameC(ifName)) {
-                    modifiedEndpoints.sae_srcif = 0;
-                    endpointsModified = YES;
-                }
-            }
-        }
-
-        // 2. Evita EADDRNOTAVAIL si sae_srcaddr intenta enlazar a la IP CGNAT o LAN simulada
-        if (modifiedEndpoints.sae_srcaddr &&
-            modifiedEndpoints.sae_srcaddr->sa_family == AF_INET &&
-            modifiedEndpoints.sae_srcaddrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
-            struct sockaddr_in srcSin;
-            memcpy(&srcSin, modifiedEndpoints.sae_srcaddr, sizeof(srcSin));
-            if ((s_spoofedCellularAddr != 0 && srcSin.sin_addr.s_addr == s_spoofedCellularAddr) ||
-                (s_spoofedLanAddr != 0 && srcSin.sin_addr.s_addr == s_spoofedLanAddr)) {
-                modifiedEndpoints.sae_srcaddr = NULL;
-                modifiedEndpoints.sae_srcaddrlen = 0;
-                endpointsModified = YES;
-            }
-        }
-
-        // 3. Redirección DNAT DNS (RFC1918:53 -> 1.1.1.1:53) y evaluación del Kill-Switch
-        struct sockaddr_storage redirectedStorage;
-        socklen_t redirectedLen = 0;
-        if (modifiedEndpoints.sae_dstaddr &&
-            modifiedEndpoints.sae_dstaddrlen >= (socklen_t)sizeof(struct sockaddr)) {
-            if (rewriteRFC1918DnsDestinationIfNeeded(modifiedEndpoints.sae_dstaddr, modifiedEndpoints.sae_dstaddrlen, &redirectedStorage, &redirectedLen)) {
-                modifiedEndpoints.sae_dstaddr = (const struct sockaddr *)&redirectedStorage;
-                modifiedEndpoints.sae_dstaddrlen = redirectedLen;
-                endpointsModified = YES;
-            }
-
-            int blockErr = evaluateSocketPolicy(sockfd, modifiedEndpoints.sae_dstaddr, modifiedEndpoints.sae_dstaddrlen);
-            if (blockErr != 0) {
-                errno = blockErr;
-                return -1;
-            }
-        }
-
-        if (endpointsModified) {
-            return orig_connectx(sockfd, &modifiedEndpoints, associd, flags, iov, iovcnt, len, connid);
-        }
-    }
-    return orig_connectx(sockfd, endpoints, associd, flags, iov, iovcnt, len, connid);
-}
-
 static ssize_t custom_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
     if (dest_addr) {
         struct sockaddr_storage redirectedStorage;
@@ -1749,50 +1621,6 @@ static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef tar
     return ok;
 }
 
-static CFDictionaryRef custom_CFNetworkCopySystemProxySettings(void) {
-    CFDictionaryRef origRef = orig_CFNetworkCopySystemProxySettings ? orig_CFNetworkCopySystemProxySettings() : NULL;
-    if (!origRef || !s_spoofNetwork) return origRef;
-    if (!isCallerFromTargetAppStrict(__builtin_return_address(0))) return origRef;
-    if (!hasActiveUtunTunnelCached()) return origRef;
-
-    NSDictionary *origDict = (__bridge NSDictionary *)origRef;
-    NSMutableDictionary *cleanDict = [NSMutableDictionary dictionary];
-    NSString *primaryIf = s_isCellularMode ? @"pdp_ip0" : @"en0";
-
-    NSDictionary *scoped = origDict[@"__SCOPED__"];
-    if ([scoped isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *cleanScoped = [NSMutableDictionary dictionary];
-        for (NSString *ifKey in scoped) {
-            if (isTunnelInterfaceNameC([ifKey UTF8String])) continue;
-            if (s_isCellularMode && ([ifKey isEqualToString:@"en0"] || isSecondaryWifiInterfaceNameC([ifKey UTF8String]))) {
-                continue;
-            }
-            if (!s_isCellularMode && [ifKey hasPrefix:@"pdp_ip"]) continue;
-            cleanScoped[ifKey] = @{};
-        }
-        if (cleanScoped.count == 0) cleanScoped[primaryIf] = @{};
-        cleanDict[@"__SCOPED__"] = cleanScoped;
-    } else {
-        cleanDict[@"__SCOPED__"] = @{primaryIf: @{}};
-    }
-
-    CFRelease(origRef);
-    return (__bridge_retained CFDictionaryRef)cleanDict;
-}
-
-static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings) {
-    if (s_spoofNetwork && isCallerFromTargetAppStrict(__builtin_return_address(0))) {
-        if (hasActiveUtunTunnelCached()) {
-            NSDictionary *directProxy = @{
-                (__bridge NSString *)kCFProxyTypeKey : (__bridge NSString *)kCFProxyTypeNone
-            };
-            NSArray *arr = @[ directProxy ];
-            return (__bridge_retained CFArrayRef)arr;
-        }
-    }
-    return orig_CFNetworkCopyProxiesForURL ? orig_CFNetworkCopyProxiesForURL(url, proxySettings) : NULL;
-}
-
 %hook NSMutableURLRequest
 - (void)setAssumesHTTP3Capable:(BOOL)capable {
     if (s_spoofNetwork) {
@@ -1811,7 +1639,7 @@ static CFArrayRef custom_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRe
 - (NSDictionary *)connectionProxyDictionary {
     NSDictionary *orig = %orig;
     if (s_spoofNetwork && orig != nil && isCallerFromTargetAppStrict(__builtin_return_address(0))) {
-        if (hasActiveUtunTunnelCached()) return nil;
+        if (hasActiveUtunTunnelCached()) return @{};
     }
     return orig;
 }
@@ -1827,48 +1655,48 @@ static CTCarrier *sharedSyntheticCarrier(void) {
 
 %hook CTCarrier
 - (NSString *)carrierName {
-    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_spoofNetwork) return %orig;
     if (!s_isCellularMode) return nil;
-    return liveContainerProfile[@"CarrierName"] ?: @"T-Mobile";
+    return s_cachedCarrierName;
 }
 - (NSString *)mobileCountryCode {
-    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_spoofNetwork) return %orig;
     if (!s_isCellularMode) return nil;
-    return liveContainerProfile[@"CarrierMCC"] ?: @"310";
+    return s_cachedCarrierMCC;
 }
 - (NSString *)mobileNetworkCode {
-    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_spoofNetwork) return %orig;
     if (!s_isCellularMode) return nil;
-    return liveContainerProfile[@"CarrierMNC"] ?: @"260";
+    return s_cachedCarrierMNC;
 }
 - (NSString *)isoCountryCode {
-    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_spoofNetwork) return %orig;
     if (!s_isCellularMode) return nil;
-    return liveContainerProfile[@"CarrierISO"] ?: @"us";
+    return s_cachedCarrierISO;
 }
 - (BOOL)allowsVOIP { return YES; }
 %end
 
 %hook CTTelephonyNetworkInfo
 - (CTCarrier *)subscriberCellularProvider {
-    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_spoofNetwork) return %orig;
     if (!s_isCellularMode) return nil;
     return %orig ?: sharedSyntheticCarrier();
 }
 - (NSDictionary<NSString *, CTCarrier *> *)serviceSubscriberCellularProviders {
-    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_spoofNetwork) return %orig;
     if (!s_isCellularMode) return @{};
     NSDictionary *orig = %orig;
     if (orig && orig.count > 0) return orig;
     return @{@"0000000100000001": sharedSyntheticCarrier()};
 }
 - (NSString *)currentRadioAccessTechnology {
-    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_spoofNetwork) return %orig;
     if (!s_isCellularMode) return nil;
     return CTRadioAccessTechnologyLTE;
 }
 - (NSDictionary<NSString *, NSString *> *)serviceCurrentRadioAccessTechnology {
-    if (!s_spoofNetwork || !liveContainerProfile) return %orig;
+    if (!s_spoofNetwork) return %orig;
     if (!s_isCellularMode) return nil;
     return @{@"0000000100000001": CTRadioAccessTechnologyLTE};
 }
@@ -1879,14 +1707,15 @@ static void writeSockaddrInAddrSafely(struct sockaddr *sa, in_addr_t ipv4NetOrde
     memcpy((char *)sa + offsetof(struct sockaddr_in, sin_addr), &ipv4NetOrder, sizeof(in_addr_t));
 }
 
-// Configura pdp_ip0 con banderas reales de enlace celular punto a punto (IFF_POINTOPOINT sin IFF_BROADCAST)
 static void applySpoofedCellularNode(struct ifaddrs *node) {
     if (!node || s_spoofedCellularAddr == 0) return;
     node->ifa_name = (char *)"pdp_ip0";
-    node->ifa_flags = (node->ifa_flags & ~((unsigned int)IFF_BROADCAST)) | (unsigned int)IFF_POINTOPOINT;
     writeSockaddrInAddrSafely(node->ifa_addr, s_spoofedCellularAddr);
     writeSockaddrInAddrSafely(node->ifa_netmask, htonl(0xFFFFFFFFU));
-    writeSockaddrInAddrSafely(node->ifa_dstaddr, s_spoofedCellularAddr);
+    if (node->ifa_dstaddr && node->ifa_dstaddr->sa_family == AF_INET) {
+        node->ifa_flags = (node->ifa_flags & ~((unsigned int)IFF_BROADCAST)) | (unsigned int)IFF_POINTOPOINT;
+        writeSockaddrInAddrSafely(node->ifa_dstaddr, s_spoofedCellularAddr);
+    }
 }
 
 static void applySpoofedWifiLanNode(struct ifaddrs *node) {
@@ -1983,18 +1812,18 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
 }
 
 static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
-    if (!s_spoofNetwork || !liveContainerProfile) return orig_CNCopyCurrentNetworkInfo(interfaceName);
+    if (!s_spoofNetwork) return orig_CNCopyCurrentNetworkInfo(interfaceName);
     if (s_isCellularMode) return NULL;
     NSDictionary *fakeWifi = @{
-        @"SSID": liveContainerProfile[@"ssid"] ?: @"HomeWiFi-5G",
-        @"BSSID": liveContainerProfile[@"bssid"] ?: @"a4:83:e7:21:9a:10",
-        @"SSIDDATA": [(liveContainerProfile[@"ssid"] ?: @"HomeWiFi-5G") dataUsingEncoding:NSUTF8StringEncoding]
+        @"SSID": s_cachedSSID ?: @"HomeWiFi-5G",
+        @"BSSID": s_cachedBSSID ?: @"a4:83:e7:21:9a:10",
+        @"SSIDDATA": s_cachedSSIDData ?: [NSData data]
     };
     return (__bridge_retained CFDictionaryRef)fakeWifi;
 }
 
 // ============================================================================
-// TELEMETRÍA ORGÁNICA, F_FSID APFS AISLADO Y RELOJ MONOTÓNICO POR CONTENEDOR
+// TELEMETRÍA ORGÁNICA, F_FSID APFS AISLADO Y RELOJ MONOTÓNICO O(1)
 // ============================================================================
 %hook UIDevice
 - (NSString *)name {
@@ -2003,38 +1832,29 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
 }
 - (NSUUID *)identifierForVendor {
     NSUUID *origUUID = %orig;
-    if (origUUID && !origCraneIDFV) {
-        NSString *captured = [[origUUID UUIDString] uppercaseString];
-        if (captured.length >= 32) {
-            origCraneIDFV = captured;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (liveContainerProfile && ![liveContainerProfile[@"craneOriginalIDFV"] isEqualToString:captured]) {
-                    NSDictionary *snap = [liveContainerProfile copy];
-                    liveContainerProfile[@"idfv"] = captured;
-                    liveContainerProfile[@"craneOriginalIDFV"] = captured;
-                    persistCurrentProfileToSandboxIfNeeded(snap);
-                }
-            });
+    if (origUUID) {
+        os_unfair_lock_lock(&s_idfvLock);
+        BOOL needCapture = (origCraneIDFV == nil);
+        if (needCapture) {
+            origCraneIDFV = [[origUUID UUIDString] uppercaseString];
+            s_cachedSpoofedIDFV = origUUID;
         }
+        NSUUID *retUUID = s_spoofIDs ? (s_cachedSpoofedIDFV ?: origUUID) : origUUID;
+        os_unfair_lock_unlock(&s_idfvLock);
+        return retUUID;
     }
     if (s_spoofIDs) {
-        if (origCraneIDFV.length >= 32) {
-            NSUUID *craneUUID = [[NSUUID alloc] initWithUUIDString:origCraneIDFV];
-            if (craneUUID) return craneUUID;
-        }
-        if (liveContainerProfile) {
-            NSString *profUUIDStr = liveContainerProfile[@"idfv"];
-            if ([profUUIDStr isKindOfClass:[NSString class]] && profUUIDStr.length >= 32) {
-                NSUUID *customUUID = [[NSUUID alloc] initWithUUIDString:profUUIDStr];
-                if (customUUID) return customUUID;
-            }
-        }
+        os_unfair_lock_lock(&s_idfvLock);
+        NSUUID *retUUID = s_cachedSpoofedIDFV;
+        os_unfair_lock_unlock(&s_idfvLock);
+        if (retUUID) return retUUID;
     }
     return origUUID;
 }
 - (float)batteryLevel {
-    if (!s_spoofHardware || !liveContainerProfile) return %orig;
-    NSTimeInterval elapsedMinutes = ([[NSDate date] timeIntervalSince1970] - sessionStartTimestamp) / 60.0;
+    if (!s_spoofHardware) return %orig;
+    NSTimeInterval elapsedMinutes = (CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970 - sessionStartTimestamp) / 60.0;
+    if (elapsedMinutes < 0.0) elapsedMinutes = 0.0;
     float drop = (float)((int)(elapsedMinutes / 12.0)) * 0.01f;
     return MAX(0.15f, s_sessionBatteryBase - drop);
 }
@@ -2046,57 +1866,41 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
 
 %hook AVAudioSession
 - (float)outputVolume {
-    if (!s_spoofHardware || !liveContainerProfile) return %orig;
+    if (!s_spoofHardware) return %orig;
     return s_sessionVolume;
 }
 %end
 
-static unsigned long long currentSmoothFreeDiskBytes(void) {
-    unsigned long long baseFree = [liveContainerProfile[@"freeBytes"] unsignedLongLongValue];
-    double elapsed = [[NSDate date] timeIntervalSince1970] - sessionStartTimestamp;
+// Cálculo en C puro sin llamadas Objective-C para seguridad total dentro de statfs()
+static unsigned long long currentSmoothFreeDiskBytesC(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    double elapsed = (double)tv.tv_sec - sessionStartTimestamp;
     if (elapsed < 0.0) elapsed = 0.0;
     unsigned long long consumed = (unsigned long long)(elapsed * 2048.0);
     unsigned long long cap = 16ULL * 1024ULL * 1024ULL;
     if (consumed > cap) consumed = cap;
-    return (baseFree > consumed) ? (baseFree - consumed) : baseFree;
-}
-
-static void applySpoofedStatfsStruct(struct statfs *buf) {
-    if (!buf || !liveContainerProfile) return;
-    if ((s_spoofIDs || s_spoofHardware) && s_spoofedFsid0 != 0) {
-        buf->f_fsid.val[0] = s_spoofedFsid0;
-        buf->f_fsid.val[1] = s_spoofedFsid1;
-    }
-    if (s_spoofHardware && liveContainerProfile[@"freeBytes"] && buf->f_bsize > 0) {
-        unsigned long long finalFree = currentSmoothFreeDiskBytes();
-        uint64_t blocks = finalFree / buf->f_bsize;
-        if (buf->f_blocks > 0) {
-            uint64_t maxBlocks = (buf->f_blocks * 85ULL) / 100ULL;
-            if (blocks > maxBlocks) blocks = maxBlocks;
-        }
-        buf->f_bavail = blocks;
-        buf->f_bfree = blocks;
-    }
+    return (s_cachedFreeBytesBase > consumed) ? (s_cachedFreeBytesBase - consumed) : s_cachedFreeBytesBase;
 }
 
 static int custom_statfs(const char *path, struct statfs *buf) {
-    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
-        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
-            errno = ENOENT;
-            return -1;
-        }
-    }
     int ret = orig_statfs(path, buf);
-    if (ret == 0 && buf && !s_inInternalCall && (s_spoofHardware || s_spoofIDs)) {
-        applySpoofedStatfsStruct(buf);
-    }
-    return ret;
-}
-
-static int custom_fstatfs(int fd, struct statfs *buf) {
-    int ret = orig_fstatfs(fd, buf);
-    if (ret == 0 && buf && !s_inInternalCall && (s_spoofHardware || s_spoofIDs)) {
-        applySpoofedStatfsStruct(buf);
+    if (ret == 0 && buf && !s_inInternalCall && (s_spoofHardware || s_spoofIDs) &&
+        isCallerAppOrSwift(__builtin_return_address(0))) {
+        if (s_spoofedFsid0 != 0) {
+            buf->f_fsid.val[0] = s_spoofedFsid0;
+            buf->f_fsid.val[1] = s_spoofedFsid1;
+        }
+        if (s_spoofHardware && s_cachedFreeBytesBase > 0 && buf->f_bsize > 0) {
+            unsigned long long finalFree = currentSmoothFreeDiskBytesC();
+            uint64_t blocks = finalFree / buf->f_bsize;
+            if (buf->f_blocks > 0) {
+                uint64_t maxBlocks = (buf->f_blocks * 85ULL) / 100ULL;
+                if (blocks > maxBlocks) blocks = maxBlocks;
+            }
+            buf->f_bavail = blocks;
+            buf->f_bfree = blocks;
+        }
     }
     return ret;
 }
@@ -2104,10 +1908,12 @@ static int custom_fstatfs(int fd, struct statfs *buf) {
 %hook NSFileManager
 - (NSDictionary<NSFileAttributeKey, id> *)attributesOfFileSystemForPath:(NSString *)path error:(NSError * _Nullable *)error {
     NSDictionary *orig = %orig;
-    if ((!s_spoofHardware && !s_spoofIDs) || !orig || !liveContainerProfile || s_inInternalCall) return orig;
+    if ((!s_spoofHardware && !s_spoofIDs) || !orig || s_inInternalCall || !isCallerAppOrSwift(__builtin_return_address(0))) {
+        return orig;
+    }
     NSMutableDictionary *modified = [orig mutableCopy];
-    if (s_spoofHardware && liveContainerProfile[@"freeBytes"]) {
-        unsigned long long freeB = currentSmoothFreeDiskBytes();
+    if (s_spoofHardware && s_cachedFreeBytesBase > 0) {
+        unsigned long long freeB = currentSmoothFreeDiskBytesC();
         unsigned long long totalB = [orig[NSFileSystemSize] unsignedLongLongValue];
         if (totalB > 0) {
             unsigned long long maxFreeB = (totalB * 85ULL) / 100ULL;
@@ -2217,17 +2023,14 @@ static int custom_clock_gettime(clockid_t clk_id, struct timespec *tp) {
     return ret;
 }
 
+// Usa s_cachedBootUUIDC en C puro para no tocar diccionarios Objective-C desde hilos C/C++
 static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-    if (ret == 0 && name && oldlenp && liveContainerProfile && !s_inInternalCall) {
-        if (strcmp(name, "kern.bootsessionuuid") == 0 && s_spoofIDs) {
-            NSString *bootUUID = liveContainerProfile[@"bootSessionUUID"];
-            if (bootUUID) {
-                const char *uuidStr = [bootUUID UTF8String];
-                size_t len = strlen(uuidStr) + 1;
-                if (oldp && *oldlenp >= len) memcpy(oldp, uuidStr, len);
-                *oldlenp = len;
-            }
+    if (ret == 0 && name && oldlenp && !s_inInternalCall) {
+        if (strcmp(name, "kern.bootsessionuuid") == 0 && s_spoofIDs && s_cachedBootUUIDC[0] != '\0') {
+            size_t len = strlen(s_cachedBootUUIDC) + 1;
+            if (oldp && *oldlenp >= len) memcpy(oldp, s_cachedBootUUIDC, len);
+            *oldlenp = len;
         } else if (strcmp(name, "kern.boottime") == 0 && (s_spoofIDs || s_spoofHardware) && s_spoofedBootSec > 0) {
             struct timeval tv;
             tv.tv_sec = s_spoofedBootSec;
@@ -2246,7 +2049,6 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     return ret;
 }
 
-// Cubre tanto KERN_BOOTTIME como KERN_HOSTNAME (usado internamente por gethostname() y uname())
 static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     if (ret == 0 && name && namelen == 2 && oldlenp && !s_inInternalCall && name[0] == CTL_KERN) {
@@ -2270,7 +2072,7 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
 
 %hook UIScreen
 - (CGFloat)brightness {
-    if (!s_spoofHardware || !liveContainerProfile) return %orig;
+    if (!s_spoofHardware) return %orig;
     return s_sessionBrightness;
 }
 - (BOOL)isCaptured {
@@ -2284,18 +2086,6 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     MSHookFunction((void *)getenv, (void *)custom_getenv, (void **)&orig_getenv);
     MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
-    // Captura la dirección base real (mach_header) de UIKitCore para coherencia en custom_dladdr
-    if (orig_dladdr) {
-        Dl_info uikitInfo;
-        memset(&uikitInfo, 0, sizeof(uikitInfo));
-        if (orig_dladdr((const void *)UIApplicationMain, &uikitInfo) != 0 && uikitInfo.dli_fbase != NULL) {
-            s_uikitBaseAddr = uikitInfo.dli_fbase;
-            if (uikitInfo.dli_fname != NULL) {
-                s_uikitImagePath = uikitInfo.dli_fname;
-            }
-        }
-    }
-
     ensureProfileLoaded();
 
     MSHookFunction((void *)_dyld_get_image_name, (void *)custom_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
@@ -2308,23 +2098,11 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
 
-    void *symFstatfs = dlsym(RTLD_DEFAULT, "fstatfs");
-    if (symFstatfs) MSHookFunction(symFstatfs, (void *)custom_fstatfs, (void **)&orig_fstatfs);
-
     void *symDlopen = dlsym(RTLD_DEFAULT, "dlopen");
     if (symDlopen) MSHookFunction(symDlopen, (void *)custom_dlopen, (void **)&orig_dlopen);
 
     void *symClockGettime = dlsym(RTLD_DEFAULT, "clock_gettime");
     if (symClockGettime) MSHookFunction(symClockGettime, (void *)custom_clock_gettime, (void **)&orig_clock_gettime);
-
-    void *symCFTimeZoneSys = dlsym(RTLD_DEFAULT, "CFTimeZoneCopySystem");
-    if (symCFTimeZoneSys) MSHookFunction(symCFTimeZoneSys, (void *)custom_CFTimeZoneCopySystem, (void **)&orig_CFTimeZoneCopySystem);
-
-    void *symCFTimeZoneDef = dlsym(RTLD_DEFAULT, "CFTimeZoneCopyDefault");
-    if (symCFTimeZoneDef) MSHookFunction(symCFTimeZoneDef, (void *)custom_CFTimeZoneCopyDefault, (void **)&orig_CFTimeZoneCopyDefault);
-
-    void *symFaccessat = dlsym(RTLD_DEFAULT, "faccessat");
-    if (symFaccessat) MSHookFunction(symFaccessat, (void *)custom_faccessat, (void **)&orig_faccessat);
 
     void *symOpendir = dlsym(RTLD_DEFAULT, "opendir");
     if (symOpendir) MSHookFunction(symOpendir, (void *)custom_opendir, (void **)&orig_opendir);
@@ -2341,23 +2119,11 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     void *symConnect = dlsym(RTLD_DEFAULT, "connect");
     if (symConnect) MSHookFunction(symConnect, (void *)custom_connect, (void **)&orig_connect);
 
-    void *symConnectx = dlsym(RTLD_DEFAULT, "connectx");
-    if (symConnectx) MSHookFunction(symConnectx, (void *)custom_connectx, (void **)&orig_connectx);
-
     void *symSendto = dlsym(RTLD_DEFAULT, "sendto");
     if (symSendto) MSHookFunction(symSendto, (void *)custom_sendto, (void **)&orig_sendto);
 
     void *symSendmsg = dlsym(RTLD_DEFAULT, "sendmsg");
     if (symSendmsg) MSHookFunction(symSendmsg, (void *)custom_sendmsg, (void **)&orig_sendmsg);
-
-    void *symProxySettings = dlsym(RTLD_DEFAULT, "CFNetworkCopySystemProxySettings");
-    if (symProxySettings) {
-        MSHookFunction(symProxySettings, (void *)custom_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings);
-    }
-    void *symProxiesForURL = dlsym(RTLD_DEFAULT, "CFNetworkCopyProxiesForURL");
-    if (symProxiesForURL) {
-        MSHookFunction(symProxiesForURL, (void *)custom_CFNetworkCopyProxiesForURL, (void **)&orig_CFNetworkCopyProxiesForURL);
-    }
 
     %init;
 
