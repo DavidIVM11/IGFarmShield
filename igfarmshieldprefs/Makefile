@@ -11,7 +11,6 @@ IGFarmShieldPrefs_FILES = IGFarmRootListController.m
 IGFarmShieldPrefs_FRAMEWORKS = UIKit Foundation CoreFoundation CoreGraphics QuartzCore AVFoundation SystemConfiguration
 IGFarmShieldPrefs_INSTALL_PATH = /Library/PreferenceBundles
 IGFarmShieldPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-error
-IGFarmShieldPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/bundle.mk
 
