@@ -69,18 +69,13 @@ static NSTimeInterval sessionStartTimestamp = 0;
 static NSTimeInterval s_launchSystemUptime = 0;
 static double s_baseAwakeUptimeSec = 3600.0;
 static BOOL bannerShownThisSession = NO;
-static BOOL s_proxyCoherenceChecked = NO;
-static BOOL s_proxyCheckInFlight = NO;
-static int s_proxyCheckAttempts = 0;
-static BOOL s_proxyMismatchDetected = NO;
-static NSString *s_proxyMismatchSummary = nil;
 static _UIStatusBarLocalOverlayWindow *persistentBadgeWindow = nil;
 static UILabel *persistentBadgePill = nil;
 static dispatch_source_t s_tunnelWatchdogTimer = nil;
 static int s_lastRenderedBadgeState = -1;
 
-// Estado inmutable en RAM/C para acceso O(1) multihilo sin bloqueos
-static volatile BOOL s_profileInitialized = NO;
+// Estado inmutable en RAM/C sincronizado con barreras atomicas ARM64
+static BOOL s_profileInitialized = NO;
 static BOOL s_shieldActive = NO;
 static BOOL s_spoofIDs = NO;
 static BOOL s_spoofNetwork = NO;
@@ -124,7 +119,7 @@ static os_unfair_lock s_idfvLock = OS_UNFAIR_LOCK_INIT;
 static BOOL s_cachedTunnelUp = NO;
 static CFAbsoluteTime s_lastTunnelCheck = 0;
 
-// Unicamente hooks de funciones C completas en espacio de usuario (sin tocar stubs de libsystem_kernel)
+// Unicamente hooks de funciones C completas en espacio de usuario (con validacion de punteros)
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
@@ -132,8 +127,12 @@ static Boolean (*orig_SCNetworkReachabilityGetFlags)(SCNetworkReachabilityRef, S
 
 static void ensureProfileLoaded(void);
 
+static inline BOOL isProfileReadyAcquire(void) {
+    return __atomic_load_n(&s_profileInitialized, __ATOMIC_ACQUIRE);
+}
+
 static inline void ensureProfileReadyInline(void) {
-    if (__builtin_expect(!s_profileInitialized, 0) && !s_inInternalCall) {
+    if (__builtin_expect(!isProfileReadyAcquire(), 0) && !s_inInternalCall) {
         ensureProfileLoaded();
     }
 }
@@ -204,7 +203,7 @@ static BOOL isSecondaryWifiInterfaceNameC(const char *ifName) {
 static BOOL hasActiveUtunTunnelLive(void) {
     struct ifaddrs *interfaces = NULL;
     int (*fn)(struct ifaddrs **) = orig_getifaddrs ? orig_getifaddrs : getifaddrs;
-    if (fn(&interfaces) != 0 || !interfaces) return NO;
+    if (!fn || fn(&interfaces) != 0 || !interfaces) return NO;
     BOOL found = NO;
     for (struct ifaddrs *cur = interfaces; cur != NULL; cur = cur->ifa_next) {
         if (cur->ifa_name && (cur->ifa_flags & IFF_UP) && isTunnelInterfaceNameC(cur->ifa_name)) {
@@ -421,9 +420,9 @@ static NSTimeInterval spoofedSystemUptime(void) {
 }
 
 static void ensureProfileLoaded(void) {
-    if (s_profileInitialized || s_inInternalCall) return;
+    if (isProfileReadyAcquire() || s_inInternalCall) return;
     os_unfair_lock_lock(&s_profileInitLock);
-    if (s_profileInitialized) {
+    if (isProfileReadyAcquire()) {
         os_unfair_lock_unlock(&s_profileInitLock);
         return;
     }
@@ -734,13 +733,13 @@ static void ensureProfileLoaded(void) {
         }
     }
 
-    s_profileInitialized = YES;
+    __atomic_store_n(&s_profileInitialized, YES, __ATOMIC_RELEASE);
     s_inInternalCall = NO;
     os_unfair_lock_unlock(&s_profileInitLock);
 }
 
 // ============================================================================
-// CAPSULA SUPERIOR CON MONITOR DE TUNEL Y DETECTOR DE DESFASE DE PROXY
+// CAPSULA SUPERIOR CON MONITOR LOCAL DE TUNEL (SIN PETICIONES EXTERNAS)
 // ============================================================================
 static void refreshBadgePillStateOnMain(void) {
     if (!persistentBadgePill) return;
@@ -748,8 +747,6 @@ static void refreshBadgePillStateOnMain(void) {
     int desiredState = 0;
     if (s_shieldActive && s_spoofNetwork && !tunnelUp) {
         desiredState = 2;
-    } else if (s_shieldActive && s_proxyMismatchDetected) {
-        desiredState = 3;
     } else if (s_shieldActive) {
         desiredState = 1;
     } else {
@@ -765,9 +762,6 @@ static void refreshBadgePillStateOnMain(void) {
     if (desiredState == 2) {
         persistentBadgePill.backgroundColor = [UIColor colorWithRed:0.80 green:0.12 blue:0.12 alpha:0.96];
         persistentBadgePill.text = [NSString stringWithFormat:@" ⛔ %@ (SIN TUNEL) ", cName];
-    } else if (desiredState == 3) {
-        persistentBadgePill.backgroundColor = [UIColor colorWithRed:0.86 green:0.45 blue:0.04 alpha:0.96];
-        persistentBadgePill.text = [NSString stringWithFormat:@" ⚠️ %@ (ZONA/PROXY) ", cName];
     } else if (desiredState == 1) {
         persistentBadgePill.backgroundColor = [UIColor colorWithRed:0.04 green:0.52 blue:0.24 alpha:0.94];
         persistentBadgePill.text = [NSString stringWithFormat:@" 🛡️ %@ ", cName];
@@ -781,92 +775,6 @@ static void refreshBadgePillStateOnMain(void) {
     persistentBadgePill.frame = CGRectMake((screenBounds.size.width - pillW) / 2.0, 18.0, pillW, 16.0);
 }
 
-static void verifyLiveProxyCoherenceOnStartup(void) {
-    if (s_proxyCoherenceChecked || s_proxyCheckInFlight || s_proxyCheckAttempts >= 2) return;
-    if (!s_shieldActive || !s_spoofNetwork || !liveContainerProfile) return;
-    if (!hasActiveUtunTunnelCached()) return;
-
-    NSURL *url = [NSURL URLWithString:@"https://ipwho.is/"];
-    if (!url) return;
-
-    s_proxyCheckInFlight = YES;
-    s_proxyCheckAttempts++;
-
-    s_inInternalCall = YES;
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    cfg.URLCache = nil;
-    cfg.HTTPCookieStorage = nil;
-    cfg.timeoutIntervalForRequest = 7.0;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-    s_inInternalCall = NO;
-
-    [[session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        [session finishTasksAndInvalidate];
-
-        if (!data || err) {
-            dispatch_async(dispatch_get_main_queue(), ^{ s_proxyCheckInFlight = NO; });
-            return;
-        }
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (![json isKindOfClass:[NSDictionary class]] || ![json[@"success"] boolValue]) {
-            dispatch_async(dispatch_get_main_queue(), ^{ s_proxyCheckInFlight = NO; });
-            return;
-        }
-
-        NSString *liveIP = [json[@"ip"] isKindOfClass:[NSString class]] ? json[@"ip"] : nil;
-        NSString *liveCC = [json[@"country_code"] isKindOfClass:[NSString class]] ? [json[@"country_code"] lowercaseString] : nil;
-        NSDictionary *tzDict = [json[@"timezone"] isKindOfClass:[NSDictionary class]] ? json[@"timezone"] : @{};
-        NSString *liveTZ = [tzDict[@"id"] isKindOfClass:[NSString class]] ? tzDict[@"id"] : nil;
-
-        if (!liveIP || !liveTZ || liveTZ.length == 0) {
-            dispatch_async(dispatch_get_main_queue(), ^{ s_proxyCheckInFlight = NO; });
-            return;
-        }
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            s_proxyCheckInFlight = NO;
-            s_proxyCoherenceChecked = YES;
-            if (!liveContainerProfile) return;
-            BOOL anchored = [liveContainerProfile[@"locationAnchored"] boolValue];
-            if (!anchored) return;
-
-            NSString *savedTZ = liveContainerProfile[@"timeZone"] ?: @"";
-            NSString *savedISO = [liveContainerProfile[@"CarrierISO"] ?: @"us" lowercaseString];
-            BOOL tzDiffers = (savedTZ.length > 0 && ![savedTZ isEqualToString:liveTZ]);
-            BOOL ccDiffers = (liveCC.length > 0 && savedISO.length > 0 && ![savedISO isEqualToString:liveCC]);
-
-            if (tzDiffers || ccDiffers) {
-                s_proxyMismatchDetected = YES;
-                s_proxyMismatchSummary = [NSString stringWithFormat:@"Proxy: %@ (%@) != Perfil: %@", liveIP, liveTZ, savedTZ];
-                s_lastRenderedBadgeState = -1;
-                refreshBadgePillStateOnMain();
-                if (persistentBadgeWindow && persistentBadgeWindow.rootViewController) {
-                    CGRect screenBounds = [UIScreen mainScreen].bounds;
-                    persistentBadgeWindow.frame = CGRectMake(0, 0, screenBounds.size.width, 92);
-                    UILabel *warnToast = [[UILabel alloc] initWithFrame:CGRectMake(16, 40, screenBounds.size.width - 32, 42)];
-                    warnToast.layer.cornerRadius = 10.0;
-                    warnToast.clipsToBounds = YES;
-                    warnToast.textAlignment = NSTextAlignmentCenter;
-                    warnToast.font = [UIFont boldSystemFontOfSize:11.0];
-                    warnToast.numberOfLines = 2;
-                    warnToast.textColor = [UIColor whiteColor];
-                    warnToast.backgroundColor = [UIColor colorWithRed:0.86 green:0.45 blue:0.04 alpha:0.96];
-                    warnToast.text = [NSString stringWithFormat:@"⚠️ Zona del Proxy Cambio en %@\n%@",
-                                      s_cachedContainerName ?: @"Contenedor", s_proxyMismatchSummary];
-                    [persistentBadgeWindow.rootViewController.view addSubview:warnToast];
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        [UIView animateWithDuration:0.35 animations:^{ warnToast.alpha = 0.0; } completion:^(BOOL f) {
-                            [warnToast removeFromSuperview];
-                            persistentBadgeWindow.frame = CGRectMake(0, 0, screenBounds.size.width, 40);
-                        }];
-                    });
-                }
-            }
-        });
-    }] resume];
-}
-
 static void startTunnelWatchdogTimer(void) {
     if (s_tunnelWatchdogTimer != nil || !s_shieldActive || !s_spoofNetwork) return;
     s_tunnelWatchdogTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -878,9 +786,6 @@ static void startTunnelWatchdogTimer(void) {
     dispatch_source_set_event_handler(s_tunnelWatchdogTimer, ^{
         if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
             refreshBadgePillStateOnMain();
-            if (!s_proxyCoherenceChecked && !s_proxyCheckInFlight && s_proxyCheckAttempts < 2 && hasActiveUtunTunnelCached()) {
-                verifyLiveProxyCoherenceOnStartup();
-            }
         }
     });
     dispatch_resume(s_tunnelWatchdogTimer);
@@ -1028,10 +933,6 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
             }
         }];
     });
-
-    if (s_shieldActive && s_spoofNetwork && tunnelUp) {
-        verifyLiveProxyCoherenceOnStartup();
-    }
 }
 
 // ============================================================================
@@ -1213,7 +1114,8 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
 // COHERENCIA DE RED, KILL-SWITCH EN SESION, CARRIER SINTETICO Y GETIFADDRS
 // ============================================================================
 static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
-    Boolean ok = orig_SCNetworkReachabilityGetFlags ? orig_SCNetworkReachabilityGetFlags(target, flags) : FALSE;
+    if (!orig_SCNetworkReachabilityGetFlags) return FALSE;
+    Boolean ok = orig_SCNetworkReachabilityGetFlags(target, flags);
     if (!ok || !flags || s_inInternalCall) return ok;
     ensureProfileReadyInline();
     if (!s_spoofNetwork) return ok;
@@ -1360,6 +1262,7 @@ static void applySpoofedWifiLanNode(struct ifaddrs *node) {
 }
 
 static int custom_getifaddrs(struct ifaddrs **ifap) {
+    if (!orig_getifaddrs) return -1;
     int res = orig_getifaddrs(ifap);
     if (res != 0 || !ifap || !*ifap || s_inInternalCall) return res;
     ensureProfileReadyInline();
@@ -1379,7 +1282,7 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     }
 
     struct ifaddrs *head = *ifap;
-    if (head->ifa_name) {
+    if (head && head->ifa_name) {
         if (isTunnelInterfaceNameC(head->ifa_name)) {
             head->ifa_name = (char *)"lo0";
             head->ifa_flags &= ~IFF_POINTOPOINT;
@@ -1397,7 +1300,7 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
     }
 
     struct ifaddrs *prev = head;
-    struct ifaddrs *curr = head->ifa_next;
+    struct ifaddrs *curr = head ? head->ifa_next : NULL;
 
     while (curr != NULL) {
         BOOL shouldHide = NO;
@@ -1447,6 +1350,7 @@ static int custom_getifaddrs(struct ifaddrs **ifap) {
 }
 
 static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName) {
+    if (!orig_CNCopyCurrentNetworkInfo) return NULL;
     if (s_inInternalCall) return orig_CNCopyCurrentNetworkInfo(interfaceName);
     ensureProfileReadyInline();
     if (!s_spoofNetwork) return orig_CNCopyCurrentNetworkInfo(interfaceName);
@@ -1629,6 +1533,7 @@ static unsigned long long currentSmoothFreeDiskBytesC(void) {
 %end
 
 static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    if (!orig_sysctlbyname) return -1;
     int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
     if (ret == 0 && name && oldlenp && !s_inInternalCall) {
         ensureProfileReadyInline();
@@ -1668,7 +1573,7 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
 %end
 
 %ctor {
-    // 1. Instalar unicamente hooks de librerias C de usuario (sin tocar stubs de libsystem_kernel)
+    // 1. Instalar unicamente hooks de librerias C de usuario (con validacion de punteros orig_*)
     void *symGetifaddrs = dlsym(RTLD_DEFAULT, "getifaddrs");
     if (symGetifaddrs) MSHookFunction(symGetifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
@@ -1681,7 +1586,7 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     void *symReachFlags = dlsym(RTLD_DEFAULT, "SCNetworkReachabilityGetFlags");
     if (symReachFlags) MSHookFunction(symReachFlags, (void *)custom_SCNetworkReachabilityGetFlags, (void **)&orig_SCNetworkReachabilityGetFlags);
 
-    // 2. Activar hooks de Objective-C (ensureProfileReadyInline carga el perfil tras montar Crane)
+    // 2. Activar hooks de Objective-C (ensureProfileReadyInline inicializa tras Crane con barrera atomica)
     %init;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
