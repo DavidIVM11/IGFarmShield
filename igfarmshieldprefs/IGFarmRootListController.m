@@ -1181,10 +1181,15 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
         }
     }
 
-    if (profile && [disk isKindOfClass:[NSDictionary class]]) {
+if (profile && [disk isKindOfClass:[NSDictionary class]]) {
         for (NSString *runtimeKey in @[@"cellularLocalIP", @"spoofedBootEpoch", @"spoofedBootUsec", @"lastBootUUIDForTime", @"idfv", @"craneOriginalIDFV"]) {
             if ((!profile[runtimeKey] || ([profile[runtimeKey] isKindOfClass:[NSString class]] && [profile[runtimeKey] length] == 0)) && disk[runtimeKey]) {
                 profile[runtimeKey] = disk[runtimeKey];
+            }
+        }
+        if ([disk[@"locationAnchored"] boolValue] && (![profile[@"locationAnchored"] boolValue] || [profile[@"lastSyncedIP"] hasPrefix:@"Sin "])) {
+            for (NSString *locKey in @[@"locationAnchored", @"lastSyncedIP", @"ispName", @"cityCountry", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO"]) {
+                if (disk[locKey] != nil) profile[locKey] = disk[locKey];
             }
         }
     }
@@ -1660,9 +1665,6 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     killAppProcess(@"Instagram");
     killAppProcess(@"Reddit");
 
-    unsigned long long freedBytes = 0;
-    NSUInteger removedCount = 0;
-
     NSUInteger pbItemsBefore = 0;
     unsigned long long pbBytesBefore = 0;
     inspectPasteboardUsage(&pbItemsBefore, &pbBytesBefore);
@@ -1675,25 +1677,36 @@ static void fetchLiveIPFromEndpoints(NSArray<NSString *> *urls, NSUInteger index
     NSArray<NSString *> *pathsToClean = collectAllPhysicalContainerPaths(self.igContainersList, self.redditContainersList, hiddenIDs);
     NSArray<NSString *> *trackedSubs = residualSubdirectoriesToTrack();
 
-    for (NSString *cPath in pathsToClean) {
-        for (NSString *sub in trackedSubs) {
-            purgeDirectoryCacheContents([cPath stringByAppendingPathComponent:sub], &freedBytes, &removedCount);
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        unsigned long long freedBytes = 0;
+        NSUInteger removedCount = 0;
+
+        for (NSString *cPath in pathsToClean) {
+            for (NSString *sub in trackedSubs) {
+                purgeDirectoryCacheContents([cPath stringByAppendingPathComponent:sub], &freedBytes, &removedCount);
+            }
         }
-    }
 
-    double freedMB = (double)freedBytes / (1024.0 * 1024.0);
-    double pbFreedKB = (double)pbBytesBefore / 1024.0;
-    [self calculateResidualTraces];
-    [self.tableView reloadData];
+        double freedMB = (double)freedBytes / (1024.0 * 1024.0);
+        double pbFreedKB = (double)pbBytesBefore / 1024.0;
 
-    if (showPopup) {
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Limpieza Completada"
-                                                                    message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados.\n• %lu archivos temporales eliminados (%.2f MB liberados).\n• Portapapeles vaciado (%lu ítem(s), %.1f KB).\n• Tus sesiones iniciadas se mantuvieron intactas.",
-                                                                             (unsigned long)removedCount, freedMB, (unsigned long)pbItemsBefore, pbFreedKB]
-                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Listo" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:ac animated:YES completion:nil];
-    }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf calculateResidualTraces];
+            [strongSelf.tableView reloadData];
+
+            if (showPopup) {
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🧹 Limpieza Completada"
+                                                                            message:[NSString stringWithFormat:@"• Instagram y Reddit cerrados.\n• %lu archivos temporales eliminados (%.2f MB liberados).\n• Portapapeles vaciado (%lu ítem(s), %.1f KB).\n• Tus sesiones iniciadas se mantuvieron intactas.",
+                                                                                     (unsigned long)removedCount, freedMB, (unsigned long)pbItemsBefore, pbFreedKB]
+                                                                     preferredStyle:UIAlertControllerStyleAlert];
+                [ac addAction:[UIAlertAction actionWithTitle:@"Listo" style:UIAlertActionStyleDefault handler:nil]];
+                [strongSelf presentViewController:ac animated:YES completion:nil];
+            }
+        });
+    });
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
