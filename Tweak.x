@@ -600,7 +600,7 @@ static void ensureProfileLoaded(void) {
         }
     }
 
-    NSMutableDictionary *profile = nil;
+NSMutableDictionary *profile = nil;
     if ([diskLoaded isKindOfClass:[NSDictionary class]] && diskLoaded[@"bootSessionUUID"]) {
         profile = [diskLoaded mutableCopy];
     }
@@ -608,8 +608,16 @@ static void ensureProfileLoaded(void) {
         if (!profile) {
             profile = [settingsEntry mutableCopy];
         } else {
-            for (NSString *k in @[@"enabled", @"masterEnabled", @"appEnabled", @"effectiveShieldActive", @"containerName", @"craneIdentifier", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP", @"localIP", @"cellularLocalIP", @"ssid", @"bssid", @"bootSessionUUID", @"spoofedBootEpoch", @"spoofedBootUsec", @"lastBootUUIDForTime", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"pasteboardCount"]) {
+            // Sincroniza interruptores y metadatos desde Ajustes sin borrar el anclaje de IP/Zona ya capturado en el sandbox
+            for (NSString *k in @[@"enabled", @"masterEnabled", @"appEnabled", @"effectiveShieldActive", @"containerName", @"craneIdentifier", @"spoofIDs", @"spoofNetwork", @"spoofLocation", @"spoofHardware", @"spoofSecurity", @"localIP", @"cellularLocalIP", @"ssid", @"bssid", @"bootSessionUUID", @"spoofedBootEpoch", @"spoofedBootUsec", @"lastBootUUIDForTime", @"freeBytes", @"batteryLevel", @"audioVolume", @"brightness", @"pasteboardCount"]) {
                 if (settingsEntry[k] != nil) profile[k] = settingsEntry[k];
+            }
+            BOOL settingsAnchored = [settingsEntry[@"locationAnchored"] boolValue];
+            BOOL diskAnchored = [profile[@"locationAnchored"] boolValue];
+            if (settingsAnchored || !diskAnchored) {
+                for (NSString * locKey in @[@"locationAnchored", @"timeZone", @"localeID", @"CarrierMode", @"CarrierName", @"CarrierMCC", @"CarrierMNC", @"CarrierISO", @"ispName", @"cityCountry", @"lastSyncedIP"]) {
+                    if (settingsEntry[locKey] != nil) profile[locKey] = settingsEntry[locKey];
+                }
             }
         }
     }
@@ -2072,6 +2080,12 @@ static void applySpoofedStatfsStruct(struct statfs *buf) {
 }
 
 static int custom_statfs(const char *path, struct statfs *buf) {
+    if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
+        if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
+            errno = ENOENT;
+            return -1;
+        }
+    }
     int ret = orig_statfs(path, buf);
     if (ret == 0 && buf && !s_inInternalCall && (s_spoofHardware || s_spoofIDs)) {
         applySpoofedStatfsStruct(buf);
