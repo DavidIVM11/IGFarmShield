@@ -151,6 +151,7 @@ static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) 
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
 static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
 static int (*orig_statfs)(const char *, struct statfs *) = NULL;
+static int (*orig_fstatfs)(int, struct statfs *) = NULL;
 static int (*orig_access)(const char *, int) = NULL;
 static int (*orig_stat)(const char *, struct stat *) = NULL;
 static int (*orig_lstat)(const char *, struct stat *) = NULL;
@@ -161,6 +162,7 @@ static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
 static int (*orig_bind)(int, const struct sockaddr *, socklen_t) = NULL;
 static int (*orig_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
 static int (*orig_connect)(int, const struct sockaddr *, socklen_t) = NULL;
+static int (*orig_connectx)(int, const sa_endpoints_t *, sae_associd_t, unsigned int, const struct iovec *, unsigned int, size_t *, sae_connid_t *) = NULL;
 static ssize_t (*orig_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t) = NULL;
 static ssize_t (*orig_sendmsg)(int, const struct msghdr *, int) = NULL;
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
@@ -211,7 +213,7 @@ static NSString *deterministicUUIDStringFromSalt(NSString *salt) {
     return [NSString stringWithFormat:@"%08X-%04X-%04X-%04X-%012llX", d1, d2, d3, d4, d5];
 }
 
-// Inicializa s_cachedTimeZoneObj sin llamar a setenv("TZ") para no corromper environ en hilos concurrentes
+// Sincroniza NSTimeZone y CFTimeZoneSetDefault sin tocar setenv("TZ") para evitar crashes multihilo
 static void prepareCachedTimeZoneAtLaunch(NSString *tzName) {
     if (!tzName || [tzName hasPrefix:@"Sincronizando"] || [tzName hasPrefix:@"Sin "] || tzName.length == 0) return;
     BOOL prev = s_inInternalCall;
@@ -219,6 +221,9 @@ static void prepareCachedTimeZoneAtLaunch(NSString *tzName) {
     NSTimeZone *tzObj = [NSTimeZone timeZoneWithName:tzName];
     if (tzObj) {
         s_cachedTimeZoneObj = tzObj;
+        if (s_spoofLocation) {
+            [NSTimeZone setDefaultTimeZone:tzObj];
+        }
     }
     s_inInternalCall = prev;
 }
@@ -1220,7 +1225,6 @@ static void *custom_dlopen(const char *path, int mode) {
     return orig_dlopen(path, mode);
 }
 
-// Compara el nombre de la variable en O(1) antes de llamar a dladdr para no saturar el arranque
 static char *custom_getenv(const char *name) {
     if (s_spoofSecurity && !s_inInternalCall && name) {
         if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0 ||
@@ -1236,7 +1240,6 @@ static char *custom_getenv(const char *name) {
     return orig_getenv(name);
 }
 
-// Usa rutas de frameworks secundarios que fishhook nunca re-enlaza y sin llamar a dladdr dentro del lock de dyld
 static const char *custom_dyld_get_image_name(uint32_t image_index) {
     const char *name = orig_dyld_get_image_name(image_index);
     if (s_spoofSecurity && !s_inInternalCall && name && isHiddenPathForTargetAppC(name)) {
@@ -1255,7 +1258,6 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
     return name;
 }
 
-// Preserva dli_fbase intacto para no romper la resta (addr - dli_fbase) en Proxygen/Crashlytics
 static int custom_dladdr(const void *addr, Dl_info *info) {
     int ret = orig_dladdr(addr, info);
     if (s_spoofSecurity && ret != 0 && info && info->dli_fname && isHiddenPathForTargetAppC(info->dli_fname)) {
@@ -1468,7 +1470,7 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
             return 0;
         }
 
-        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0,0xff,0xff};
         if (memcmp(sin6.sin6_addr.s6_addr, v4mapPrefix, 12) == 0) {
             uint32_t mappedIPv4 = 0;
             memcpy(&mappedIPv4, &sin6.sin6_addr.s6_addr[12], 4);
@@ -1549,6 +1551,58 @@ static int custom_connect(int sockfd, const struct sockaddr *addr, socklen_t add
     return orig_connect(sockfd, targetAddr, targetLen);
 }
 
+static int custom_connectx(int sockfd, const sa_endpoints_t *endpoints, sae_associd_t associd, unsigned int flags, const struct iovec *iov, unsigned int iovcnt, size_t *len, sae_connid_t *connid) {
+    if (endpoints && s_spoofNetwork && !s_inInternalCall) {
+        sa_endpoints_t modifiedEndpoints = *endpoints;
+        BOOL endpointsModified = NO;
+
+        if (modifiedEndpoints.sae_srcif > 0) {
+            char ifName[IF_NAMESIZE] = {0};
+            if (if_indextoname(modifiedEndpoints.sae_srcif, ifName) != NULL) {
+                if (strcmp(ifName, "lo0") != 0 && !isTunnelInterfaceNameC(ifName)) {
+                    modifiedEndpoints.sae_srcif = 0;
+                    endpointsModified = YES;
+                }
+            }
+        }
+
+        if (modifiedEndpoints.sae_srcaddr &&
+            modifiedEndpoints.sae_srcaddr->sa_family == AF_INET &&
+            modifiedEndpoints.sae_srcaddrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+            struct sockaddr_in srcSin;
+            memcpy(&srcSin, modifiedEndpoints.sae_srcaddr, sizeof(srcSin));
+            if ((s_spoofedCellularAddr != 0 && srcSin.sin_addr.s_addr == s_spoofedCellularAddr) ||
+                (s_spoofedLanAddr != 0 && srcSin.sin_addr.s_addr == s_spoofedLanAddr)) {
+                modifiedEndpoints.sae_srcaddr = NULL;
+                modifiedEndpoints.sae_srcaddrlen = 0;
+                endpointsModified = YES;
+            }
+        }
+
+        struct sockaddr_storage redirectedStorage;
+        socklen_t redirectedLen = 0;
+        if (modifiedEndpoints.sae_dstaddr &&
+            modifiedEndpoints.sae_dstaddrlen >= (socklen_t)sizeof(struct sockaddr)) {
+            if (rewriteRFC1918DnsDestinationIfNeeded(modifiedEndpoints.sae_dstaddr, modifiedEndpoints.sae_dstaddrlen, &redirectedStorage, &redirectedLen)) {
+                modifiedEndpoints.sae_dstaddr = (const struct sockaddr *)&redirectedStorage;
+                modifiedEndpoints.sae_dstaddrlen = redirectedLen;
+                endpointsModified = YES;
+            }
+
+            int blockErr = evaluateSocketPolicy(sockfd, modifiedEndpoints.sae_dstaddr, modifiedEndpoints.sae_dstaddrlen);
+            if (blockErr != 0) {
+                errno = blockErr;
+                return -1;
+            }
+        }
+
+        if (endpointsModified) {
+            return orig_connectx(sockfd, &modifiedEndpoints, associd, flags, iov, iovcnt, len, connid);
+        }
+    }
+    return orig_connectx(sockfd, endpoints, associd, flags, iov, iovcnt, len, connid);
+}
+
 static ssize_t custom_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
     if (dest_addr) {
         struct sockaddr_storage redirectedStorage;
@@ -1601,8 +1655,7 @@ static ssize_t custom_sendmsg(int sockfd, const struct msghdr *msg, int flags) {
 // ============================================================================
 static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
     Boolean ok = orig_SCNetworkReachabilityGetFlags ? orig_SCNetworkReachabilityGetFlags(target, flags) : FALSE;
-    if (!ok || !flags || !s_spoofNetwork) return ok;
-    if (!isCallerAppOrSwift(__builtin_return_address(0))) return ok;
+    if (!ok || !flags || !s_spoofNetwork || s_inInternalCall) return ok;
 
     if (!hasActiveUtunTunnelCached()) {
         *flags = 0;
@@ -1882,6 +1935,24 @@ static unsigned long long currentSmoothFreeDiskBytesC(void) {
     return (s_cachedFreeBytesBase > consumed) ? (s_cachedFreeBytesBase - consumed) : s_cachedFreeBytesBase;
 }
 
+static void applySpoofedStatfsStruct(struct statfs *buf) {
+    if (!buf) return;
+    if (s_spoofedFsid0 != 0) {
+        buf->f_fsid.val[0] = s_spoofedFsid0;
+        buf->f_fsid.val[1] = s_spoofedFsid1;
+    }
+    if (s_spoofHardware && s_cachedFreeBytesBase > 0 && buf->f_bsize > 0) {
+        unsigned long long finalFree = currentSmoothFreeDiskBytesC();
+        uint64_t blocks = finalFree / buf->f_bsize;
+        if (buf->f_blocks > 0) {
+            uint64_t maxBlocks = (buf->f_blocks * 85ULL) / 100ULL;
+            if (blocks > maxBlocks) blocks = maxBlocks;
+        }
+        buf->f_bavail = blocks;
+        buf->f_bfree = blocks;
+    }
+}
+
 static int custom_statfs(const char *path, struct statfs *buf) {
     if (s_spoofSecurity && path && isHiddenPathForTargetAppC(path)) {
         if (!isCallerExemptInfrastructure(__builtin_return_address(0))) {
@@ -1890,22 +1961,16 @@ static int custom_statfs(const char *path, struct statfs *buf) {
         }
     }
     int ret = orig_statfs(path, buf);
-    if (ret == 0 && buf && !s_inInternalCall && (s_spoofHardware || s_spoofIDs) &&
-        isCallerAppOrSwift(__builtin_return_address(0))) {
-        if (s_spoofedFsid0 != 0) {
-            buf->f_fsid.val[0] = s_spoofedFsid0;
-            buf->f_fsid.val[1] = s_spoofedFsid1;
-        }
-        if (s_spoofHardware && s_cachedFreeBytesBase > 0 && buf->f_bsize > 0) {
-            unsigned long long finalFree = currentSmoothFreeDiskBytesC();
-            uint64_t blocks = finalFree / buf->f_bsize;
-            if (buf->f_blocks > 0) {
-                uint64_t maxBlocks = (buf->f_blocks * 85ULL) / 100ULL;
-                if (blocks > maxBlocks) blocks = maxBlocks;
-            }
-            buf->f_bavail = blocks;
-            buf->f_bfree = blocks;
-        }
+    if (ret == 0 && buf && !s_inInternalCall && (s_spoofHardware || s_spoofIDs)) {
+        applySpoofedStatfsStruct(buf);
+    }
+    return ret;
+}
+
+static int custom_fstatfs(int fd, struct statfs *buf) {
+    int ret = orig_fstatfs(fd, buf);
+    if (ret == 0 && buf && !s_inInternalCall && (s_spoofHardware || s_spoofIDs)) {
+        applySpoofedStatfsStruct(buf);
     }
     return ret;
 }
@@ -1913,7 +1978,7 @@ static int custom_statfs(const char *path, struct statfs *buf) {
 %hook NSFileManager
 - (NSDictionary<NSFileAttributeKey, id> *)attributesOfFileSystemForPath:(NSString *)path error:(NSError * _Nullable *)error {
     NSDictionary *orig = %orig;
-    if ((!s_spoofHardware && !s_spoofIDs) || !orig || s_inInternalCall || !isCallerAppOrSwift(__builtin_return_address(0))) {
+    if ((!s_spoofHardware && !s_spoofIDs) || !orig || s_inInternalCall) {
         return orig;
     }
     NSMutableDictionary *modified = [orig mutableCopy];
@@ -2102,6 +2167,9 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
     MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
     MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
 
+    void *symFstatfs = dlsym(RTLD_DEFAULT, "fstatfs");
+    if (symFstatfs) MSHookFunction(symFstatfs, (void *)custom_fstatfs, (void **)&orig_fstatfs);
+
     void *symDlopen = dlsym(RTLD_DEFAULT, "dlopen");
     if (symDlopen) MSHookFunction(symDlopen, (void *)custom_dlopen, (void **)&orig_dlopen);
 
@@ -2122,6 +2190,9 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
 
     void *symConnect = dlsym(RTLD_DEFAULT, "connect");
     if (symConnect) MSHookFunction(symConnect, (void *)custom_connect, (void **)&orig_connect);
+
+    void *symConnectx = dlsym(RTLD_DEFAULT, "connectx");
+    if (symConnectx) MSHookFunction(symConnectx, (void *)custom_connectx, (void **)&orig_connectx);
 
     void *symSendto = dlsym(RTLD_DEFAULT, "sendto");
     if (symSendto) MSHookFunction(symSendto, (void *)custom_sendto, (void **)&orig_sendto);
