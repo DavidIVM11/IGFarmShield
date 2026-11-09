@@ -16,11 +16,8 @@
 #import <ifaddrs.h>
 #import <net/if.h>
 #import <sys/sysctl.h>
-#import <sys/mount.h>
-#import <sys/stat.h>
 #import <os/lock.h>
 #import <dlfcn.h>
-#import <errno.h>
 #import <stddef.h>
 #import <string.h>
 #import <strings.h>
@@ -37,18 +34,6 @@ void MSHookFunction(void *symbol, void *replace, void **result);
 #ifdef __cplusplus
 }
 #endif
-#endif
-
-#ifndef IP_BOUND_IF
-#define IP_BOUND_IF 25
-#endif
-
-#ifndef IPV6_BOUND_IF
-#define IPV6_BOUND_IF 125
-#endif
-
-#ifndef CLOCK_UPTIME_RAW
-#define CLOCK_UPTIME_RAW 8
 #endif
 
 #define GLOBAL_STATE_PLIST @"/var/jb/var/mobile/Library/Preferences/com.ivm.igfarmshield.state.plist"
@@ -81,7 +66,7 @@ static NSUUID *s_cachedSpoofedIDFV = nil;
 static NSMutableDictionary *liveContainerProfile = nil;
 static CTCarrier *s_syntheticCarrier = nil;
 static NSTimeInterval sessionStartTimestamp = 0;
-static double s_realMonoAtLaunch = 0.0;
+static NSTimeInterval s_launchSystemUptime = 0;
 static double s_baseAwakeUptimeSec = 3600.0;
 static BOOL bannerShownThisSession = NO;
 static BOOL s_proxyCoherenceChecked = NO;
@@ -92,7 +77,7 @@ static UILabel *persistentBadgePill = nil;
 static dispatch_source_t s_tunnelWatchdogTimer = nil;
 static int s_lastRenderedBadgeState = -1;
 
-// Estado inmutable en C/RAM para acceso O(1) multihilo sin bloqueos
+// Estado inmutable en RAM/C para acceso O(1) multihilo sin bloqueos
 static volatile BOOL s_profileInitialized = NO;
 static BOOL s_shieldActive = NO;
 static BOOL s_spoofIDs = NO;
@@ -107,7 +92,6 @@ static float s_sessionVolume = 0.40f;
 static NSInteger s_sessionPasteboardCount = 8;
 static unsigned long long s_cachedFreeBytesBase = 24000000000ULL;
 static int32_t s_spoofedFsid0 = 0;
-static int32_t s_spoofedFsid1 = 0;
 static in_addr_t s_spoofedLanAddr = 0;
 static in_addr_t s_spoofedLanMask = 0;
 static in_addr_t s_spoofedLanBcast = 0;
@@ -115,6 +99,8 @@ static in_addr_t s_spoofedCellularAddr = 0;
 static time_t s_spoofedBootSec = 0;
 static suseconds_t s_spoofedBootUsec = 0;
 static char s_cachedBootUUIDC[64] = {0};
+static char s_containerHomePath[PATH_MAX] = {0};
+static size_t s_containerHomeLen = 0;
 
 static NSString *s_cachedContainerName = @"Default";
 static NSString *s_cachedCarrierName = @"T-Mobile";
@@ -130,24 +116,15 @@ static NSArray<NSString *> *s_cachedPreferredLangs = nil;
 
 static __thread BOOL s_inInternalCall = NO;
 
-static os_unfair_lock s_initLock = OS_UNFAIR_LOCK_INIT;
+static os_unfair_lock s_profileInitLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock s_tunnelCacheLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock s_idfvLock = OS_UNFAIR_LOCK_INIT;
 static BOOL s_cachedTunnelUp = NO;
 static CFAbsoluteTime s_lastTunnelCheck = 0;
 
+// Únicamente hooks de funciones C completas en espacio de usuario (sin tocar stubs de libsystem_kernel)
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
-static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
-static int (*orig_clock_gettime)(clockid_t, struct timespec *) = NULL;
-static int (*orig_statfs)(const char *, struct statfs *) = NULL;
-static int (*orig_fstatfs)(int, struct statfs *) = NULL;
 static int (*orig_getifaddrs)(struct ifaddrs **) = NULL;
-static int (*orig_bind)(int, const struct sockaddr *, socklen_t) = NULL;
-static int (*orig_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
-static int (*orig_connect)(int, const struct sockaddr *, socklen_t) = NULL;
-static int (*orig_connectx)(int, const sa_endpoints_t *, sae_associd_t, unsigned int, const struct iovec *, unsigned int, size_t *, sae_connid_t *) = NULL;
-static ssize_t (*orig_sendto)(int, const void *, size_t, int, const struct sockaddr *, socklen_t) = NULL;
-static ssize_t (*orig_sendmsg)(int, const struct msghdr *, int) = NULL;
 static CFDictionaryRef (*orig_CNCopyCurrentNetworkInfo)(CFStringRef) = NULL;
 static Boolean (*orig_SCNetworkReachabilityGetFlags)(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *) = NULL;
 
@@ -255,12 +232,12 @@ static BOOL hasActiveUtunTunnelCached(void) {
 }
 
 static void persistCurrentProfileToSandboxIfNeeded(NSDictionary *previousDiskSnapshot) {
-    if (!liveContainerProfile) return;
+    if (!liveContainerProfile || s_containerHomeLen == 0) return;
     if (previousDiskSnapshot && [previousDiskSnapshot isEqualToDictionary:liveContainerProfile]) return;
 
     BOOL prev = s_inInternalCall;
     s_inInternalCall = YES;
-    NSString *homePath = NSHomeDirectory();
+    NSString *homePath = [NSString stringWithUTF8String:s_containerHomePath];
     if (homePath.length > 0) {
         NSString *libDir = [homePath stringByAppendingPathComponent:@"Library"];
         NSFileManager *fm = [NSFileManager defaultManager];
@@ -424,34 +401,34 @@ static NSDictionary *resolveCraneIdentityDict(NSString *homePath, NSString *bund
 }
 
 static NSTimeInterval spoofedSystemUptime(void) {
-    struct timespec tsNow;
-    int (*clkFn)(clockid_t, struct timespec *) = orig_clock_gettime ? orig_clock_gettime : clock_gettime;
-    if (clkFn(CLOCK_UPTIME_RAW, &tsNow) == 0 && s_realMonoAtLaunch > 0.0) {
-        double monoNow = (double)tsNow.tv_sec + ((double)tsNow.tv_nsec / 1000000000.0);
-        double delta = monoNow - s_realMonoAtLaunch;
-        if (delta < 0.0) delta = 0.0;
-        return s_baseAwakeUptimeSec + delta;
-    }
-    return s_baseAwakeUptimeSec;
+    BOOL prev = s_inInternalCall;
+    s_inInternalCall = YES;
+    NSTimeInterval nowUp = [[NSProcessInfo processInfo] systemUptime];
+    s_inInternalCall = prev;
+    double delta = (s_launchSystemUptime > 0) ? (nowUp - s_launchSystemUptime) : 0.0;
+    if (delta < 0.0) delta = 0.0;
+    return s_baseAwakeUptimeSec + delta;
 }
 
 static void ensureProfileLoaded(void) {
     if (s_profileInitialized || s_inInternalCall) return;
-    os_unfair_lock_lock(&s_initLock);
+    os_unfair_lock_lock(&s_profileInitLock);
     if (s_profileInitialized) {
-        os_unfair_lock_unlock(&s_initLock);
+        os_unfair_lock_unlock(&s_profileInitLock);
         return;
     }
     s_inInternalCall = YES;
 
     sessionStartTimestamp = CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970;
-    struct timespec tsInit;
-    int (*clkInitFn)(clockid_t, struct timespec *) = orig_clock_gettime ? orig_clock_gettime : clock_gettime;
-    if (clkInitFn(CLOCK_UPTIME_RAW, &tsInit) == 0) {
-        s_realMonoAtLaunch = (double)tsInit.tv_sec + ((double)tsInit.tv_nsec / 1000000000.0);
-    }
+    s_launchSystemUptime = [[NSProcessInfo processInfo] systemUptime];
 
     NSString *homePath = NSHomeDirectory() ?: @"";
+    if (homePath.length > 0) {
+        strncpy(s_containerHomePath, [homePath UTF8String], sizeof(s_containerHomePath) - 1);
+        s_containerHomePath[sizeof(s_containerHomePath) - 1] = '\0';
+        s_containerHomeLen = strlen(s_containerHomePath);
+    }
+
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.burbn.instagram";
     NSString *localPlist = [homePath stringByAppendingPathComponent:@"Library/.igshield_container.plist"];
     NSDictionary *diskLoaded = [NSDictionary dictionaryWithContentsOfFile:localPlist];
@@ -463,9 +440,7 @@ static void ensureProfileLoaded(void) {
 
     uint64_t fsidHash = deterministicHash64([NSString stringWithFormat:@"APFS_%@_%@", bundleID, keyUUID]);
     s_spoofedFsid0 = (int32_t)((fsidHash >> 32) & 0x7FFFFFFFU);
-    s_spoofedFsid1 = (int32_t)(fsidHash & 0x7FFFFFFFU);
     if (s_spoofedFsid0 == 0) s_spoofedFsid0 = 0x1A2B3C4D;
-    if (s_spoofedFsid1 == 0) s_spoofedFsid1 = 0x5E6F7A8B;
 
     NSDictionary *loadedGlobal = [NSDictionary dictionaryWithContentsOfFile:GLOBAL_STATE_PLIST];
     if (![loadedGlobal isKindOfClass:[NSDictionary class]] || loadedGlobal.count == 0) {
@@ -746,15 +721,12 @@ static void ensureProfileLoaded(void) {
         NSTimeZone *tzObj = [NSTimeZone timeZoneWithName:tzName];
         if (tzObj) {
             s_cachedTimeZoneObj = tzObj;
-            if (s_spoofLocation) {
-                [NSTimeZone setDefaultTimeZone:tzObj];
-            }
         }
     }
 
     s_profileInitialized = YES;
     s_inInternalCall = NO;
-    os_unfair_lock_unlock(&s_initLock);
+    os_unfair_lock_unlock(&s_profileInitLock);
 }
 
 // ============================================================================
@@ -799,10 +771,9 @@ static void refreshBadgePillStateOnMain(void) {
     persistentBadgePill.frame = CGRectMake((screenBounds.size.width - pillW) / 2.0, 18.0, pillW, 16.0);
 }
 
+// Verificador corregido (cierra la sesión dentro del completionHandler y permite reintento si la red tarda)
 static void verifyLiveProxyCoherenceOnStartup(void) {
-    // Eliminamos la comprobación estricta de s_proxyCoherenceChecked aquí 
-    // para permitir reintentos si la red falla en el arranque.
-    if (!s_shieldActive || !s_spoofNetwork || !liveContainerProfile) return;
+    if (s_proxyCoherenceChecked || !s_shieldActive || !s_spoofNetwork || !liveContainerProfile) return;
     if (!hasActiveUtunTunnelCached()) return;
 
     NSURL *url = [NSURL URLWithString:@"https://ipwho.is/"];
@@ -818,7 +789,6 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
     s_inInternalCall = NO;
 
     [[session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        // Cerramos y liberamos la sesión de forma segura UNICAMENTE cuando termina la tarea
         [session finishTasksAndInvalidate];
 
         if (!data || err) return;
@@ -832,10 +802,8 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
 
         if (!liveIP || !liveTZ || liveTZ.length == 0) return;
 
-        // Marcamos como verificado solo si la petición fue exitosa y trajo datos reales
-        s_proxyCoherenceChecked = YES;
-
         dispatch_async(dispatch_get_main_queue(), ^{
+            s_proxyCoherenceChecked = YES;
             if (!liveContainerProfile) return;
             BOOL anchored = [liveContainerProfile[@"locationAnchored"] boolValue];
             if (!anchored) return;
@@ -887,6 +855,9 @@ static void startTunnelWatchdogTimer(void) {
     dispatch_source_set_event_handler(s_tunnelWatchdogTimer, ^{
         if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
             refreshBadgePillStateOnMain();
+            if (!s_proxyCoherenceChecked && hasActiveUtunTunnelCached()) {
+                verifyLiveProxyCoherenceOnStartup();
+            }
         }
     });
     dispatch_resume(s_tunnelWatchdogTimer);
@@ -894,7 +865,7 @@ static void startTunnelWatchdogTimer(void) {
 
 static void showStartupBannerAndPersistentIcon(int attempt) {
     if (bannerShownThisSession) return;
-    if (!s_profileInitialized) ensureProfileLoaded();
+    ensureProfileLoaded();
     if (!liveContainerProfile) return;
 
     s_inInternalCall = YES;
@@ -953,6 +924,11 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
     }
 
     bannerShownThisSession = YES;
+    if (s_spoofLocation && s_cachedTimeZoneObj) {
+        s_inInternalCall = YES;
+        [NSTimeZone setDefaultTimeZone:s_cachedTimeZoneObj];
+        s_inInternalCall = NO;
+    }
 
     NSDictionary *prof = liveContainerProfile;
     NSString *cName = s_cachedContainerName ?: @"Default";
@@ -1036,25 +1012,34 @@ static void showStartupBannerAndPersistentIcon(int attempt) {
 }
 
 // ============================================================================
-// MODO INVISIBLE (PERMITIENDO TODAS LAS CARPETAS DE CONTENEDORES Y APP GROUPS DE CRANE)
+// MODO INVISIBLE (RESPETANDO ___Crane_Containers Y APPGROUPS DE LA APP)
 // ============================================================================
 static BOOL isHiddenPathForTargetAppC(const char *path) {
     if (!path || !*path) return NO;
 
     if (containsIgnoreCaseC(path, "cryptex")) return NO;
 
-    // Nunca bloquear las carpetas de contenedores o AppGroups de la app o de Crane
-    if (containsIgnoreCaseC(path, "/Containers/Data/Application/") ||
+    if ((s_containerHomeLen > 0 && strncmp(path, s_containerHomePath, s_containerHomeLen) == 0) ||
+        containsIgnoreCaseC(path, "/Containers/Data/Application/") ||
         containsIgnoreCaseC(path, "/Containers/Shared/AppGroup/") ||
         containsIgnoreCaseC(path, "/Containers/Bundle/Application/") ||
         strstr(path, "___Crane_Containers") != NULL) {
-        if (strstr(path, ".igshield_container") != NULL) {
+        if (strstr(path, ".igshield_container") != NULL || containsIgnoreCaseC(path, "igfarmshield")) {
             return YES;
         }
         return NO;
     }
 
     if (containsIgnoreCaseC(path, "igfarmshield") || strstr(path, ".igshield_container") != NULL) {
+        return YES;
+    }
+
+    if (containsIgnoreCaseC(path, "crane.dylib") ||
+        containsIgnoreCaseC(path, "libcrane") ||
+        containsIgnoreCaseC(path, "cranegui") ||
+        containsIgnoreCaseC(path, "com.opa334.crane") ||
+        containsIgnoreCaseC(path, "/application support/crane") ||
+        containsIgnoreCaseC(path, "/library/crane")) {
         return YES;
     }
 
@@ -1074,6 +1059,7 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
         containsIgnoreCaseC(path, "palera1n") ||
         containsIgnoreCaseC(path, "dopamine") ||
         containsIgnoreCaseC(path, "mobilesubstrate") ||
+        containsIgnoreCaseC(path, "substrate") ||
         containsIgnoreCaseC(path, "substitute") ||
         containsIgnoreCaseC(path, "tweakinject") ||
         containsIgnoreCaseC(path, "apt/sources.list")) {
@@ -1115,6 +1101,12 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
 %end
 
 %hook UIApplication
+- (instancetype)init {
+    if (!s_profileInitialized && !s_inInternalCall) {
+        ensureProfileLoaded();
+    }
+    return %orig;
+}
 - (BOOL)canOpenURL:(NSURL *)url {
     if (s_spoofSecurity && url && url.scheme) {
         NSString *s = url.scheme.lowercaseString;
@@ -1186,283 +1178,7 @@ static BOOL isHiddenPathForTargetAppC(const char *path) {
 %end
 
 // ============================================================================
-// CORTAFUEGOS POSIX + DNAT EN PILA PARA DNS LOCAL (RFC1918:53 -> 1.1.1.1:53)
-// ============================================================================
-static BOOL isSocketDatagram(int sockfd) {
-    int sockType = 0;
-    socklen_t optLen = sizeof(sockType);
-    if (getsockopt(sockfd, SOL_SOCKET, SO_TYPE, &sockType, &optLen) == 0) {
-        return (sockType == SOCK_DGRAM);
-    }
-    return NO;
-}
-
-static BOOL isRFC1918OrLinkLocalIPv4(uint32_t ipHost) {
-    if ((ipHost >> 24) == 10) return YES;
-    if ((ipHost & 0xFFF00000U) == 0xAC100000U) return YES;
-    if ((ipHost & 0xFFFF0000U) == 0xC0A80000U) return YES;
-    if ((ipHost & 0xFFFF0000U) == 0xA9FE0000U) return YES;
-    return NO;
-}
-
-static BOOL rewriteRFC1918DnsDestinationIfNeeded(const struct sockaddr *addr, socklen_t addrlen, struct sockaddr_storage *outStorage, socklen_t *outLen) {
-    if (!s_spoofNetwork || s_inInternalCall || !addr || !outStorage || !outLen) return NO;
-
-    if (addr->sa_family == AF_INET && addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
-        struct sockaddr_in sin;
-        memcpy(&sin, addr, sizeof(sin));
-        uint16_t dstPort = ntohs(sin.sin_port);
-        uint32_t ipHost = ntohl(sin.sin_addr.s_addr);
-        if (dstPort == 53 && isRFC1918OrLinkLocalIPv4(ipHost)) {
-            sin.sin_addr.s_addr = htonl(0x01010101U);
-            memset(outStorage, 0, sizeof(struct sockaddr_storage));
-            memcpy(outStorage, &sin, sizeof(sin));
-            *outLen = sizeof(sin);
-            return YES;
-        }
-    } else if (addr->sa_family == AF_INET6 && addrlen >= (socklen_t)sizeof(struct sockaddr_in6)) {
-        struct sockaddr_in6 sin6;
-        memcpy(&sin6, addr, sizeof(sin6));
-        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
-        if (memcmp(sin6.sin6_addr.s6_addr, v4mapPrefix, 12) == 0) {
-            uint32_t mappedIPv4 = 0;
-            memcpy(&mappedIPv4, &sin6.sin6_addr.s6_addr[12], 4);
-            uint32_t ipHost = ntohl(mappedIPv4);
-            uint16_t dstPort = ntohs(sin6.sin6_port);
-            if (dstPort == 53 && isRFC1918OrLinkLocalIPv4(ipHost)) {
-                uint32_t pubDnsNet = htonl(0x01010101U);
-                memcpy(&sin6.sin6_addr.s6_addr[12], &pubDnsNet, 4);
-                memset(outStorage, 0, sizeof(struct sockaddr_storage));
-                memcpy(outStorage, &sin6, sizeof(sin6));
-                *outLen = sizeof(sin6);
-                return YES;
-            }
-        }
-    }
-    return NO;
-}
-
-static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    if (!s_spoofNetwork || s_inInternalCall || !addr) return 0;
-
-    if (addr->sa_family == AF_INET && addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
-        struct sockaddr_in sin;
-        memcpy(&sin, addr, sizeof(sin));
-        uint32_t ipHost = ntohl(sin.sin_addr.s_addr);
-        if (ipHost == 0 || (ipHost >> 24) == 127) return 0;
-
-        if (!hasActiveUtunTunnelCached()) {
-            return ENETUNREACH;
-        }
-
-        if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
-            return EHOSTUNREACH;
-        }
-
-        uint16_t dstPort = ntohs(sin.sin_port);
-        if (dstPort == 53) {
-            return 0;
-        }
-
-        if (isSocketDatagram(sockfd)) {
-            return EHOSTUNREACH;
-        }
-        return 0;
-    }
-
-    if (addr->sa_family == AF_INET6 && addrlen >= (socklen_t)sizeof(struct sockaddr_in6)) {
-        struct sockaddr_in6 sin6;
-        memcpy(&sin6, addr, sizeof(sin6));
-
-        static const uint8_t loop6[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
-        static const uint8_t zero6[16] = {0};
-        if (memcmp(sin6.sin6_addr.s6_addr, loop6, 16) == 0 ||
-            memcmp(sin6.sin6_addr.s6_addr, zero6, 16) == 0) {
-            return 0;
-        }
-
-        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
-        if (memcmp(sin6.sin6_addr.s6_addr, v4mapPrefix, 12) == 0) {
-            uint32_t mappedIPv4 = 0;
-            memcpy(&mappedIPv4, &sin6.sin6_addr.s6_addr[12], 4);
-            uint32_t ipHost = ntohl(mappedIPv4);
-            if (ipHost == 0 || (ipHost >> 24) == 127) return 0;
-
-            if (!hasActiveUtunTunnelCached()) {
-                return ENETUNREACH;
-            }
-            if (isRFC1918OrLinkLocalIPv4(ipHost) || ipHost >= 0xE0000000U) {
-                return EHOSTUNREACH;
-            }
-            uint16_t dstPort = ntohs(sin6.sin6_port);
-            if (dstPort == 53) {
-                return 0;
-            }
-            if (isSocketDatagram(sockfd)) {
-                return EHOSTUNREACH;
-            }
-            return 0;
-        }
-
-        return ENETUNREACH;
-    }
-
-    return 0;
-}
-
-static int custom_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    if (s_spoofNetwork && !s_inInternalCall && addr &&
-        addr->sa_family == AF_INET && addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
-        struct sockaddr_in sin;
-        memcpy(&sin, addr, sizeof(sin));
-        if ((s_spoofedCellularAddr != 0 && sin.sin_addr.s_addr == s_spoofedCellularAddr) ||
-            (s_spoofedLanAddr != 0 && sin.sin_addr.s_addr == s_spoofedLanAddr)) {
-            sin.sin_addr.s_addr = htonl(INADDR_ANY);
-            return orig_bind(sockfd, (const struct sockaddr *)&sin, sizeof(sin));
-        }
-    }
-    return orig_bind(sockfd, addr, addrlen);
-}
-
-static int custom_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
-    if (s_spoofNetwork && !s_inInternalCall && optval && optlen >= (socklen_t)sizeof(int)) {
-        if ((level == IPPROTO_IP && optname == IP_BOUND_IF) ||
-            (level == IPPROTO_IPV6 && optname == IPV6_BOUND_IF)) {
-            int reqIndex = 0;
-            memcpy(&reqIndex, optval, sizeof(int));
-            if (reqIndex > 0) {
-                char ifName[IF_NAMESIZE] = {0};
-                if (if_indextoname((unsigned int)reqIndex, ifName) != NULL) {
-                    if (strcmp(ifName, "lo0") != 0 && !isTunnelInterfaceNameC(ifName)) {
-                        return 0;
-                    }
-                }
-            }
-        }
-    }
-    return orig_setsockopt(sockfd, level, optname, optval, optlen);
-}
-
-static int custom_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    struct sockaddr_storage redirectedStorage;
-    socklen_t redirectedLen = 0;
-    const struct sockaddr *targetAddr = addr;
-    socklen_t targetLen = addrlen;
-
-    if (rewriteRFC1918DnsDestinationIfNeeded(addr, addrlen, &redirectedStorage, &redirectedLen)) {
-        targetAddr = (const struct sockaddr *)&redirectedStorage;
-        targetLen = redirectedLen;
-    }
-
-    int blockErr = evaluateSocketPolicy(sockfd, targetAddr, targetLen);
-    if (blockErr != 0) {
-        errno = blockErr;
-        return -1;
-    }
-    return orig_connect(sockfd, targetAddr, targetLen);
-}
-
-static int custom_connectx(int sockfd, const sa_endpoints_t *endpoints, sae_associd_t associd, unsigned int flags, const struct iovec *iov, unsigned int iovcnt, size_t *len, sae_connid_t *connid) {
-    if (endpoints && s_spoofNetwork && !s_inInternalCall) {
-        sa_endpoints_t modifiedEndpoints = *endpoints;
-        BOOL endpointsModified = NO;
-
-        if (modifiedEndpoints.sae_srcif > 0) {
-            char ifName[IF_NAMESIZE] = {0};
-            if (if_indextoname(modifiedEndpoints.sae_srcif, ifName) != NULL) {
-                if (strcmp(ifName, "lo0") != 0 && !isTunnelInterfaceNameC(ifName)) {
-                    modifiedEndpoints.sae_srcif = 0;
-                    endpointsModified = YES;
-                }
-            }
-        }
-
-        if (modifiedEndpoints.sae_srcaddr &&
-            modifiedEndpoints.sae_srcaddr->sa_family == AF_INET &&
-            modifiedEndpoints.sae_srcaddrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
-            struct sockaddr_in srcSin;
-            memcpy(&srcSin, modifiedEndpoints.sae_srcaddr, sizeof(srcSin));
-            if ((s_spoofedCellularAddr != 0 && srcSin.sin_addr.s_addr == s_spoofedCellularAddr) ||
-                (s_spoofedLanAddr != 0 && srcSin.sin_addr.s_addr == s_spoofedLanAddr)) {
-                modifiedEndpoints.sae_srcaddr = NULL;
-                modifiedEndpoints.sae_srcaddrlen = 0;
-                endpointsModified = YES;
-            }
-        }
-
-        struct sockaddr_storage redirectedStorage;
-        socklen_t redirectedLen = 0;
-        if (modifiedEndpoints.sae_dstaddr &&
-            modifiedEndpoints.sae_dstaddrlen >= (socklen_t)sizeof(struct sockaddr)) {
-            if (rewriteRFC1918DnsDestinationIfNeeded(modifiedEndpoints.sae_dstaddr, modifiedEndpoints.sae_dstaddrlen, &redirectedStorage, &redirectedLen)) {
-                modifiedEndpoints.sae_dstaddr = (const struct sockaddr *)&redirectedStorage;
-                modifiedEndpoints.sae_dstaddrlen = redirectedLen;
-                endpointsModified = YES;
-            }
-
-            int blockErr = evaluateSocketPolicy(sockfd, modifiedEndpoints.sae_dstaddr, modifiedEndpoints.sae_dstaddrlen);
-            if (blockErr != 0) {
-                errno = blockErr;
-                return -1;
-            }
-        }
-
-        if (endpointsModified) {
-            return orig_connectx(sockfd, &modifiedEndpoints, associd, flags, iov, iovcnt, len, connid);
-        }
-    }
-    return orig_connectx(sockfd, endpoints, associd, flags, iov, iovcnt, len, connid);
-}
-
-static ssize_t custom_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen) {
-    if (dest_addr) {
-        struct sockaddr_storage redirectedStorage;
-        socklen_t redirectedLen = 0;
-        const struct sockaddr *targetAddr = dest_addr;
-        socklen_t targetLen = addrlen;
-
-        if (rewriteRFC1918DnsDestinationIfNeeded(dest_addr, addrlen, &redirectedStorage, &redirectedLen)) {
-            targetAddr = (const struct sockaddr *)&redirectedStorage;
-            targetLen = redirectedLen;
-        }
-
-        int blockErr = evaluateSocketPolicy(sockfd, targetAddr, targetLen);
-        if (blockErr != 0) {
-            errno = blockErr;
-            return -1;
-        }
-        return orig_sendto(sockfd, buf, len, flags, targetAddr, targetLen);
-    }
-    return orig_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
-}
-
-static ssize_t custom_sendmsg(int sockfd, const struct msghdr *msg, int flags) {
-    if (msg && msg->msg_name && msg->msg_namelen >= (socklen_t)sizeof(struct sockaddr)) {
-        struct sockaddr_storage redirectedStorage;
-        socklen_t redirectedLen = 0;
-        if (rewriteRFC1918DnsDestinationIfNeeded((const struct sockaddr *)msg->msg_name, msg->msg_namelen, &redirectedStorage, &redirectedLen)) {
-            struct msghdr modifiedMsg = *msg;
-            modifiedMsg.msg_name = (void *)&redirectedStorage;
-            modifiedMsg.msg_namelen = redirectedLen;
-            int blockErr = evaluateSocketPolicy(sockfd, (const struct sockaddr *)modifiedMsg.msg_name, modifiedMsg.msg_namelen);
-            if (blockErr != 0) {
-                errno = blockErr;
-                return -1;
-            }
-            return orig_sendmsg(sockfd, &modifiedMsg, flags);
-        }
-
-        int blockErr = evaluateSocketPolicy(sockfd, (const struct sockaddr *)msg->msg_name, msg->msg_namelen);
-        if (blockErr != 0) {
-            errno = blockErr;
-            return -1;
-        }
-    }
-    return orig_sendmsg(sockfd, msg, flags);
-}
-
-// ============================================================================
-// COHERENCIA DE RED, CARRIER SINTÉTICO SIN SIM Y GETIFADDRS O(1)
+// COHERENCIA DE RED, KILL-SWITCH EN SESIÓN, CARRIER SINTÉTICO Y GETIFADDRS
 // ============================================================================
 static Boolean custom_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
     Boolean ok = orig_SCNetworkReachabilityGetFlags ? orig_SCNetworkReachabilityGetFlags(target, flags) : FALSE;
@@ -1699,10 +1415,12 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
 // ============================================================================
 %hook UIDevice
 - (NSString *)name {
+    if (!s_profileInitialized && !s_inInternalCall) ensureProfileLoaded();
     if (!s_spoofHardware) return %orig;
     return @"iPhone";
 }
 - (NSUUID *)identifierForVendor {
+    if (!s_profileInitialized && !s_inInternalCall) ensureProfileLoaded();
     NSUUID *origUUID = %orig;
     if (origUUID) {
         os_unfair_lock_lock(&s_idfvLock);
@@ -1753,44 +1471,6 @@ static unsigned long long currentSmoothFreeDiskBytesC(void) {
     unsigned long long cap = 16ULL * 1024ULL * 1024ULL;
     if (consumed > cap) consumed = cap;
     return (s_cachedFreeBytesBase > consumed) ? (s_cachedFreeBytesBase - consumed) : s_cachedFreeBytesBase;
-}
-
-static void applySpoofedStatfsStruct(struct statfs *buf) {
-    if (!buf) return;
-    if (s_spoofedFsid0 != 0) {
-        buf->f_fsid.val[0] = s_spoofedFsid0;
-        buf->f_fsid.val[1] = s_spoofedFsid1;
-    }
-    if (s_spoofHardware && s_cachedFreeBytesBase > 0 && buf->f_bsize > 0) {
-        unsigned long long finalFree = currentSmoothFreeDiskBytesC();
-        uint64_t blocks = finalFree / buf->f_bsize;
-        if (buf->f_blocks > 0) {
-            uint64_t maxBlocks = (buf->f_blocks * 85ULL) / 100ULL;
-            if (blocks > maxBlocks) blocks = maxBlocks;
-        }
-        buf->f_bavail = blocks;
-        buf->f_bfree = blocks;
-    }
-}
-
-static int custom_statfs(const char *path, struct statfs *buf) {
-    if (s_spoofSecurity && !s_inInternalCall && path && isHiddenPathForTargetAppC(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    int ret = orig_statfs(path, buf);
-    if (ret == 0 && buf && !s_inInternalCall && (s_spoofHardware || s_spoofIDs)) {
-        applySpoofedStatfsStruct(buf);
-    }
-    return ret;
-}
-
-static int custom_fstatfs(int fd, struct statfs *buf) {
-    int ret = orig_fstatfs(fd, buf);
-    if (ret == 0 && buf && !s_inInternalCall && (s_spoofHardware || s_spoofIDs)) {
-        applySpoofedStatfsStruct(buf);
-    }
-    return ret;
 }
 
 %hook NSFileManager
@@ -1857,6 +1537,7 @@ static int custom_fstatfs(int fd, struct statfs *buf) {
 
 %hook NSProcessInfo
 - (NSString *)hostName {
+    if (!s_profileInitialized && !s_inInternalCall) ensureProfileLoaded();
     if (s_spoofHardware || s_spoofIDs) {
         return @"iphone.local";
     }
@@ -1870,7 +1551,7 @@ static int custom_fstatfs(int fd, struct statfs *buf) {
 }
 - (NSDictionary<NSString *, NSString *> *)environment {
     NSDictionary *orig = %orig;
-    if (!s_spoofSecurity || s_inInternalCall || !orig) {
+    if (!s_spoofSecurity || !orig || s_inInternalCall) {
         return orig;
     }
     NSMutableDictionary *cleanEnv = [orig mutableCopy];
@@ -1887,27 +1568,9 @@ static int custom_fstatfs(int fd, struct statfs *buf) {
 }
 %end
 
-static int custom_clock_gettime(clockid_t clk_id, struct timespec *tp) {
-    int ret = orig_clock_gettime(clk_id, tp);
-    if (ret == 0 && tp && !s_inInternalCall && (s_spoofIDs || s_spoofHardware) &&
-        clk_id == CLOCK_UPTIME_RAW && s_spoofedBootSec > 0 && s_realMonoAtLaunch > 0.0) {
-        double monoNow = (double)tp->tv_sec + ((double)tp->tv_nsec / 1000000000.0);
-        double delta = monoNow - s_realMonoAtLaunch;
-        if (delta < 0.0) delta = 0.0;
-        double totalSpoofed = s_baseAwakeUptimeSec + delta;
-        time_t secPart = (time_t)totalSpoofed;
-        long nsecPart = (long)((totalSpoofed - (double)secPart) * 1000000000.0);
-        if (nsecPart < 0L) nsecPart = 0L;
-        if (nsecPart >= 1000000000L) nsecPart = 999999999L;
-        tp->tv_sec = secPart;
-        tp->tv_nsec = nsecPart;
-    }
-    return ret;
-}
-
 static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-    if (ret == 0 && name && oldlenp && !s_inInternalCall) {
+    if (ret == 0 && name && oldlenp && s_profileInitialized && !s_inInternalCall) {
         if (strcmp(name, "kern.bootsessionuuid") == 0 && s_spoofIDs && s_cachedBootUUIDC[0] != '\0') {
             size_t len = strlen(s_cachedBootUUIDC) + 1;
             if (oldp && *oldlenp >= len) memcpy(oldp, s_cachedBootUUIDC, len);
@@ -1930,27 +1593,6 @@ static int custom_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, vo
     return ret;
 }
 
-static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    if (ret == 0 && name && namelen == 2 && oldlenp && !s_inInternalCall && name[0] == CTL_KERN) {
-        if (name[1] == KERN_BOOTTIME && (s_spoofIDs || s_spoofHardware) && s_spoofedBootSec > 0) {
-            struct timeval tv;
-            tv.tv_sec = s_spoofedBootSec;
-            tv.tv_usec = s_spoofedBootUsec;
-            if (oldp && *oldlenp >= sizeof(struct timeval)) {
-                memcpy(oldp, &tv, sizeof(struct timeval));
-            }
-            *oldlenp = sizeof(struct timeval);
-        } else if (name[1] == KERN_HOSTNAME && (s_spoofHardware || s_spoofIDs)) {
-            static const char *cleanHost = "iPhone";
-            size_t len = strlen(cleanHost) + 1;
-            if (oldp && *oldlenp >= len) memcpy(oldp, cleanHost, len);
-            *oldlenp = len;
-        }
-    }
-    return ret;
-}
-
 %hook UIScreen
 - (CGFloat)brightness {
     if (!s_spoofHardware) return %orig;
@@ -1963,41 +1605,20 @@ static int custom_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, 
 %end
 
 %ctor {
-    MSHookFunction((void *)getifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
-    MSHookFunction((void *)sysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
-    MSHookFunction((void *)sysctl, (void *)custom_sysctl, (void **)&orig_sysctl);
-    MSHookFunction((void *)statfs, (void *)custom_statfs, (void **)&orig_statfs);
-    MSHookFunction((void *)CNCopyCurrentNetworkInfo, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
+    // 1. Instalar únicamente hooks de librerías C de usuario (sin tocar stubs de libsystem_kernel)
+    void *symGetifaddrs = dlsym(RTLD_DEFAULT, "getifaddrs");
+    if (symGetifaddrs) MSHookFunction(symGetifaddrs, (void *)custom_getifaddrs, (void **)&orig_getifaddrs);
 
-    void *symFstatfs = dlsym(RTLD_DEFAULT, "fstatfs");
-    if (symFstatfs) MSHookFunction(symFstatfs, (void *)custom_fstatfs, (void **)&orig_fstatfs);
+    void *symSysctlbyname = dlsym(RTLD_DEFAULT, "sysctlbyname");
+    if (symSysctlbyname) MSHookFunction(symSysctlbyname, (void *)custom_sysctlbyname, (void **)&orig_sysctlbyname);
 
-    void *symClockGettime = dlsym(RTLD_DEFAULT, "clock_gettime");
-    if (symClockGettime) MSHookFunction(symClockGettime, (void *)custom_clock_gettime, (void **)&orig_clock_gettime);
+    void *symCNCopy = dlsym(RTLD_DEFAULT, "CNCopyCurrentNetworkInfo");
+    if (symCNCopy) MSHookFunction(symCNCopy, (void *)custom_CNCopyCurrentNetworkInfo, (void **)&orig_CNCopyCurrentNetworkInfo);
 
     void *symReachFlags = dlsym(RTLD_DEFAULT, "SCNetworkReachabilityGetFlags");
     if (symReachFlags) MSHookFunction(symReachFlags, (void *)custom_SCNetworkReachabilityGetFlags, (void **)&orig_SCNetworkReachabilityGetFlags);
 
-    void *symBind = dlsym(RTLD_DEFAULT, "bind");
-    if (symBind) MSHookFunction(symBind, (void *)custom_bind, (void **)&orig_bind);
-
-    void *symSetsockopt = dlsym(RTLD_DEFAULT, "setsockopt");
-    if (symSetsockopt) MSHookFunction(symSetsockopt, (void *)custom_setsockopt, (void **)&orig_setsockopt);
-
-    void *symConnect = dlsym(RTLD_DEFAULT, "connect");
-    if (symConnect) MSHookFunction(symConnect, (void *)custom_connect, (void **)&orig_connect);
-
-    void *symConnectx = dlsym(RTLD_DEFAULT, "connectx");
-    if (symConnectx) MSHookFunction(symConnectx, (void *)custom_connectx, (void **)&orig_connectx);
-
-    void *symSendto = dlsym(RTLD_DEFAULT, "sendto");
-    if (symSendto) MSHookFunction(symSendto, (void *)custom_sendto, (void **)&orig_sendto);
-
-    void *symSendmsg = dlsym(RTLD_DEFAULT, "sendmsg");
-    if (symSendmsg) MSHookFunction(symSendmsg, (void *)custom_sendmsg, (void **)&orig_sendmsg);
-
-    ensureProfileLoaded();
-
+    // 2. Activar hooks de Objective-C (ensureProfileLoaded se ejecuta de forma segura al iniciar UIApplication/UIDevice)
     %init;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
