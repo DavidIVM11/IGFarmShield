@@ -880,7 +880,7 @@ static void applyAutoDetectedProxyMetadataOnMain(NSString *ip, NSString *ispRaw,
     persistCurrentProfileToSandboxIfNeeded(snap);
 }
 
-// Verifica en segundo plano que el proxy activo coincida con la zona horaria/país del contenedor (Thread-Safe en Main Queue)
+// Verifica en segundo plano que el proxy activo coincida con la zona horaria/país del contenedor (Thread-Safe y sin leaks de NSURLSession)
 static void verifyLiveProxyCoherenceOnStartup(void) {
     if (s_proxyCoherenceChecked || !s_shieldActive || !s_spoofNetwork || !liveContainerProfile) return;
     if (!hasActiveUtunTunnelCached()) return;
@@ -962,6 +962,7 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
             }
         });
     }] resume];
+    [session finishTasksAndInvalidate];
 }
 
 static void startTunnelWatchdogTimer(void) {
@@ -1475,7 +1476,7 @@ static BOOL rewriteRFC1918DnsDestinationIfNeeded(const struct sockaddr *addr, so
     } else if (addr->sa_family == AF_INET6 && addrlen >= (socklen_t)sizeof(struct sockaddr_in6)) {
         struct sockaddr_in6 sin6;
         memcpy(&sin6, addr, sizeof(sin6));
-        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0,0xff,0xff};
         if (memcmp(sin6.sin6_addr.s6_addr, v4mapPrefix, 12) == 0) {
             uint32_t mappedIPv4 = 0;
             memcpy(&mappedIPv4, &sin6.sin6_addr.s6_addr[12], 4);
@@ -1533,7 +1534,7 @@ static int evaluateSocketPolicy(int sockfd, const struct sockaddr *addr, socklen
             return 0;
         }
 
-        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        static const uint8_t v4mapPrefix[12] = {0,0,0,0,0,0,0,0,0,0,0,0xff,0xff};
         if (memcmp(sin6.sin6_addr.s6_addr, v4mapPrefix, 12) == 0) {
             uint32_t mappedIPv4 = 0;
             memcpy(&mappedIPv4, &sin6.sin6_addr.s6_addr[12], 4);
@@ -1870,9 +1871,11 @@ static void writeSockaddrInAddrSafely(struct sockaddr *sa, in_addr_t ipv4NetOrde
     memcpy((char *)sa + offsetof(struct sockaddr_in, sin_addr), &ipv4NetOrder, sizeof(in_addr_t));
 }
 
+// Configura pdp_ip0 con banderas reales de enlace celular punto a punto (IFF_POINTOPOINT sin IFF_BROADCAST)
 static void applySpoofedCellularNode(struct ifaddrs *node) {
     if (!node || s_spoofedCellularAddr == 0) return;
     node->ifa_name = (char *)"pdp_ip0";
+    node->ifa_flags = (node->ifa_flags & ~((unsigned int)IFF_BROADCAST)) | (unsigned int)IFF_POINTOPOINT;
     writeSockaddrInAddrSafely(node->ifa_addr, s_spoofedCellularAddr);
     writeSockaddrInAddrSafely(node->ifa_netmask, htonl(0xFFFFFFFFU));
     writeSockaddrInAddrSafely(node->ifa_dstaddr, s_spoofedCellularAddr);
@@ -1993,19 +1996,30 @@ static CFDictionaryRef custom_CNCopyCurrentNetworkInfo(CFStringRef interfaceName
 - (NSUUID *)identifierForVendor {
     NSUUID *origUUID = %orig;
     if (origUUID && !origCraneIDFV) {
-        origCraneIDFV = [[origUUID UUIDString] uppercaseString];
-        if (liveContainerProfile && ![liveContainerProfile[@"craneOriginalIDFV"] isEqualToString:origCraneIDFV]) {
-            NSDictionary *snap = [liveContainerProfile copy];
-            liveContainerProfile[@"idfv"] = origCraneIDFV;
-            liveContainerProfile[@"craneOriginalIDFV"] = origCraneIDFV;
-            persistCurrentProfileToSandboxIfNeeded(snap);
+        NSString *captured = [[origUUID UUIDString] uppercaseString];
+        if (captured.length >= 32) {
+            origCraneIDFV = captured;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (liveContainerProfile && ![liveContainerProfile[@"craneOriginalIDFV"] isEqualToString:captured]) {
+                    NSDictionary *snap = [liveContainerProfile copy];
+                    liveContainerProfile[@"idfv"] = captured;
+                    liveContainerProfile[@"craneOriginalIDFV"] = captured;
+                    persistCurrentProfileToSandboxIfNeeded(snap);
+                }
+            });
         }
     }
-    if (s_spoofIDs && liveContainerProfile) {
-        NSString *profUUIDStr = liveContainerProfile[@"idfv"];
-        if ([profUUIDStr isKindOfClass:[NSString class]] && profUUIDStr.length >= 32) {
-            NSUUID *customUUID = [[NSUUID alloc] initWithUUIDString:profUUIDStr];
-            if (customUUID) return customUUID;
+    if (s_spoofIDs) {
+        if (origCraneIDFV.length >= 32) {
+            NSUUID *craneUUID = [[NSUUID alloc] initWithUUIDString:origCraneIDFV];
+            if (craneUUID) return craneUUID;
+        }
+        if (liveContainerProfile) {
+            NSString *profUUIDStr = liveContainerProfile[@"idfv"];
+            if ([profUUIDStr isKindOfClass:[NSString class]] && profUUIDStr.length >= 32) {
+                NSUUID *customUUID = [[NSUUID alloc] initWithUUIDString:profUUIDStr];
+                if (customUUID) return customUUID;
+            }
         }
     }
     return origUUID;
