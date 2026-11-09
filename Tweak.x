@@ -800,9 +800,10 @@ static void refreshBadgePillStateOnMain(void) {
 }
 
 static void verifyLiveProxyCoherenceOnStartup(void) {
-    if (s_proxyCoherenceChecked || !s_shieldActive || !s_spoofNetwork || !liveContainerProfile) return;
+    // Eliminamos la comprobación estricta de s_proxyCoherenceChecked aquí 
+    // para permitir reintentos si la red falla en el arranque.
+    if (!s_shieldActive || !s_spoofNetwork || !liveContainerProfile) return;
     if (!hasActiveUtunTunnelCached()) return;
-    s_proxyCoherenceChecked = YES;
 
     NSURL *url = [NSURL URLWithString:@"https://ipwho.is/"];
     if (!url) return;
@@ -817,6 +818,9 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
     s_inInternalCall = NO;
 
     [[session dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        // Cerramos y liberamos la sesión de forma segura UNICAMENTE cuando termina la tarea
+        [session finishTasksAndInvalidate];
+
         if (!data || err) return;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         if (![json isKindOfClass:[NSDictionary class]] || ![json[@"success"] boolValue]) return;
@@ -827,6 +831,9 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
         NSString *liveTZ = [tzDict[@"id"] isKindOfClass:[NSString class]] ? tzDict[@"id"] : nil;
 
         if (!liveIP || !liveTZ || liveTZ.length == 0) return;
+
+        // Marcamos como verificado solo si la petición fue exitosa y trajo datos reales
+        s_proxyCoherenceChecked = YES;
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!liveContainerProfile) return;
@@ -867,7 +874,6 @@ static void verifyLiveProxyCoherenceOnStartup(void) {
             }
         });
     }] resume];
-    [session finishTasksAndInvalidate];
 }
 
 static void startTunnelWatchdogTimer(void) {
